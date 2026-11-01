@@ -196,6 +196,14 @@ export function deriveProviderModels(
      * covers providers without live evidence.
      */
     liveOkProviders?: string[];
+    /**
+     * Lowercase providers eligible to claim via the `owned_by` fallback:
+     * enabled discovered providers (at least one non-disabled account). A
+     * disabled or configured-but-accountless provider has no credential
+     * evidence and must not claim through `owned_by`. Defaults to the full
+     * scope when omitted (callers without credential data).
+     */
+    ownedByEligible?: string[];
   },
 ): { providerModels: Record<string, string[]>; overlaps: ModelOverlap[]; warnings: string[] } {
   const warnings: string[] = [];
@@ -239,8 +247,27 @@ export function deriveProviderModels(
     const ownedInScope = ownedBy ? providerForOwnedBy(ownedBy, inScope) : null;
     // Live membership supersedes the fallback: a provider whose served set
     // answered successfully never claims via `owned_by` (its live set — even
-    // an empty one — already says what it serves).
-    const ownedClaimed = ownedInScope && !liveOk.has(ownedInScope) ? ownedInScope : null;
+    // an empty one — already says what it serves). Providers without an
+    // enabled account never claim via `owned_by` either: a disabled or
+    // accountless provider's fallback claim would fabricate overlaps that
+    // hide the actually-serving provider's usable model.
+    const eligible = opts.ownedByEligible ? new Set(opts.ownedByEligible.map((p) => p.toLowerCase())) : null;
+    // An in-scope exact match that cannot claim must not block the vendor
+    // alias: `openai` configured without an account (in scope, ineligible)
+    // must not swallow codex's fallback claim. The live block stays
+    // absolute — live membership already spoke for that provider — only an
+    // eligibility block falls through to the alias.
+    const ownedClaimed = (() => {
+      if (!ownedInScope) return null;
+      if (!liveOk.has(ownedInScope) && (!eligible || eligible.has(ownedInScope))) return ownedInScope;
+      if (!eligible || liveOk.has(ownedInScope)) return null;
+      const ownedRaw = ownedBy ? ownedBy.trim().toLowerCase() : "";
+      const mapped = ownedRaw ? OWNED_BY_TO_PROVIDER[ownedRaw] : undefined;
+      if (mapped && mapped !== ownedInScope && inScope.has(mapped) && !liveOk.has(mapped) && eligible.has(mapped)) {
+        return mapped;
+      }
+      return null;
+    })();
     const parties = [...new Set([...claimants, ...(ownedClaimed ? [ownedClaimed] : [])])].sort();
     if (parties.length === 1) {
       give(parties[0] as string, id);

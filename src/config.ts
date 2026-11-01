@@ -84,7 +84,10 @@ export const DEFAULTS = {
  */
 export const DEFAULT_PROVIDER_WINDOWS: Record<string, string[]> = {
   claude: ["5h", "7d", "unified"],
-  codex: ["codex", "5h", "weekly"],
+  // Stock CLIProxy Codex headers carry bare `primary` / `secondary` windows
+  // (`x-codex-primary-used-percent`) alongside namespaced ones (`5h-primary`):
+  // both must gate, or stock quotas never constrain routing.
+  codex: ["codex", "5h", "weekly", "primary", "secondary"],
   devin: ["devin", "5h", "weekly"],
   synthetic: ["weekly", "rolling-5h", "5h", "subscription"],
   "nvidia-nim": ["rpm", "minute"],
@@ -242,6 +245,20 @@ export function parseConfig(raw: unknown): { config: ConnectorConfig; validation
         warnings.push(
           `providerWindows[${provider}] is empty: this converts a gated provider to quota-blind fail-open (routes without quota knowledge). Restore the defaults if that was not intended.`,
         );
+      }
+      if (provider.toLowerCase() === "codex" && lowered.length > 0) {
+        // Stock Codex headers carry bare `primary` / `secondary` windows, and
+        // gating is decided on those bare window names (not the `codex:…`
+        // prefixed ids): an override of ["codex"] looks covering but gates
+        // nothing, while ["5h", "weekly"] silently stops gating stock quota.
+        // Probe the names gating actually sees so existing installations
+        // are told to update instead of routing blind.
+        const gates = (window: string) => lowered.some((sub) => sub !== "" && window.includes(sub));
+        if (!gates("primary") || !gates("secondary")) {
+          warnings.push(
+            `providerWindows[codex] does not gate the stock primary/secondary windows; existing overrides need "primary" and "secondary" entries (or a matching substring) or stock Codex quota stops constraining routing.`,
+          );
+        }
       }
       providerWindows[provider.toLowerCase()] = lowered;
     }

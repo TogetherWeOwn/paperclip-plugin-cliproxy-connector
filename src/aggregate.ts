@@ -10,8 +10,12 @@
  *   plugin-route reading.
  * - `exhausted` only when every enabled account is positively out (quota
  *   exhausted, or cooling with a future `next_retry_after`) **and**
- *   `completeInventory` is true. `retryAt` is the earliest reset or cooldown
- *   end across those accounts.
+ *   `completeInventory` is true. `retryAt` is the earliest per-account
+ *   recovery bound across those accounts, where one account's bound is the
+ *   latest required reset among its own limiting windows (an account with
+ *   both 5h and 7d exhausted recovers only when the later clears) — unless a
+ *   limiting condition has no usable reset, in which case that account
+ *   rechecks at the recheck cadence instead of sleeping past a distant reset.
  * - `unknown` otherwise, including stale data and zero visible accounts.
  *   Never claims headroom.
  *
@@ -209,9 +213,11 @@ function assessAccount(
   }
 
   if (limiting.length > 0) return { kind: "out", resets: [] };
-  // Positive evidence on one window must not override missing evidence on
-  // another: mixed healthy/unknown is unknown, never headroom.
+  // Positive headroom requires fresh evidence on EVERY applicable window: a
+  // single unknown window (missing or stale telemetry) vetoes headroom, or a
+  // healthy 5h reading would mask an exhausted 7d window.
   if (headroom && unknownWindows.length === 0) return { kind: "headroom" };
+  if (headroom) return { kind: "unknown", reason: `fresh headroom on some windows but no fresh verdict on ${unknownWindows.join(", ")}; unknown.` };
   return { kind: "unknown", reason: `no fresh verdict on ${unknownWindows.join(", ")}; unknown.` };
 }
 
@@ -289,7 +295,11 @@ export function aggregateProvider(args: {
   }
 
   let headroomAccounts = 0;
-  const outResets: string[] = [];
+  // Per-account recovery bounds: an account recovers only when ALL of its
+  // limiting windows clear, so its bound is the LATEST required reset (not the
+  // earliest). The provider wakes when the FIRST account may have recovered,
+  // so the aggregate retry is the earliest per-account bound.
+  const perAccountBounds: number[] = [];
   let allOut = true;
   for (const row of enabled) {
     const verdict = assessAccount(row, model, nowMs, reserve, maxAge, grace, futureSkewMs);
@@ -297,19 +307,37 @@ export function aggregateProvider(args: {
       headroomAccounts += 1;
       allOut = false;
     } else if (verdict.kind === "out") {
-      // Limiting windows carry their resets in the row; collect the future
-      // ones as this account's recovery bound.
+      const bounds: number[] = [];
+      // A limiting condition with no usable future reset (missing resetsAt,
+      // a passed reset the parser kept, an unbounded cooldown) may clear at
+      // any time: cap this account's next check at the recheck cadence even
+      // when another window carries a distant reset.
+      let hasUnboundedLimiting = false;
       for (const w of row.limits) {
         if (!w.gating || !windowAppliesToModel(w, model, provider)) continue;
         const resetMs = w.resetsAt ? parseTime(w.resetsAt) : null;
-        if ((w.allowed === false || w.limitReached) && resetMs !== null && resetMs > nowMs && w.resetsAt) {
-          outResets.push(w.resetsAt);
-        }
+        // Any limiting signal counts, including low-remaining windows whose
+        // `allowed` is still true: the account cannot route until they clear.
+        const limiting =
+          w.allowed === false || w.limitReached || (w.remainingPercent !== null && w.remainingPercent <= reserve);
+        if (!limiting) continue;
+        if (resetMs !== null && resetMs > nowMs) bounds.push(resetMs);
+        else hasUnboundedLimiting = true;
       }
-      if (row.cooldownUntil) {
-        const untilMs = parseTime(row.cooldownUntil);
-        if (untilMs !== null && untilMs > nowMs) outResets.push(row.cooldownUntil);
+      if (row.coolingDown) {
+        const untilMs = row.cooldownUntil ? parseTime(row.cooldownUntil) : null;
+        if (untilMs !== null && untilMs > nowMs) bounds.push(untilMs);
+        else hasUnboundedLimiting = true;
       }
+      const recheckAt = nowMs + config.recheckSeconds * 1000;
+      // Unbounded limiting may clear at any time, so recheck at the cadence
+      // even when a sibling window carries a distant reset. Fully bounded
+      // accounts keep the latest reset: nothing can change before it.
+      // An out account with no future bound still re-wakes at the recheck
+      // cadence so exhaustion never waits forever on a missing reset.
+      perAccountBounds.push(
+        hasUnboundedLimiting ? recheckAt : bounds.length > 0 ? Math.max(...bounds) : recheckAt,
+      );
     } else {
       allOut = false;
     }
@@ -329,9 +357,7 @@ export function aggregateProvider(args: {
     };
   }
   if (allOut && args.completeInventory) {
-    const future = outResets
-      .map((r) => parseTime(r))
-      .filter((t): t is number => t !== null && t > nowMs);
+    const future = perAccountBounds.filter((t) => t > nowMs);
     let retryAt =
       future.length > 0
         ? new Date(Math.min(...future)).toISOString()

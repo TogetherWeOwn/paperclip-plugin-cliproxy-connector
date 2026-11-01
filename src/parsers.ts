@@ -90,6 +90,177 @@ export function toIsoTimestamp(v: unknown): string | null {
   return new Date(ms).toISOString();
 }
 
+/**
+ * Scrub an upstream `status_message` before it reaches the plugin page.
+ * Emails become `[redacted-email]`; any whitespace-delimited token that
+ * looks credential-like — a 20+ word-char run, or 8+ chars mixing letters
+ * with digits (short API keys, session ids) — becomes `[redacted]`. Tokens
+ * with operational shapes (timestamps, versions, benign `k=v` pairs like
+ * `error=429`, lowercase hyphenated slugs like model ids) pass through so
+ * the page keeps reset times and model names. The note is capped at
+ * 120 chars. Plain notes ("ok", "429 rate limited") pass through unchanged.
+ */
+export function sanitizeStatusMessage(raw: string | null): string | null {
+  if (!raw) return null;
+  let s = raw.trim();
+  if (!s) return null;
+  s = s.replace(/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g, "[redacted-email]");
+  s = s
+    .split(/\s+/)
+    .map((tok) => {
+      if (tok === "[redacted-email]") return tok;
+      if (/[A-Za-z0-9_\-]{20,}/.test(tok)) return "[redacted]";
+      // Judge the punctuation-stripped core: real notes attach commas and
+      // periods ("for gpt-4o-mini, retry"), which must not defeat the
+      // operational-shape exemption.
+      const core = tok.replace(/^[^A-Za-z0-9]+/, "").replace(/[^A-Za-z0-9]+$/, "");
+      if (isCredentialCore(core)) return "[redacted]";
+      return tok;
+    })
+    .join(" ");
+  if (s.length > 120) s = `${s.slice(0, 117)}...`;
+  return s;
+}
+
+/**
+ * A letter+digit token that is operational, not a credential: timestamps,
+ * versions and URLs (punctuation bare keys/session ids almost never
+ * contain), `k=v` pairs whose value is not itself credential-shaped
+ * (`error=429` keeps; `token=ab12cd34ef` redacts), and lowercase hyphenated
+ * slugs without credential tells (`gpt-4o-mini`, `claude-sonnet-4-5` model
+ * ids pass; `sk-live-abc123` and `sk-live-a1b2c3d4` still redact).
+ * `:`/`/` tokens are operational only when no separated segment is itself
+ * credential-shaped (`error=429` and `HTTP/1.1` keep; `token:ab12cd34ef`
+ * redacts). Dots stay inside the slug judgment as version separators
+ * (`claude-3.5-sonnet` keeps), with a per-segment fallback for hostnames and
+ * dotted versions (`s3.amazonaws.com`, `v1.2.3-beta1` keep) that still rejects
+ * dotted credentials (`sk.live.a1.b2` redacts). A strong dot-segment cannot
+ * launder a secret-shaped token: a leading secret marker (`sk`, `secret`,
+ * `token`, …) or two flat letter-digit fragments (`a1`, `b2`) deny the
+ * hostname/version fallback, so `sk.production.a1.b2` redacts while
+ * `s3.amazonaws.com` (one flat fragment) and `v1.2.3-beta1` (a hyphenated
+ * prerelease part plus a bare version number) keep. Several flat mixed
+ * labels deny the fallback unless every one is version/hostname structured
+ * (`v1`, `us2`, `3rc1`) beside a structural part — a bare number anywhere or
+ * a strong word with more hostname after it — so `v1.2.3rc1` and
+ * `s3.us2.amazonaws.com` keep while a trailing payload word
+ * (`a1.b2.production`) and interleaved entropy (`a1b2.c3d4.99`) still redact.
+ * Timestamps are exempted
+ * only when the whole token is a date/time, fractional seconds and numeric
+ * offsets included (`2026-11-01T12:00:00.000Z` and `...+00:00` keep), so a
+ * date substring cannot launder attached secret material
+ * (`sk-2026-11-01-ab12` redacts).
+ */
+function isOperationalToken(tok: string): boolean {
+  const eq = tok.lastIndexOf("=");
+  if (eq >= 0) return !isCredentialCore(tok.slice(eq + 1));
+  if (
+    /^\d{4}-\d{2}-\d{2}([T ]\d{2}:\d{2}(:\d{2}(\.\d+)?)?(Z|[+-]\d{2}:?\d{2})?)?$/.test(tok) ||
+    /^\d{2}:\d{2}(:\d{2})?$/.test(tok)
+  )
+    return true;
+  if (tok.includes(".")) {
+    // Judge the dotted token as one slug first, so version continuations
+    // (`5-sonnet` in `claude-3.5-sonnet`) are not mistaken for credentials.
+    if (isSlugLike(tok.replace(/\./g, "-"), 1)) return true;
+    const segs = tok.split(".");
+    if (segs.some((seg) => isCredentialCore(seg))) return false;
+    // A secret marker up front (`sk`, `secret`, `token`, …) means the rest
+    // of the labels are key material, not a hostname — however
+    // operational one of them looks on its own (`production`).
+    if (segs.length > 1 && SECRET_DOT_PREFIX.test(segs[0] ?? "")) return false;
+    // Segmented secrets spread entropy across several flat letter-digit
+    // labels (`a1.b2`); hostnames carry version-shaped ones (`s3`, `us2`),
+    // and dotted versions structure theirs (`3rc1`, `3-beta1`). Two or more
+    // flat mixed labels deny the fallback — unless every one is
+    // version/hostname structured and another segment is clearly operational
+    // (a bare number or long word), so `v1.2.3rc1` and
+    // `s3.us2.amazonaws.com` keep while interleaved entropy (`a1b2.c3d4.99`)
+    // still redacts. A leading secret marker already denied above.
+    const flatMixed = segs.filter(
+      (seg) => !seg.includes("-") && /[a-zA-Z]/.test(seg) && /[0-9]/.test(seg),
+    );
+    // The clearly operational part must be structural, not a trailing payload
+    // word: a bare number (a version component) anywhere, or a strong word
+    // with more hostname after it. `a1.b2.production` ends on its payload
+    // word and redacts; `s3.us2.amazonaws.com` continues past `amazonaws`
+    // and `v1.2.3rc1` carries the bare `2`, so both keep.
+    const justified =
+      segs.some((seg) => /^[0-9]+$/.test(seg)) || segs.slice(0, -1).some(isStrongDotPart);
+    if (flatMixed.length >= 2 && !(flatMixed.every(isVersionShapedPart) && justified))
+      return false;
+    return segs.some(isStrongDotPart);
+  }
+  if (/[/:]/.test(tok)) return !tok.split(/[/:]/).some((seg) => isCredentialCore(seg));
+  return isSlugLike(tok.replace(/\./g, "-"));
+}
+
+/** 8+ chars mixing letters with digits: a short key/session id shape. */
+function isCredentialCore(core: string): boolean {
+  return (
+    core.length >= 8 &&
+    /[A-Za-z]/.test(core) &&
+    /[0-9]/.test(core) &&
+    !isOperationalToken(core)
+  );
+}
+
+/**
+ * A leading dot-segment that marks a dotted token as secret-shaped: the
+ * usual key-material prefixes. Common subdomain words (`api`, `auth`) are
+ * deliberately absent — `api.example.com` keeps via the slug judgment or
+ * the fallback, and must not redact.
+ */
+const SECRET_DOT_PREFIX =
+  /^(sk|secret|secrets|key|keys|token|tokens|bearer|session|password|passwd|pwd|private|credentials?)$/i;
+
+/**
+ * A dot-separated segment that marks a dotted token operational on its own:
+ * a real word (`amazonaws`) or a bare version number (`2`). Short entropy
+ * fragments (`a1`, `sk`) do not count.
+ */
+function isStrongDotPart(seg: string): boolean {
+  return /^[a-z]{5,}$/.test(seg) || /^[0-9]+$/.test(seg);
+}
+
+/**
+ * A flat letter-digit label shaped like a version or hostname part: one run
+ * of letters against one run of digits (`v1`, `s3`, `us2`, `3rc1`, `2beta1`).
+ * Interleaved entropy (`a1b2`, `ab12cd`) does not count.
+ */
+function isVersionShapedPart(seg: string): boolean {
+  return /^[a-zA-Z]+[0-9]+$/.test(seg) || /^[0-9]+[a-zA-Z]+[0-9]*$/.test(seg);
+}
+
+/**
+ * Lowercase hyphenated slug (`gpt-4o-mini`) that is not credential-shaped.
+ * Every non-initial segment must be a model-id part: a word (`mini`), a
+ * small number (`4`, `70`), a leading run plus letters (`4o`, `70b`), or a
+ * trailing single digit (`v3`, `o1`). Anything else — an internal digit run
+ * (`abc123def`), a trailing run (`abc123`), interleaved alphanumerics
+ * (`a1b2c3d4`) — reads as a credential and redacts. Mixed letter-digit
+ * segments may not outnumber the plain words: model ids are mostly words
+ * with version annotations (`gpt-4o-mini-v2` keeps), while segmented
+ * credentials spread their entropy across many mixed parts
+ * (`sk-live-a1-b2-c3-d4` redacts). Callers judging dotted tokens pass an
+ * explicit budget of 1, since dots already had their own fallback.
+ */
+function isSlugLike(core: string, maxMixed?: number): boolean {
+  const parts = core.split("-");
+  if (parts.length < 2 || !/^[a-z]+$/.test(parts[0] as string)) return false;
+  const rest = parts.slice(1) as string[];
+  const mixed = rest.filter((seg) => /[a-z]/.test(seg) && /[0-9]/.test(seg));
+  const budget = maxMixed ?? parts.filter((seg) => /^[a-z]+$/.test(seg)).length;
+  if (mixed.length > budget) return false;
+  return rest.every(
+    (seg) =>
+      /^[a-z]+$/.test(seg) ||
+      /^[0-9]{1,4}$/.test(seg) ||
+      /^[0-9]+[a-z]+$/.test(seg) ||
+      /^[a-z]+[0-9]$/.test(seg),
+  );
+}
+
 /** Opaque sha256 of an upstream account identity. Null when there is nothing to hash. */
 export function hashIdentity(parts: Array<string | null | undefined>): string | null {
   const joined = parts
@@ -491,7 +662,10 @@ export function parseHeaderSignals(
       const metric = m[3];
       if (metric === "used-percent") {
         // Codex `used-percent` is already 0–100 (unlike Claude's fractional
-        // utilization): a nearly-unused account reads "1", never 100.
+        // utilization): a nearly-unused account reads "1", never 100. Never
+        // route through toUsedPercent. Overage readings up to 150 still
+        // count — they mean exhausted, and dropping them would read unknown
+        // instead of out.
         const direct = Number(value);
         const used =
           Number.isFinite(direct) && direct >= 0 && direct <= 150 ? direct : null;
@@ -569,9 +743,9 @@ export function parseHeaderSignals(
         resetsAt: new Date(resetMs).toISOString(),
         limitReached: true,
         allowed: false,
-        // An explicit 429 watermark always limits, whatever the provider's
-        // quota-window allow-list names: it is evidence of throttling, not a
-        // quota window.
+        // An explicit 429 watermark always gates, whatever the provider's
+        // quota-window allow-list names: it is evidence of throttling (an
+        // admission signal), not a quota window.
         gating: true,
         observedAt,
         models: opts?.models ?? null,
@@ -775,7 +949,11 @@ export function parseAuthFiles(
           ? "cooling"
           : "error"
         : "active";
-    const statusMessage = getStr(entry, "status_message", "statusMessage", "StatusMessage");
+    // Upstream text can carry account identifiers: never persist it raw.
+    // Keep a short operational note with emails and long tokens stripped.
+    const statusMessage = sanitizeStatusMessage(
+      getStr(entry, "status_message", "statusMessage", "StatusMessage"),
+    );
     const priorityRaw = entry.priority ?? entry.Priority ?? null;
     const priority =
       typeof priorityRaw === "number" && Number.isFinite(priorityRaw)
@@ -929,9 +1107,10 @@ export function parseAuthFiles(
         stableId,
       ]),
       coolingDown: unavailable,
-      // Keep a past retry time: it lets the aggregator tell "cooldown lifted,
-      // no fresh telemetry" (unknown) apart from "no recovery bound at all"
-      // (out). Nulling it here dead-coded that branch and re-waited forever.
+      // Keep the parsed retry time even when it has passed: the aggregator
+      // needs the past timestamp to tell "cooldown lifted, no fresh
+      // telemetry" (unknown) apart from "no recovery bound at all" (out).
+      // Nulling it here dead-coded that branch and re-waited forever.
       cooldownUntil: nextRetryAfter,
       parseWarnings: [...parseWarnings, ...(pluginQuota?.warnings ?? [])],
     });

@@ -8,6 +8,7 @@ import {
   parseHeaderSignals,
   parseLegacySignalList,
   parsePluginQuota,
+  sanitizeStatusMessage,
 } from "./parsers.js";
 import { DEFAULT_PROVIDER_WINDOWS } from "./config.js";
 
@@ -124,7 +125,9 @@ describe("provider normalization (parser keys only, never identity)", () => {
 
   it("gating matches allow-list substrings, case-insensitive", () => {
     expect(isGatingWindow("claude", "5h", ["5H"])).toBe(true);
-    expect(isGatingWindow("codex", "primary", DEFAULT_PROVIDER_WINDOWS.codex)).toBe(false);
+    // Stock `x-codex-primary-*` windows gate: without this, stock Codex
+    // quotas never constrain routing.
+    expect(isGatingWindow("codex", "primary", DEFAULT_PROVIDER_WINDOWS.codex)).toBe(true);
     expect(isGatingWindow("codex", "weekly-primary", DEFAULT_PROVIDER_WINDOWS.codex)).toBe(true);
   });
 });
@@ -216,14 +219,14 @@ describe("parseHeaderSignals (source-mirrored header maps)", () => {
     });
   });
 
-  it("tier windows never gate under the default codex allow-list: bare and namespaced agree", () => {
-    // Gating is an allow-list (time-window) decision, not a tier decision:
-    // `primary`/`secondary` tier names gate only when the operator lists them
-    // via providerWindows. Bare `primary` and namespaced `acme-primary` parse
-    // to the same non-gating window under defaults, so a stock Codex
-    // exhaustion signal aggregates to unknown (fail open), never headroom —
-    // the same verdict as when the headers were dropped pre-parse.
-    const expected = { allowed: false, limitReached: true, gating: false };
+  it("tier windows gate under the default codex allow-list: bare and namespaced agree", () => {
+    // Bare `primary` and namespaced `acme-primary` parse to the same gating
+    // window under defaults. An explicit stock exhaustion signal
+    // (`allowed: false`) is positive evidence and must constrain routing —
+    // treating it like a dropped header (unknown, selectable) lets exhausted
+    // stock accounts keep receiving traffic. Missing telemetry still reads
+    // unknown; only an explicit denial gates.
+    const expected = { allowed: false, limitReached: true, gating: true };
     const bare = parseHeaderSignals(
       "codex",
       { "x-codex-primary-allowed": "false" },
@@ -328,6 +331,73 @@ describe("parseHeaderSignals (source-mirrored header maps)", () => {
       allowed: false,
       gating: true,
       resetsAt: iso(NOW_MS + 120_000),
+    });
+  });
+
+  it("a retry-after cooldown always gates, even under default windows", () => {
+    // The default allow-lists carry window substrings ("5h", …), never
+    // "retry-after": an explicit 429 watermark must still gate routing.
+    const { limits } = parseHeaderSignals(
+      "claude",
+      { "retry-after": "120" },
+      NOW,
+      DEFAULT_PROVIDER_WINDOWS.claude,
+    );
+    expect(limits).toHaveLength(1);
+    expect(limits[0]?.gating).toBe(true);
+  });
+
+  it("parses stock unnamespaced codex primary/secondary headers", () => {
+    const resetAt = String(Math.floor((NOW_MS + 3_600_000) / 1000));
+    const { limits, warnings } = parseHeaderSignals(
+      "codex",
+      {
+        "x-codex-primary-used-percent": "100",
+        "x-codex-primary-reset-at": resetAt,
+        "x-codex-primary-allowed": "false",
+      },
+      NOW,
+      DEFAULT_PROVIDER_WINDOWS.codex,
+    );
+    expect(warnings).toEqual([]);
+    expect(limits).toHaveLength(1);
+    expect(limits[0]).toMatchObject({
+      id: "codex:primary",
+      usedPercent: 100,
+      remainingPercent: 0,
+      allowed: false,
+      limitReached: true,
+      gating: true,
+    });
+  });
+
+  it("parses codex used-percent on the 0-100 scale (1% stays 1%)", () => {
+    const { limits } = parseHeaderSignals(
+      "codex",
+      { "x-codex-primary-used-percent": "1" },
+      NOW,
+      DEFAULT_PROVIDER_WINDOWS.codex,
+    );
+    expect(limits).toHaveLength(1);
+    expect(limits[0]).toMatchObject({ id: "codex:primary", usedPercent: 1, remainingPercent: 99 });
+  });
+
+  it("treats codex overage above 100% as exhausted, not unknown", () => {
+    // 105% used with no explicit denial: dropping the reading would leave no
+    // limiting evidence and the account would route as unknown (selectable).
+    const { limits } = parseHeaderSignals(
+      "codex",
+      { "x-codex-primary-used-percent": "105" },
+      NOW,
+      DEFAULT_PROVIDER_WINDOWS.codex,
+    );
+    expect(limits).toHaveLength(1);
+    expect(limits[0]).toMatchObject({
+      id: "codex:primary",
+      usedPercent: 105,
+      remainingPercent: 0,
+      allowed: false,
+      limitReached: true,
     });
   });
 
@@ -561,6 +631,133 @@ describe("parsePluginQuota", () => {
     const { limits, warnings } = parsePluginQuota("synthetic", "nope", ["weekly"]);
     expect(limits).toHaveLength(0);
     expect(warnings.length).toBeGreaterThan(0);
+  });
+});
+
+describe("sanitizeStatusMessage", () => {
+  it("keeps short operational notes unchanged", () => {
+    expect(sanitizeStatusMessage("ok")).toBe("ok");
+    expect(sanitizeStatusMessage("429 rate limited")).toBe("429 rate limited");
+    expect(sanitizeStatusMessage(null)).toBeNull();
+  });
+
+  it("redacts emails and long tokens instead of leaking them to the page", () => {
+    const scrubbed = sanitizeStatusMessage("quota exceeded for user@example.com, token abcdefghijklmnopqrstu") ?? "";
+    expect(scrubbed).not.toContain("user@example.com");
+    expect(scrubbed).not.toContain("abcdefghijklmnopqrstu");
+    expect(scrubbed).toContain("[redacted-email]");
+    expect(scrubbed).toContain("[redacted]");
+  });
+
+  it("redacts short credential-like tokens but keeps hyphenated operational words", () => {
+    const scrubbed = sanitizeStatusMessage("auth failed, key ab12cd34ef, retry rate-limited soon") ?? "";
+    expect(scrubbed).not.toContain("ab12cd34ef");
+    expect(scrubbed).toContain("[redacted]");
+    expect(scrubbed).toContain("rate-limited");
+  });
+
+  it("keeps timestamps, versions, k=v pairs and model ids out of the redactor", () => {
+    const msg = "reset 2026-11-01T12:00:00Z via HTTP/1.1, error=429 for gpt-4o-mini, key sk-live-abc123";
+    const scrubbed = sanitizeStatusMessage(msg) ?? "";
+    for (const keep of ["2026-11-01T12:00:00Z", "HTTP/1.1", "error=429", "gpt-4o-mini"]) {
+      expect(scrubbed).toContain(keep);
+    }
+    expect(scrubbed).not.toContain("sk-live-abc123");
+    expect(scrubbed).toContain("[redacted]");
+  });
+
+  it("redacts credential-shaped k=v values and interleaved-alphanumeric slugs", () => {
+    const scrubbed = sanitizeStatusMessage("retry token=ab12cd34ef with sk-live-a1b2c3d4 for llama-3-3-70b") ?? "";
+    expect(scrubbed).not.toContain("token=ab12cd34ef");
+    expect(scrubbed).not.toContain("sk-live-a1b2c3d4");
+    expect(scrubbed).toContain("llama-3-3-70b");
+    expect(scrubbed).toContain("[redacted]");
+  });
+
+  it("redacts internal-digit slugs and label:credential tokens, keeps timestamps", () => {
+    const scrubbed =
+      sanitizeStatusMessage("key sk-live-abc123def, token:ab12cd34ef seen 2026-11-01T12:00:00Z") ?? "";
+    expect(scrubbed).not.toContain("sk-live-abc123def");
+    expect(scrubbed).not.toContain("token:ab12cd34ef");
+    expect(scrubbed).toContain("2026-11-01T12:00:00Z");
+    expect(scrubbed).toContain("[redacted]");
+  });
+
+  it("redacts segmented letter-digit credentials spread across hyphen parts", () => {
+    const scrubbed = sanitizeStatusMessage("key sk-live-a1-b2-c3-d4 rejected") ?? "";
+    expect(scrubbed).not.toContain("sk-live-a1-b2-c3-d4");
+    expect(scrubbed).toContain("[redacted]");
+  });
+
+  it("keeps multi-version model ids while redacting segmented credentials", () => {
+    const scrubbed =
+      sanitizeStatusMessage("model gpt-4o-mini-v2 unavailable, key sk-live-a1-b2-c3-d4 rejected") ?? "";
+    expect(scrubbed).toContain("gpt-4o-mini-v2");
+    expect(scrubbed).not.toContain("sk-live-a1-b2-c3-d4");
+    expect(scrubbed).toContain("[redacted]");
+  });
+
+  it("keeps dotted hostnames and versions but redacts dotted credentials", () => {
+    const scrubbed =
+      sanitizeStatusMessage("lookup s3.amazonaws.com failed, deploy v1.2.3-beta1 ready, note sk.live.a1.b2 here") ??
+      "";
+    expect(scrubbed).toContain("s3.amazonaws.com");
+    expect(scrubbed).toContain("v1.2.3-beta1");
+    expect(scrubbed).not.toContain("sk.live.a1.b2");
+    expect(scrubbed).toContain("[redacted]");
+  });
+
+  it("redacts date-shaped credentials while keeping bare timestamps", () => {
+    const scrubbed = sanitizeStatusMessage("key sk-2026-11-01-ab12 seen 2026-11-01T12:00Z") ?? "";
+    expect(scrubbed).not.toContain("sk-2026-11-01-ab12");
+    expect(scrubbed).toContain("2026-11-01T12:00Z");
+    expect(scrubbed).toContain("[redacted]");
+  });
+
+  it("keeps dotted model ids and minute-precision timestamps out of the redactor", () => {
+    const scrubbed =
+      sanitizeStatusMessage("reset 2026-11-01T12:00Z for claude-3.5-sonnet, gemini-2.5-flash-lite, llama-3.1-70b-instruct") ?? "";
+    for (const keep of [
+      "2026-11-01T12:00Z",
+      "claude-3.5-sonnet",
+      "gemini-2.5-flash-lite",
+      "llama-3.1-70b-instruct",
+    ]) {
+      expect(scrubbed).toContain(keep);
+    }
+    expect(scrubbed).not.toContain("[redacted]");
+  });
+
+  it("keeps fractional-second and offset timestamps out of the redactor", () => {
+    const scrubbed =
+      sanitizeStatusMessage("retry 2026-11-01T12:00:00.000Z, backoff 2026-11-01T12:00:00+00:00") ?? "";
+    expect(scrubbed).toContain("2026-11-01T12:00:00.000Z");
+    expect(scrubbed).toContain("2026-11-01T12:00:00+00:00");
+    expect(scrubbed).not.toContain("[redacted]");
+  });
+
+  it("redacts dotted credentials that hide behind an operational-looking label", () => {
+    const scrubbed = sanitizeStatusMessage("note sk.production.a1.b2 here") ?? "";
+    expect(scrubbed).not.toContain("sk.production.a1.b2");
+    expect(scrubbed).toContain("[redacted]");
+  });
+
+  it("keeps dotted versions and hostnames with several structured mixed labels", () => {
+    const scrubbed =
+      sanitizeStatusMessage("deploy v1.2.3rc1 on s3.us2.amazonaws.com, note sk.production.a1.b2 here") ?? "";
+    expect(scrubbed).toContain("v1.2.3rc1");
+    expect(scrubbed).toContain("s3.us2.amazonaws.com");
+    expect(scrubbed).not.toContain("sk.production.a1.b2");
+    expect(scrubbed).toContain("[redacted]");
+  });
+
+  it("redacts segmented credentials that end on a payload word", () => {
+    const scrubbed =
+      sanitizeStatusMessage("deploy v1.2.3rc1 on s3.us2.amazonaws.com, note a1.b2.production here") ?? "";
+    expect(scrubbed).not.toContain("a1.b2.production");
+    expect(scrubbed).toContain("[redacted]");
+    expect(scrubbed).toContain("v1.2.3rc1");
+    expect(scrubbed).toContain("s3.us2.amazonaws.com");
   });
 });
 
