@@ -19,9 +19,15 @@
  * Host contract (stated honestly, tested): `retryAt` is advisory — core owns
  * the actual wait and clamps it to its own bounds. The router returns member
  * selection plus `skipped` notes only; it never sees, forwards, or constrains
- * the task's native execution input. `missing-connection` drift (a config row
- * whose connection appears in no pool member) is reported as a
- * `skipped["pool:<id>"]` note — it never blocks selection.
+ * the task's native execution input. `missing-connection` drift means a
+ * `providers[]` row whose connection is bound by no pool using this router
+ * (fleet-wide), or a connection that is archived or missing: it is computed
+ * across every pool's member bindings — never from one pool's members alone,
+ * where every sibling row would false-positive — and reported as page drift.
+ * Per route, the only missing-connection this pool can vouch for is its own
+ * member binding naming a connection with no `providers[]` row; that is
+ * reported as a `skipped["pool:<id>"]` note. Neither note ever blocks
+ * selection.
  *
  * Rotation (not most-headroom) orders the selectable members; unknown members
  * rotate with healthy ones (fail open), never ahead of them by design — order
@@ -73,16 +79,24 @@ export function resolveProviderRow(
 }
 
 /**
- * `missing-connection` drift at route time: config rows whose connection id
- * appears in none of the pool's candidate bindings. Pure — route() reports
- * these as a `skipped["pool:<id>"]` note without blocking selection.
+ * `missing-connection` drift, fleet-wide: config rows whose connection id is
+ * bound by none of the pools using this router. Pure.
+ *
+ * The caller MUST pass the union of member-binding connection ids across
+ * every pool that routes through `cliproxy-connector` — never one pool's
+ * members alone. The host's route input carries only the current pool's
+ * candidates, so route() cannot satisfy that contract and never calls this
+ * per route (a per-pool call false-positives on every sibling row in the
+ * single-member-pool fleet). Evaluate it where the union is known (fleet
+ * tests, a future host sibling-pool field, or an offline audit) and surface
+ * findings as page drift; see TWO-690.
  */
 export function detectMissingConnections(
   config: ConnectorConfig,
-  candidateConnectionIds: Array<string | null>,
+  pooledConnectionIds: Array<string | null>,
 ): ProviderEntry[] {
-  const present = new Set(candidateConnectionIds.filter((c): c is string => !!c));
-  return config.providers.filter((p) => !present.has(p.connectionId));
+  const pooled = new Set(pooledConnectionIds.filter((c): c is string => !!c));
+  return config.providers.filter((p) => !pooled.has(p.connectionId));
 }
 
 interface Assessment {
@@ -162,16 +176,26 @@ function clampFuture(retryAt: string, nowMs: number): string {
 
 export function route(input: RouteInput): RouteResult {
   const nowMs = parseTime(input.now) ?? Date.now();
+  // The only missing-connection this pool can vouch for is its own member
+  // binding naming a connection with no `providers[]` row. Sibling rows
+  // (present in config, bound by other pools) are never this pool's finding:
+  // reporting them per route false-positives on every route in the
+  // single-member-pool fleet (TWO-690). Fleet-wide absence (a row bound by
+  // no pool at all) is `detectMissingConnections` over the union of every
+  // pool's bindings — evaluated where that union is known, not here.
   const missingNote = (() => {
-    const missing = detectMissingConnections(
-      input.config,
-      input.candidates.map((c) => c.connectionId),
-    );
-    if (missing.length === 0) return null;
+    const unmapped = [
+      ...new Set(
+        input.candidates
+          .filter((c) => c.connectionId && !resolveProviderRow(input.config, c.connectionId))
+          .map((c) => c.connectionId as string),
+      ),
+    ].sort();
+    if (unmapped.length === 0) return null;
     return (
-      `drift [missing-connection]: providers[] row(s) ${missing.map((m) => `${m.provider}→${m.connectionId}`).join(", ")} ` +
-      `name connections absent from this pool's members; single-member pools route only their own connection. ` +
-      `Wire them into the pool or drop the row(s).`
+      `drift [missing-connection]: this pool binds connection(s) ${unmapped.join(", ")} ` +
+      `with no providers[] row; the member routes unknown (fail open), never headroom. ` +
+      `Add a providers[] row for the connection or fix the member binding.`
     );
   })();
   const withPoolNote = (skipped: Record<string, string>): Record<string, string> => {

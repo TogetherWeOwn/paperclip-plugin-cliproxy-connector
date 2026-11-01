@@ -217,33 +217,81 @@ describe("pinned tasks", () => {
   });
 });
 
-describe("missing-connection drift (route time)", () => {
-  it("detectMissingConnections is pure over candidate bindings", () => {
-    const cfg = testConfig({
+describe("missing-connection drift (TWO-690)", () => {
+  function fleetConfig(): ConnectorConfig {
+    return testConfig({
       providers: [
         { provider: "claude", connectionId: "conn-claude", completeInventory: true },
-        { provider: "codex", connectionId: "conn-codex", completeInventory: false },
+        { provider: "codex", connectionId: "conn-codex", completeInventory: true },
+        { provider: "zai", connectionId: "conn-zai", completeInventory: true },
       ],
     });
-    expect(detectMissingConnections(cfg, ["conn-claude"])).toEqual([
-      { provider: "codex", connectionId: "conn-codex", completeInventory: false },
-    ]);
-    expect(detectMissingConnections(cfg, ["conn-claude", "conn-codex"])).toEqual([]);
+  }
+
+  it("detectMissingConnections is fleet-wide over the union of every pool's bindings", () => {
+    const cfg = fleetConfig();
+    expect(resolveProviderRow(cfg, "conn-claude")?.provider).toBe("claude");
+    expect(resolveProviderRow(cfg, "conn-ghost")).toBeNull();
+    // Every row bound by some pool: no drift.
+    expect(detectMissingConnections(cfg, ["conn-claude", "conn-codex", "conn-zai"])).toEqual([]);
+    // One pool's members alone must NOT be passed: from a single pool's view
+    // the sibling rows look missing, but they are bound elsewhere.
+    expect(
+      detectMissingConnections(cfg, ["conn-claude"]).map((p) => p.connectionId).sort(),
+    ).toEqual(["conn-codex", "conn-zai"]);
   });
 
-  it("reports missing-connection as a pool note without blocking selection", () => {
-    const cfg = testConfig({
-      providers: [
-        { provider: "claude", connectionId: "conn-claude", completeInventory: true },
-        { provider: "codex", connectionId: "conn-codex", completeInventory: false },
-      ],
-    });
-    const r = route(input({ config: cfg }));
+  it("a fleet of single-member pools gives no drift", () => {
+    const cfg = fleetConfig();
+    const pools = ["conn-claude", "conn-codex", "conn-zai"];
+    for (const [i, connectionId] of pools.entries()) {
+      const r = route(
+        input({
+          config: cfg,
+          poolId: `pool-${i}`,
+          candidates: [{ memberId: `m-${i}`, model: "", connectionId }],
+          rows: [row({ key: `acct-${i}` })],
+        }),
+      );
+      expect(r.kind).toBe("selected");
+      if (r.kind === "selected") {
+        expect(Object.values(r.skipped).join("\n")).not.toMatch(/missing-connection/);
+      }
+    }
+    // And the fleet union itself is clean.
+    expect(detectMissingConnections(cfg, pools)).toEqual([]);
+  });
+
+  it("a row with an unpooled connection gives exactly one finding", () => {
+    const cfg = fleetConfig();
+    const pooled = ["conn-claude", "conn-codex"]; // conn-zai bound by no pool
+    const missing = detectMissingConnections(cfg, pooled);
+    expect(missing).toEqual([{ provider: "zai", connectionId: "conn-zai", completeInventory: true }]);
+  });
+
+  it("route() reports missing-connection only for this pool's own unmapped member, without blocking selection", () => {
+    const cfg = fleetConfig();
+    const r = route(
+      input({
+        config: cfg,
+        candidates: [{ memberId: "m-a", model: "", connectionId: "conn-ghost" }],
+      }),
+    );
     expect(r.kind).toBe("selected");
     if (r.kind === "selected") {
+      expect(r.memberId).toBe("m-a");
       expect(r.skipped["pool:pool-1"]).toMatch(/missing-connection/);
-      expect(resolveProviderRow(cfg, "conn-claude")?.provider).toBe("claude");
-      expect(resolveProviderRow(cfg, "conn-ghost")).toBeNull();
+      expect(r.skipped["pool:pool-1"]).toMatch(/conn-ghost/);
+      // Names only this pool's own binding — never the sibling rows.
+      expect(r.skipped["pool:pool-1"]).not.toMatch(/conn-codex|conn-zai/);
+    }
+  });
+
+  it("members without a binding connection raise no missing-connection note", () => {
+    const r = route(input({ config: fleetConfig(), candidates: [{ memberId: "m-a", model: "", connectionId: null }] }));
+    expect(r.kind).toBe("selected");
+    if (r.kind === "selected") {
+      expect(Object.values(r.skipped).join("\n")).not.toMatch(/missing-connection/);
     }
   });
 });
