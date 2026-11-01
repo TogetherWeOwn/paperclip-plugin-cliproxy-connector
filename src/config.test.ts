@@ -3,6 +3,7 @@ import {
   effectiveReservePercent,
   isLoopbackUrl,
   parseConfig,
+  stripTrailingSlashes,
 } from "./config.js";
 
 function base(over: Record<string, unknown> = {}) {
@@ -113,6 +114,12 @@ describe("security knobs (kept from v1)", () => {
     expect(isLoopbackUrl("http://[::1]:8317")).toBe(true);
     expect(isLoopbackUrl("https://cliproxy.example.com")).toBe(false);
     expect(isLoopbackUrl("http://21370.example.com")).toBe(false);
+  });
+});
+
+describe("stripTrailingSlashes (non-regex trailing-slash trim)", () => {
+  it("strips trailing slashes without a regex", () => {
+    expect(stripTrailingSlashes("http://127.0.0.1:8317///")).toBe("http://127.0.0.1:8317");
   });
 });
 

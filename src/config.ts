@@ -96,6 +96,17 @@ export const DEFAULT_PROVIDER_WINDOWS: Record<string, string[]> = {
 /** Single path segment: no slashes, no dots, no encoding tricks. Shared with the management client. */
 export const SINGLE_SEGMENT = /^[A-Za-z0-9][A-Za-z0-9_-]*$/;
 
+/**
+ * Strip trailing slashes without a regex. The `/\/+$/` form trips CodeQL
+ * `js/polynomial-redos` (low risk here — the value is operator config that
+ * passes loopback validation — but a high must not merge open).
+ */
+export function stripTrailingSlashes(value: string): string {
+  let end = value.length;
+  while (end > 0 && value[end - 1] === "/") end -= 1;
+  return value.slice(0, end);
+}
+
 export function isLoopbackUrl(raw: string): boolean {
   let url: URL;
   try {
@@ -129,7 +140,7 @@ export function parseConfig(raw: unknown): { config: ConnectorConfig; validation
   const num = (v: unknown, fallback: number) =>
     typeof v === "number" && Number.isFinite(v) ? v : fallback;
 
-  const cliproxyBaseUrl = str(r.cliproxyBaseUrl).trim().replace(/\/+$/, "");
+  const cliproxyBaseUrl = stripTrailingSlashes(str(r.cliproxyBaseUrl).trim());
   const managementKeyHeader = str(r.managementKeyHeader).trim();
 
   if (!cliproxyBaseUrl) {

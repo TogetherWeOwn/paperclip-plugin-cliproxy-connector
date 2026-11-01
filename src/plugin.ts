@@ -12,7 +12,7 @@ import type {
   PluginApiResponse,
   PluginContext,
 } from "@paperclipai/plugin-sdk";
-import { parseConfig, type ConnectorConfig } from "./config.js";
+import { parseConfig, stripTrailingSlashes, type ConnectorConfig } from "./config.js";
 import {
   LAST_ERROR_STATE_KEY,
   LAST_SYNC_STATE_KEY,
@@ -54,7 +54,7 @@ export function normaliseStrikeOrigin(cliproxyBaseUrl: string): string {
     const port = url.port || (url.protocol === "https:" ? "443" : "80");
     return `loopback:${port}`;
   } catch {
-    return `loopback:${cliproxyBaseUrl.trim().replace(/\/+$/, "")}`;
+    return `loopback:${stripTrailingSlashes(cliproxyBaseUrl.trim())}`;
   }
 }
 
@@ -120,7 +120,7 @@ function legacyOriginFor(config: ConnectorConfig): string {
   try {
     return new URL(config.cliproxyBaseUrl).origin;
   } catch {
-    return config.cliproxyBaseUrl.trim().replace(/\/+$/, "");
+    return stripTrailingSlashes(config.cliproxyBaseUrl.trim());
   }
 }
 

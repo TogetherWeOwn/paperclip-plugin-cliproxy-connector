@@ -17,7 +17,7 @@
  * key is resolved per run from a `secret_ref` and kept in memory only.
  */
 
-import { SINGLE_SEGMENT, isLoopbackUrl } from "./config.js";
+import { SINGLE_SEGMENT, isLoopbackUrl, stripTrailingSlashes } from "./config.js";
 
 export const MANAGEMENT_TIMEOUT_MS = 15_000;
 export const MANAGEMENT_MAX_BYTES = 2 * 1024 * 1024;
@@ -299,7 +299,7 @@ export class CliproxyManagementClient {
     }
     if (!opts.keyHeader) throw new CliproxyConfigError("Key header name is required.");
     if (!opts.key) throw new CliproxyConfigError("Resolved management key is required.");
-    this.baseUrl = opts.baseUrl.replace(/\/+$/, "");
+    this.baseUrl = stripTrailingSlashes(opts.baseUrl);
     this.keyHeader = opts.keyHeader;
     this.key = opts.key;
     this.fetchImpl = opts.fetchImpl ?? fetch;
@@ -399,7 +399,7 @@ export class CliproxyClientApiClient {
       throw new CliproxyConfigError("CLIProxy base URL must be loopback.");
     }
     if (!opts.key) throw new CliproxyConfigError("Resolved client API key is required.");
-    this.baseUrl = opts.baseUrl.replace(/\/+$/, "");
+    this.baseUrl = stripTrailingSlashes(opts.baseUrl);
     this.key = opts.key;
     this.fetchImpl = opts.fetchImpl ?? fetch;
     this.timeoutMs = opts.timeoutMs ?? MANAGEMENT_TIMEOUT_MS;
