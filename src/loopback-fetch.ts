@@ -25,6 +25,7 @@
  */
 
 import {
+  API_CALL_PATH,
   CliproxyConfigError,
   CliproxyNetworkError,
   MANAGEMENT_TIMEOUT_MS,
@@ -94,6 +95,13 @@ export function createLoopbackFetch(baseUrl: string, opts: LoopbackFetchOptions 
       throw new CliproxyConfigError("loopback transport allows GET and the pinned api-call POST only; refusing to send another method.");
     }
     const url = canonicalLoopbackUrl(input);
+    // POST is pinned to the api-call path with no query string: the transport
+    // stays a second, independent guard behind the management client's own
+    // allow-list, so a future credential-bearing POST to another management
+    // endpoint is refused here even if the caller checks pass.
+    if (method === "POST" && (url.pathname !== API_CALL_PATH || url.search !== "")) {
+      throw new CliproxyConfigError("loopback transport allows POST only to the pinned api-call path.");
+    }
     // Canonical origin (host:port from config), and loopback: a request to
     // any other host — loopback-spelled or not — never leaves this function.
     if (url.origin !== baseOrigin || !isLoopbackUrl(url.toString())) {

@@ -442,3 +442,51 @@ describe("limiting verdict edges", () => {
     expect(assess([r]).state).toBe("unknown");
   });
 });
+
+describe("live provider-API unknown rows (devin plan-only answers)", () => {
+  const unknownDevin = (id: string) =>
+    limit({
+      id,
+      label: `Devin ${id}`,
+      usedPercent: null,
+      remainingPercent: null,
+      resetsAt: null,
+      limitReached: false,
+      // Admission is not denied — only the percent telemetry is missing.
+      allowed: true,
+      gating: true,
+      observedAt: NOW,
+      models: null,
+    });
+  const devinAccount = (limits: UsageLimitRow[]) =>
+    row({ provider: "devin", channel: "devin", limits, quotaBlind: false });
+
+  it("a plan-only answer is unknown, never exhaustion, even with complete inventory", () => {
+    const a = assess([devinAccount([unknownDevin("devin:daily"), unknownDevin("devin:weekly")])], {
+      provider: "devin",
+      model: null,
+    });
+    expect(a.state).toBe("unknown");
+  });
+
+  it("a partial answer vetoes headroom without reporting exhaustion", () => {
+    const a = assess(
+      [devinAccount([limit({ id: "devin:daily", label: "Devin daily", observedAt: NOW }), unknownDevin("devin:weekly")])],
+      { provider: "devin", model: null },
+    );
+    expect(a.state).toBe("unknown");
+  });
+
+  it("genuine reported exhaustion still waits", () => {
+    const a = assess(
+      [
+        devinAccount([
+          limit({ id: "devin:daily", label: "Devin daily", usedPercent: 100, remainingPercent: 0, limitReached: true, allowed: false, observedAt: NOW }),
+          limit({ id: "devin:weekly", label: "Devin weekly", usedPercent: 100, remainingPercent: 0, limitReached: true, allowed: false, observedAt: NOW }),
+        ]),
+      ],
+      { provider: "devin", model: null },
+    );
+    expect(a.state).toBe("exhausted");
+  });
+});

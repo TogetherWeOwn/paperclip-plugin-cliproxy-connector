@@ -439,11 +439,16 @@ function makeLimit(init: {
 
 /**
  * Emit an expected live window whose percent is missing or unusable. The row
- * carries no usable percent, so aggregation treats it as unknown — and for an
- * admission-signal provider as limiting (fail closed) — rather than letting
- * a sibling usable window imply full coverage. The row still marks the window
- * as expected, so it clears quota-blind when at least one gating window was
- * expected.
+ * carries no usable percent, so aggregation treats it as unknown rather than
+ * letting a sibling usable window imply full coverage: an unknown window
+ * still vetoes headroom, but it must never read as exhaustion. For an
+ * admission-signal provider an `allowed: null` row would read as limiting
+ * (fail closed), so a caller that knows the plan exists passes
+ * `allowed: true` — admission is not denied, only the percent telemetry is
+ * missing (`remainingPercent: null` keeps the verdict unknown). The row still
+ * marks the window as expected, so it clears quota-blind when at least one
+ * gating window was expected. Genuine exhaustion keeps flowing through the
+ * usable branch with an explicit `allowed: false`.
  */
 function makeUnknownProviderWindow(args: {
   provider: "meta" | "devin";
@@ -451,6 +456,7 @@ function makeUnknownProviderWindow(args: {
   label: string;
   observedAt: string | null;
   allowList: string[];
+  allowed?: boolean | null;
 }): UsageLimitRow {
   return makeLimit({
     id: `${args.provider}:${args.id}`,
@@ -459,7 +465,7 @@ function makeUnknownProviderWindow(args: {
     remainingPercent: null,
     resetsAt: null,
     limitReached: false,
-    allowed: null,
+    allowed: args.allowed ?? null,
     gating: isGatingWindow(args.provider, args.id, args.allowList),
     observedAt: args.observedAt,
     viaProviderApi: true,
@@ -1037,10 +1043,11 @@ function parseDevinUnixSeconds(value: unknown): string | null {
  * `planInfo.planName`. This reads the live RPC — never auth-file metadata or
  * `quota.signals` — which is why the connector saw nothing for Devin before
  * the live provider-API reads. An expected window without a usable percent is emitted as an
- * explicit unknown row: for Devin's admission semantics that unknown is
- * limiting (fail closed), so a partial response cannot leave a usable sibling
- * as false headroom. Zero usable windows is `empty_data`-equivalent: plan
- * only, account stays unknown.
+ * explicit unknown row: the row vetoes headroom (so a partial response
+ * cannot leave a usable sibling as false headroom) but never reads as
+ * exhaustion — a plan-only answer carries no quota evidence, so the account
+ * stays unknown rather than waiting on a phantom limit. Zero usable windows
+ * is `empty_data`-equivalent: plan only, account stays unknown.
  */
 export function parseDevinQuota(
   body: unknown,
@@ -1076,6 +1083,12 @@ export function parseDevinQuota(
           label: `devin ${window}`,
           observedAt,
           allowList,
+          // The plan exists (planStatus answered) — admission is not denied,
+          // only the percent telemetry is missing. `allowed: true` with a
+          // null percent keeps the aggregation verdict unknown (still
+          // vetoing headroom) instead of tripping Devin's admission-based
+          // limiting rule into phantom exhaustion.
+          allowed: true,
         }),
       );
       continue;
@@ -1816,16 +1829,25 @@ export function parseAuthFiles(
       }
     }
 
-    // Live windows supersede same-id passive/plugin windows: the RPC reads the
-    // same underlying quota fresher (observed at sync time), and keeping both
-    // would duplicate the row and let a stale passive reading veto the fresh
-    // live headroom. Failover stays: when the live fetch fails there is no
-    // apiLimit, so the passive/plugin windows show again.
-    const liveIds = new Set(apiLimits.map((l) => l.id));
+    // Usable live windows supersede same-id passive/plugin windows: the RPC
+    // reads the same underlying quota fresher (observed at sync time), and
+    // keeping both would duplicate the row and let a stale passive reading
+    // veto the fresh live headroom. An expected-but-unreadable live row must
+    // not evict a usable twin: it joins the set only when no same-id
+    // passive/plugin row covers the window, so a live answer without usable
+    // percents degrades to unknown instead of discarding genuine headroom.
+    // Failover stays: when the live fetch fails there is no apiLimit, so the
+    // passive/plugin windows show again.
+    const usableLive = (l: UsageLimitRow) => l.remainingPercent !== null || l.limitReached;
+    const liveIds = new Set(apiLimits.filter(usableLive).map((l) => l.id));
     const live = (l: UsageLimitRow) => !liveIds.has(l.id);
+    const twinIds = new Set(
+      [...limits.filter(live), ...pluginLimits.filter(live)].map((l) => l.id),
+    );
+    const apiRows = apiLimits.filter((l) => usableLive(l) || !twinIds.has(l.id));
     const stamped = softGating
-      ? [...limits.filter(live).map((l) => ({ ...l, gating: false })), ...pluginLimits.filter(live), ...apiLimits]
-      : [...limits.filter(live), ...pluginLimits.filter(live), ...apiLimits];
+      ? [...limits.filter(live).map((l) => ({ ...l, gating: false })), ...pluginLimits.filter(live), ...apiRows]
+      : [...limits.filter(live), ...pluginLimits.filter(live), ...apiRows];
 
     // Meta and Antigravity publish no passive signals: without live provider-API
     // windows they stay quota-blind. With at least one gating live window they

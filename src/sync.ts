@@ -74,10 +74,15 @@ export interface ApiCallCachedEnvelope {
  * Normalise a CLIProxy base URL to its origin for api-call throttle/cache
  * keying. Two companies pointing at the same CLIProxy share one throttle
  * bucket and one cache entry per credential; different origins never share.
+ * The `localhost` spelling is normalised exactly the way the transport
+ * canonicalises it, so `localhost` and `127.0.0.1` configurations of one
+ * CLIProxy do not throttle (and call) twice.
  */
 export function apiCallOriginKey(cliproxyBaseUrl: string): string {
   try {
-    return new URL(cliproxyBaseUrl).origin;
+    const url = new URL(cliproxyBaseUrl);
+    if (url.hostname.toLowerCase() === "localhost") url.hostname = "127.0.0.1";
+    return url.origin;
   } catch {
     return cliproxyBaseUrl.trim();
   }

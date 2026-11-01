@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { parseConfig } from "./config.js";
 import {
+  apiCallOriginKey,
   emptyStrikeBudget,
   reenableAfterStrike,
   runSync,
@@ -1531,5 +1532,17 @@ describe("live provider-API quota (pinned api-call templates)", () => {
     }
     assertNoKeyLeak(sA);
     assertNoKeyLeak(sB);
+  });
+
+  it("localhost and 127.0.0.1 spellings share one throttle bucket", () => {
+    expect(apiCallOriginKey("http://localhost:8317")).toBe("http://127.0.0.1:8317");
+    expect(apiCallOriginKey("http://127.0.0.1:8317")).toBe("http://127.0.0.1:8317");
+    expect(apiCallOriginKey("http://localhost:8317")).toBe(
+      apiCallOriginKey("HTTP://127.0.0.1:8317/"),
+    );
+    // A different port is a different CLIProxy: never shared.
+    expect(apiCallOriginKey("http://localhost:8318")).not.toBe(
+      apiCallOriginKey("http://localhost:8317"),
+    );
   });
 });

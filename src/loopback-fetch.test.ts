@@ -140,6 +140,32 @@ describe("per-request guards", () => {
     expect(seen.init?.body).toBe(JSON.stringify({ auth_index: "idx1" }));
   });
 
+  it("refuses a POST outside the pinned api-call path", async () => {
+    const fetch = vi.fn(async () => json(200, {}));
+    const guarded = createLoopbackFetch(BASE, { fetchImpl: fetch });
+    await expect(
+      guarded(`${BASE}/v0/management/config`, { method: "POST", body: "{}" }),
+    ).rejects.toThrow(/POST only to the pinned api-call path/);
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it("refuses a POST to the api-call path with a query string", async () => {
+    const fetch = vi.fn(async () => json(200, {}));
+    const guarded = createLoopbackFetch(BASE, { fetchImpl: fetch });
+    await expect(
+      guarded(`${BASE}/v0/management/api-call?debug=1`, { method: "POST", body: "{}" }),
+    ).rejects.toThrow(/POST only to the pinned api-call path/);
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it("a GET to another management path still passes the transport", async () => {
+    const fetch = vi.fn(async () => json(200, { ok: true }));
+    const guarded = createLoopbackFetch(BASE, { fetchImpl: fetch });
+    const res = await guarded(`${BASE}/v0/management/auth-files`);
+    expect(res.status).toBe(200);
+    expect(fetch).toHaveBeenCalledTimes(1);
+  });
+
   it("forces redirect: manual even when the caller asks to follow", async () => {
     let seenRedirect: RequestRedirect | undefined;
     const fetch = vi.fn(async (_url: string, init?: RequestInit) => {
