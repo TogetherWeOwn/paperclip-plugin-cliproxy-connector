@@ -527,10 +527,12 @@ export function parseHeaderSignals(
 
   const limits: UsageLimitRow[] = [];
   for (const a of byWindow.values()) {
-    // Metadata alone is never a window: a bare limit-name with no quota
-    // reading must not emit an allowed:null row, which reads as limiting
-    // for admission-signal providers and would false-exhaust the account.
-    if (a.used === null && a.allowed === null && !a.limitReached && a.extraResetMs.length === 0) {
+    // Metadata alone is never a window: a bare limit-name — or a lone
+    // reset timestamp — with no quota reading must not emit an allowed:null
+    // row, which reads as limiting for admission-signal providers and would
+    // false-exhaust the account. A reset bound ships with the next real
+    // reading; until then the window is unknown, never limiting.
+    if (a.used === null && a.allowed === null && !a.limitReached) {
       continue;
     }
     let usedPercent: number | null = a.used;

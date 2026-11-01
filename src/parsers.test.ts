@@ -286,6 +286,20 @@ describe("parseHeaderSignals (source-mirrored header maps)", () => {
     expect(warnings.length).toBeGreaterThan(0);
   });
 
+  it("a reset timestamp alone emits no window (a bound without a reading is metadata)", () => {
+    // A lone reset-at for an allow-listed window would otherwise emit an
+    // allowed:null row, which reads as limiting for admission-signal
+    // providers and false-exhausts the account until the reset passes.
+    const { limits, warnings } = parseHeaderSignals(
+      "codex",
+      { "x-codex-weekly-primary-reset-at": String(Math.floor((NOW_MS + 3_600_000) / 1000)) },
+      NOW,
+      DEFAULT_PROVIDER_WINDOWS.codex,
+    );
+    expect(limits).toHaveLength(0);
+    expect(warnings.length).toBeGreaterThan(0);
+  });
+
   it("reads codex used-percent on the 0–100 scale (1% is not exhaustion)", () => {
     for (const [raw, used] of [
       ["0", 0],
