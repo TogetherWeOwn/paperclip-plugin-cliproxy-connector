@@ -41,6 +41,21 @@ export function pruneFailures(failures: string[], nowMs: number): string[] {
   });
 }
 
+/**
+ * When the next probe is allowed again: the moment the failure count drops
+ * below STRIKE_LIMIT. Null when the window already has room. The board page
+ * shows this as "wait until <time>" instead of offering a probe that would
+ * trip the host-wide CLIProxy ban.
+ */
+export function strikeWaitUntil(failures: string[], nowMs: number): string | null {
+  const pruned = pruneFailures(failures, nowMs)
+    .map((iso) => Date.parse(iso))
+    .filter((t) => !Number.isNaN(t))
+    .sort((a, b) => a - b);
+  if (pruned.length < STRIKE_LIMIT) return null;
+  return new Date(pruned[pruned.length - STRIKE_LIMIT] + STRIKE_WINDOW_MS).toISOString();
+}
+
 export interface SyncDeps {
   config: ConnectorConfig;
   companyId: string;
@@ -99,6 +114,40 @@ export async function runSync(deps: SyncDeps, inFlight: { running: boolean }): P
           "Board re-enable required; config edits do not reset the budget.",
       });
     }
+    // The window is full (only possible right after a board re-enable that
+    // kept the rolling failures): refuse to probe. Sending a key that is
+    // still bad here would push the host past 2 rejections in 30 min.
+    // Re-disable with the wait time so the page says "wait until <time>".
+    {
+      const kept = pruneFailures(strike.failures, nowMs);
+      const waitUntil = strikeWaitUntil(kept, nowMs);
+      if (waitUntil) {
+        const reason =
+          `strike budget still full (${kept.length}/${STRIKE_LIMIT} auth failures in 30 min); ` +
+          `wait until ${waitUntil} before probing again. No probe was sent.`;
+        await deps.saveStrike({
+          ...strike,
+          failures: kept,
+          disabled: true,
+          disabledAt: new Date(nowMs).toISOString(),
+          disabledReason: reason,
+        });
+        return finish({
+          skipped: true,
+          skipReason: `${reason} Board re-enable required; config edits do not reset the budget.`,
+        });
+      }
+    }
+    // A rejected key is never probed again automatically: only an explicit
+    // board re-enable (ideally together with a rotated secret) clears this.
+    if (strike.secretBad) {
+      return finish({
+        skipped: true,
+        skipReason:
+          "CLIProxy previously rejected the management key; sync is paused and no probe was sent. " +
+          "Rotate the key and re-enable from the plugin page (board action).",
+      });
+    }
     const last = await deps.loadLastSync();
     if (last && !Number.isNaN(Date.parse(last.finishedAt))) {
       const gap = nowMs - Date.parse(last.finishedAt);
@@ -118,6 +167,8 @@ export async function runSync(deps: SyncDeps, inFlight: { running: boolean }): P
     }
     if (!key) {
       const message = "CLIProxy management secret resolved empty; refusing to probe without a key.";
+      await deps.recordFailure({ attemptedAt: startedAt, message });
+      await deps.logActivity(`cliproxy-connector: ${message}`, { companyId: deps.companyId });
       return finish({ skipped: true, skipReason: message, errors: [message] });
     }
 
@@ -125,11 +176,6 @@ export async function runSync(deps: SyncDeps, inFlight: { running: boolean }): P
       baseUrl: deps.config.cliproxyBaseUrl,
       keyHeader: deps.config.managementKeyHeader,
       key,
-      paths: {
-        authFilesPath: deps.config.authFilesPath,
-        pluginQuotaPathTemplate: deps.config.pluginQuotaPathTemplate,
-        modelsPath: deps.config.modelsPath,
-      },
       fetchImpl: deps.fetchImpl,
     });
     // `key` must not survive this function: the client is dropped on every
@@ -307,21 +353,41 @@ async function recordAuthFailure(
 
 /**
  * Explicit board re-enable after a spent strike budget. This is the ONLY
- * path that clears `disabled` — config edits never do.
+ * path that clears `disabled`/`secretBad` — config edits never do, and the
+ * sync job never probes while `secretBad` is set.
+ *
+ * The rolling `failures` are KEPT (pruned to the window): CLIProxy's own
+ * 30 min counter does not reset when the board clicks re-enable, so a key
+ * that is still bad must not get a fresh budget. When the kept window is
+ * still full, the budget stays spent with a wait-until time and no probe is
+ * ever sent; once the window has room, probing resumes (one strike left).
  */
 export async function reenableAfterStrike(
   loadStrike: () => Promise<StrikeBudgetState>,
   saveStrike: (s: StrikeBudgetState) => Promise<void>,
+  nowIso: string = new Date().toISOString(),
 ): Promise<StrikeBudgetState> {
   const strike = await loadStrike();
-  const next: StrikeBudgetState = {
-    failures: [],
-    disabled: false,
-    disabledAt: null,
-    disabledReason: null,
-    secretBad: false,
-  };
-  void strike;
+  const nowMs = Date.parse(nowIso);
+  const kept = pruneFailures(strike.failures, Number.isNaN(nowMs) ? Date.now() : nowMs);
+  const waitUntil = strikeWaitUntil(kept, Number.isNaN(nowMs) ? Date.now() : nowMs);
+  const next: StrikeBudgetState = waitUntil
+    ? {
+        failures: kept,
+        disabled: true,
+        disabledAt: nowIso,
+        disabledReason:
+          `strike budget still full (${kept.length}/${STRIKE_LIMIT} auth failures in 30 min); ` +
+          `wait until ${waitUntil} before probing again. No probe was sent.`,
+        secretBad: false,
+      }
+    : {
+        failures: kept,
+        disabled: false,
+        disabledAt: null,
+        disabledReason: null,
+        secretBad: false,
+      };
   await saveStrike(next);
   return next;
 }

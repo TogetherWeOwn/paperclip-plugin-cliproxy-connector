@@ -74,9 +74,6 @@ step below is run by the operator.
 | `cliproxyBaseUrl` | — (required) | Loopback only (`localhost`, `127.0.0.1`, `::1`). |
 | `managementKeyHeader` | — (required) | Exact header name CLIProxy expects. No default. |
 | `managementSecretRef` | — (required) | `secret_ref` object. Never persisted, never leaves the worker. |
-| `authFilesPath` | `/v0/management/auth-files` | GET allow-list entry. |
-| `pluginQuotaPathTemplate` | `/v0/management/plugins/{pluginId}/quota` | `{pluginId}` substituted per `pluginQuotaIds`. |
-| `modelsPath` | `/v1/models` | Model catalog (confirms prefixed ids exist). |
 | `syncIntervalMinutes` | `5` | The cron runs every 5 min; larger values make runs skip. Range 1–60. |
 | `reservePercent` | `10` | Default reserve; per-pool `thresholdPercent` derives `100 − t`. |
 | `perPoolReservePercent` | `{}` | Per-pool override, wins over everything. |
@@ -89,11 +86,13 @@ step below is run by the operator.
 
 ## Endpoint assumptions
 
-If your CLIProxy build differs, change `authFilesPath` / `pluginQuotaPathTemplate` /
-`modelsPath` in config and the `ENDPOINTS` block at the top of
-`scripts/provision-connections.mjs` — everything else follows. Exact live management JSON is
-still operator-captured (spike §8 item 8); parsers are defensive by design: unknown shapes
-become warnings + quota-blind rows, never headroom.
+The management paths are pinned in code (`/v0/management/auth-files` and
+`/v0/management/plugins/<segment>/quota`) — there are deliberately no config knobs for
+them, and the key is never sent to `/v1` paths. If your CLIProxy build differs, change the
+pinned constants in `src/cliproxy.ts` (and the `ENDPOINTS` block at the top of
+`scripts/provision-connections.mjs` for the board REST calls) — everything else follows.
+Exact live management JSON is still operator-captured (spike §8 item 8); parsers are
+defensive by design: unknown shapes become warnings + quota-blind rows, never headroom.
 
 ## Security properties (all tested)
 
@@ -102,9 +101,14 @@ become warnings + quota-blind rows, never headroom.
 - Safe path only: loopback base URL, key header attached after origin validation, GET-only
   allow-list, `api-call` excluded and un-admittable, manual redirects with revalidation
   (max 2, same-origin loopback), 15 s timeouts, 2 MB caps, schema-checked JSON.
-- Strike budget: first 401/403 stops the run and marks the secret bad; a 2nd auth failure per
-  rolling 30 min hard-disables sync until explicit board re-enable (`reenable` route/action).
-  Config edits never reset the budget — it lives in plugin state under its own key.
+- Strike budget (host-wide): first 401/403 stops the run and marks the secret bad; sync
+  never re-probes while the secret is marked bad. A 2nd auth failure per rolling 30 min
+  hard-disables sync until explicit board re-enable (`reenable` route/action, board users
+  only — agent/system callers are rejected). The budget lives in instance-scoped plugin
+  state keyed by CLIProxy origin, so every company targeting the same CLIProxy shares one
+  budget (the CLIProxy lockout bans the whole host). Re-enable keeps the rolling failures
+  and refuses to probe while the window is full — the page says "wait until \<time\>".
+  Config edits never reset the budget.
 - Single-flight + minimum 60 s interval between runs.
 - Router never calls CLIProxy inline; identity is verified per row against the operator map.
 

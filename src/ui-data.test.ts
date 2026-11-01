@@ -105,6 +105,24 @@ describe("buildPageData", () => {
     expect(typeof page.strike.secretBad).toBe("boolean");
   });
 
+  it("exposes waitUntil while the rolling window is full", () => {
+    const t1 = new Date(Date.parse(NOW) - 5 * 60_000).toISOString();
+    const t0 = new Date(Date.parse(NOW) - 10 * 60_000).toISOString();
+    const full = buildPageData(
+      args({
+        strike: { failures: [t0, t1], disabled: true, disabledAt: t1, disabledReason: "spent", secretBad: false },
+      }),
+    );
+    expect(full.strike.waitUntil).toBe(new Date(Date.parse(t0) + 30 * 60_000).toISOString());
+
+    const room = buildPageData(
+      args({
+        strike: { failures: [t1], disabled: false, disabledAt: null, disabledReason: null, secretBad: true },
+      }),
+    );
+    expect(room.strike.waitUntil).toBeNull();
+  });
+
   it("keeps the audience notice until the operator confirms", () => {
     const unconfirmed = parseConfig({
       cliproxyBaseUrl: "http://127.0.0.1:8317",

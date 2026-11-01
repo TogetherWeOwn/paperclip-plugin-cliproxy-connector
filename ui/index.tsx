@@ -48,6 +48,25 @@ export function CliProxyPage({ context }: PluginPageProps) {
       {data.strike.disabled && (
         <div style={{ background: "#7f1d1d", color: "#fecaca", padding: 12, borderRadius: 6 }}>
           <strong>Sync hard-disabled</strong> since {data.strike.disabledAt}: {data.strike.disabledReason}{" "}
+          {data.strike.waitUntil && (
+            <span>
+              No probe will be sent until {data.strike.waitUntil} — re-enabling before then keeps sync paused.{" "}
+            </span>
+          )}
+          <button
+            onClick={async () => {
+              await reenable({ companyId });
+              refresh();
+            }}
+          >
+            Re-enable (board action)
+          </button>
+        </div>
+      )}
+      {!data.strike.disabled && data.strike.secretBad && (
+        <div style={{ background: "#78350f", color: "#fde68a", padding: 12, borderRadius: 6 }}>
+          <strong>Management key rejected by CLIProxy.</strong> Sync is paused and no further probes will be sent.{" "}
+          Rotate the key, then{" "}
           <button
             onClick={async () => {
               await reenable({ companyId });

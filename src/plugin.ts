@@ -12,7 +12,7 @@ import type {
   PluginApiResponse,
   PluginContext,
 } from "@paperclipai/plugin-sdk";
-import { parseConfig } from "./config.js";
+import { parseConfig, type ConnectorConfig } from "./config.js";
 import {
   LAST_ERROR_STATE_KEY,
   LAST_SYNC_STATE_KEY,
@@ -25,6 +25,7 @@ import {
   SYNC_JOB_KEY,
   WIDGET_DATA_KEY,
 } from "./manifest.js";
+import type { PluginPerformActionContext } from "@paperclipai/plugin-sdk";
 import { route, type RouterCandidate } from "./router.js";
 import { emptyStrikeBudget, reenableAfterStrike, runSync } from "./sync.js";
 import type { AccountUsageRow, StrikeBudgetState, SyncFailure, SyncSummary } from "./types.js";
@@ -32,16 +33,63 @@ import { buildPageData, buildWidgetData } from "./ui-data.js";
 
 const inFlight: { running: boolean } = { running: false };
 
-type StateKey = { scopeKind: "company"; scopeId: string; namespace: string; stateKey: string };
+type CompanyStateKey = { scopeKind: "company"; scopeId: string; namespace: string; stateKey: string };
+type InstanceStateKey = { scopeKind: "instance"; namespace: string; stateKey: string };
 
-function key(companyId: string, stateKey: string): StateKey {
+function key(companyId: string, stateKey: string): CompanyStateKey {
   return { scopeKind: "company", scopeId: companyId, namespace: STATE_NAMESPACE, stateKey };
 }
 
-async function loadStrike(ctx: PluginContext, companyId: string): Promise<StrikeBudgetState> {
-  const raw = await ctx.state.get(key(companyId, STRIKE_STATE_KEY));
-  if (raw !== null && typeof raw === "object") return raw as StrikeBudgetState;
+/**
+ * Normalise a CLIProxy base URL to its origin for strike-budget keying.
+ * The CLIProxy lockout (5 bad keys = 30 min ban) is host-wide per origin,
+ * so every company pointing at the same origin draws from ONE budget.
+ */
+export function normaliseStrikeOrigin(cliproxyBaseUrl: string): string {
+  try {
+    return new URL(cliproxyBaseUrl).origin;
+  } catch {
+    return cliproxyBaseUrl.trim().replace(/\/+$/, "");
+  }
+}
+
+function strikeKey(origin: string): InstanceStateKey {
+  return { scopeKind: "instance", namespace: STATE_NAMESPACE, stateKey: `${STRIKE_STATE_KEY}:${origin}` };
+}
+
+function isStrikeBudget(raw: unknown): raw is StrikeBudgetState {
+  return raw !== null && typeof raw === "object" && !Array.isArray(raw);
+}
+
+async function loadStrike(
+  ctx: PluginContext,
+  companyId: string,
+  origin: string,
+): Promise<StrikeBudgetState> {
+  const raw = await ctx.state.get(strikeKey(origin));
+  if (isStrikeBudget(raw)) return raw;
+  // One-time adoption of the pre-host-wide-budget company-scoped key: carry a
+  // spent budget forward so upgrading the plugin cannot reset it and allow
+  // extra probes. The legacy key is deleted after adoption.
+  const legacy = await ctx.state.get(key(companyId, STRIKE_STATE_KEY));
+  if (isStrikeBudget(legacy)) {
+    await ctx.state.set(strikeKey(origin), legacy);
+    try {
+      await ctx.state.delete(key(companyId, STRIKE_STATE_KEY));
+    } catch {
+      /* best-effort: the legacy key is never read again once adopted */
+    }
+    return legacy;
+  }
   return emptyStrikeBudget();
+}
+
+async function saveStrike(ctx: PluginContext, origin: string, s: StrikeBudgetState): Promise<void> {
+  await ctx.state.set(strikeKey(origin), s);
+}
+
+function strikeOriginFor(config: ConnectorConfig): string {
+  return normaliseStrikeOrigin(config.cliproxyBaseUrl);
 }
 
 async function loadRows(ctx: PluginContext, companyId: string): Promise<Record<string, AccountUsageRow>> {
@@ -108,11 +156,12 @@ const plugin = definePlugin({
     });
     ctx.data.register(WIDGET_DATA_KEY, async (params) => {
       const companyId = String((params as Record<string, unknown>).companyId ?? "");
-      const [config, rows, lastSync, strike, lastFailure] = await Promise.all([
-        resolveCompany(ctx, companyId).then((r) => r.config),
+      const config = await resolveCompany(ctx, companyId).then((r) => r.config);
+      const origin = strikeOriginFor(config);
+      const [rows, lastSync, strike, lastFailure] = await Promise.all([
         loadRows(ctx, companyId),
         loadLastSync(ctx, companyId),
-        loadStrike(ctx, companyId),
+        loadStrike(ctx, companyId, origin),
         loadLastFailure(ctx, companyId),
       ]);
       return buildWidgetData({ now: new Date().toISOString(), config, rows, lastSync, strike, lastFailure });
@@ -123,16 +172,29 @@ const plugin = definePlugin({
       if (!companyId) throw new Error("companyId is required");
       return runCompanySync(ctx, companyId, new Date().toISOString());
     });
-    ctx.actions.register(REENABLE_ACTION_KEY, async (params) => {
-      const companyId = String((params as Record<string, unknown>).companyId ?? "");
-      if (!companyId) throw new Error("companyId is required");
+    ctx.actions.register(REENABLE_ACTION_KEY, async (params, context?: PluginPerformActionContext) => {
+      // Board users only: the host passes the authenticated actor — an agent
+      // or system caller must never clear the hard stop. The company scope
+      // comes from the host-authorised context, never from caller params.
+      if (context?.actor?.type !== "user") {
+        throw new Error(
+          "cliproxy-reenable is a board-user action: re-enabling the strike budget requires an authenticated board user.",
+        );
+      }
+      const companyId = context?.companyId;
+      void params;
+      if (!companyId) throw new Error("companyId is required (host-authorised action context).");
+      const userId = context?.actor?.userId ?? "unknown";
+      const { config } = await resolveCompany(ctx, companyId);
+      const origin = strikeOriginFor(config);
       const next = await reenableAfterStrike(
-        () => loadStrike(ctx, companyId),
-        (s) => ctx.state.set(key(companyId, STRIKE_STATE_KEY), s),
+        () => loadStrike(ctx, companyId, origin),
+        (s) => saveStrike(ctx, origin, s),
+        new Date().toISOString(),
       );
       await ctx.activity.log({
         companyId,
-        message: "cliproxy-connector: strike budget re-enabled by board action.",
+        message: `cliproxy-connector: strike budget re-enabled by board user ${userId}.`,
       });
       return next;
     });
@@ -155,13 +217,20 @@ const plugin = definePlugin({
       if (!companyId) return { status: 400, body: { error: "companyId is required" } };
       if (!boundCtx) return { status: 503, body: { error: "worker is not ready" } };
       const ctx = boundCtx;
+      const { config } = await resolveCompany(ctx, companyId);
+      const origin = strikeOriginFor(config);
       const next = await reenableAfterStrike(
-        () => loadStrike(ctx, companyId),
-        (s) => ctx.state.set(key(companyId, STRIKE_STATE_KEY), s),
+        () => loadStrike(ctx, companyId, origin),
+        (s) => saveStrike(ctx, origin, s),
+        new Date().toISOString(),
       );
+      const actorLabel =
+        input.actor.actorType === "user"
+          ? `board user ${input.actor.userId ?? "unknown"}`
+          : `agent ${input.actor.agentId ?? "unknown"}`;
       await ctx.activity.log({
         companyId,
-        message: "cliproxy-connector: strike budget re-enabled via board API route.",
+        message: `cliproxy-connector: strike budget re-enabled via board API route by ${actorLabel}.`,
       });
       return { status: 200, body: { strike: next } };
     }
@@ -201,6 +270,9 @@ async function runCompanySync(
     await ctx.state.set(key(companyId, LAST_SYNC_STATE_KEY), result);
     return result;
   }
+  // Host-wide budget: every company targeting the same CLIProxy origin draws
+  // from one instance-scoped bucket (the CLIProxy lockout bans the host).
+  const origin = strikeOriginFor(config);
   return runSync(
     {
       config,
@@ -208,8 +280,8 @@ async function runCompanySync(
       now,
       resolveSecret: (ref) => ctx.secrets.resolve(ref as never, { companyId }),
       fetchImpl: ctx.http.fetch.bind(ctx.http),
-      loadStrike: () => loadStrike(ctx, companyId),
-      saveStrike: (s) => ctx.state.set(key(companyId, STRIKE_STATE_KEY), s),
+      loadStrike: () => loadStrike(ctx, companyId, origin),
+      saveStrike: (s) => saveStrike(ctx, origin, s),
       loadRows: () => loadRows(ctx, companyId),
       loadLastSync: () => loadLastSync(ctx, companyId),
       saveSync: async (rows, result) => {
@@ -226,11 +298,12 @@ async function runCompanySync(
 }
 
 async function pageData(ctx: PluginContext, companyId: string, now: string) {
-  const [config, rows, lastSync, strike, lastFailure] = await Promise.all([
-    resolveCompany(ctx, companyId).then((r) => r.config),
+  const config = await resolveCompany(ctx, companyId).then((r) => r.config);
+  const origin = strikeOriginFor(config);
+  const [rows, lastSync, strike, lastFailure] = await Promise.all([
     loadRows(ctx, companyId),
     loadLastSync(ctx, companyId),
-    loadStrike(ctx, companyId),
+    loadStrike(ctx, companyId, origin),
     loadLastFailure(ctx, companyId),
   ]);
   return buildPageData({ now, config, rows, lastSync, strike, lastFailure });

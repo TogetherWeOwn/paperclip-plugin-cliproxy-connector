@@ -1,27 +1,23 @@
 import { describe, expect, it, vi } from "vitest";
 import {
   type ManagementFetch,
+  AUTH_FILES_PATH,
   CliproxyAuthError,
   CliproxyBodyError,
   CliproxyConfigError,
   CliproxyManagementClient,
   CliproxyNetworkError,
   CliproxyRedirectError,
+  pluginQuotaPath,
 } from "./cliproxy.js";
 
 const KEY = "LIVE-KEY-MATERIAL-xyz789";
-const PATHS = {
-  authFilesPath: "/v0/management/auth-files",
-  pluginQuotaPathTemplate: "/v0/management/plugins/{pluginId}/quota",
-  modelsPath: "/v1/models",
-};
 
 function client(fetchImpl?: ManagementFetch) {
   return new CliproxyManagementClient({
     baseUrl: "http://127.0.0.1:8317",
     keyHeader: "X-Test-Key",
     key: KEY,
-    paths: PATHS,
     fetchImpl,
   });
 }
@@ -38,7 +34,6 @@ describe("construction and allow-list", () => {
           baseUrl: "https://cliproxy.example.com",
           keyHeader: "X-K",
           key: KEY,
-          paths: PATHS,
         }),
     ).toThrow(CliproxyConfigError);
   });
@@ -79,7 +74,7 @@ describe("construction and allow-list", () => {
       signal = init?.signal ?? null;
       return json(200, {});
     });
-    await client(fetch).getModels();
+    await client(fetch).getAuthFiles();
     expect(signal).toBeInstanceOf(AbortSignal);
   });
 });
@@ -100,7 +95,7 @@ describe("auth and error mapping", () => {
   it("maps 5xx to CliproxyNetworkError without key material", async () => {
     const fetch = vi.fn(async () => new Response("boom", { status: 500 }));
     const err = await client(fetch)
-      .getModels()
+      .getAuthFiles()
       .catch((e: unknown) => e);
     expect(err).toBeInstanceOf(CliproxyNetworkError);
     expect((err as Error).message).not.toContain(KEY);
@@ -108,13 +103,13 @@ describe("auth and error mapping", () => {
 
   it("rejects non-JSON bodies", async () => {
     const fetch = vi.fn(async () => new Response("<html>nope</html>", { status: 200 }));
-    await expect(client(fetch).getModels()).rejects.toThrow(CliproxyBodyError);
+    await expect(client(fetch).getAuthFiles()).rejects.toThrow(CliproxyBodyError);
   });
 
   it("refuses to propagate a body containing key material", async () => {
     const fetch = vi.fn(async () => json(200, { echoed: KEY }));
     const err = await client(fetch)
-      .getModels()
+      .getAuthFiles()
       .catch((e: unknown) => e);
     expect(err).toBeInstanceOf(CliproxyBodyError);
     expect((err as Error).message).toMatch(/key material/);
@@ -130,45 +125,77 @@ describe("auth and error mapping", () => {
       baseUrl: "http://127.0.0.1:8317",
       keyHeader: "X-Test-Key",
       key: KEY,
-      paths: PATHS,
       fetchImpl: fetch,
       maxBytes: 10,
     });
-    await expect(tiny.getModels()).rejects.toThrow(CliproxyBodyError);
+    await expect(tiny.getAuthFiles()).rejects.toThrow(CliproxyBodyError);
   });
 });
 
 describe("redirects", () => {
-  it("follows a same-origin allow-listed redirect", async () => {
+  it("follows a same-origin pinned-shape redirect", async () => {
     const calls: string[] = [];
     const fetch = vi.fn(async (url: string) => {
       calls.push(url);
       if (calls.length === 1) {
         return new Response(null, {
           status: 302,
-          headers: { location: "/v1/models" },
+          headers: { location: "/v0/management/plugins/claude-quota/quota" },
         });
       }
-      return json(200, { models: [] });
+      return json(200, { quota: [] });
     });
-    const body = await client(fetch).getModels();
-    expect(body).toEqual({ models: [] });
+    const body = await client(fetch).getAuthFiles();
+    expect(body).toEqual({ quota: [] });
     expect(calls).toHaveLength(2);
   });
 
   it("refuses a redirect that escapes the loopback origin", async () => {
     const fetch = vi.fn(async () => new Response(null, { status: 302, headers: { location: "https://evil.example/x" } }));
-    await expect(client(fetch).getModels()).rejects.toThrow(CliproxyRedirectError);
+    await expect(client(fetch).getAuthFiles()).rejects.toThrow(CliproxyRedirectError);
   });
 
   it("refuses a redirect to a non-allow-listed path", async () => {
     const fetch = vi.fn(async () => new Response(null, { status: 302, headers: { location: "/v0/management/api-call" } }));
-    await expect(client(fetch).getModels()).rejects.toThrow(CliproxyRedirectError);
+    await expect(client(fetch).getAuthFiles()).rejects.toThrow(CliproxyRedirectError);
+  });
+
+  it("refuses a redirect to the removed /v1/models path", async () => {
+    const fetch = vi.fn(async () => new Response(null, { status: 302, headers: { location: "/v1/models" } }));
+    await expect(client(fetch).getAuthFiles()).rejects.toThrow(CliproxyRedirectError);
   });
 
   it("stops after too many redirects", async () => {
-    const fetch = vi.fn(async () => new Response(null, { status: 302, headers: { location: "/v1/models" } }));
-    await expect(client(fetch).getModels()).rejects.toThrow(/too many redirects/);
+    const fetch = vi.fn(async () => new Response(null, { status: 302, headers: { location: AUTH_FILES_PATH } }));
+    await expect(client(fetch).getAuthFiles()).rejects.toThrow(/too many redirects/);
     expect(fetch.mock.calls.length).toBeGreaterThan(1);
+  });
+});
+
+describe("pinned allow-list and plugin id validation (S1)", () => {
+  it("pins the auth-files path and the plugin quota shape", () => {
+    expect(AUTH_FILES_PATH).toBe("/v0/management/auth-files");
+    expect(pluginQuotaPath("claude-quota")).toBe("/v0/management/plugins/claude-quota/quota");
+  });
+
+  it("rejects hostile plugin ids before any network happens", async () => {
+    for (const bad of ["../config", "..%2Fconfig", "api-call", "evil-api-call-x", "a/b", "", ".", "x y"]) {
+      const fetch = vi.fn(async () => json(200, {}));
+      await expect(client(fetch).getPluginQuota(bad)).rejects.toThrow(CliproxyConfigError);
+      expect(fetch).not.toHaveBeenCalled();
+    }
+  });
+
+  it("rejects percent-encoded api-call in the request path", async () => {
+    const fetch = vi.fn(async () => json(200, {}));
+    await expect(client(fetch).getJson("/v0/management/api%2Dcall")).rejects.toThrow(
+      CliproxyConfigError,
+    );
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it("rejects a decoded-traversal redirect target", async () => {
+    const fetch = vi.fn(async () => new Response(null, { status: 302, headers: { location: "/v0/management/plugins/..%2Fconfig/quota" } }));
+    await expect(client(fetch).getAuthFiles()).rejects.toThrow(CliproxyRedirectError);
   });
 });

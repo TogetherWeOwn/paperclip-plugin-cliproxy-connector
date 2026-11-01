@@ -202,11 +202,13 @@ describe("strike budget (TWO-378 lesson)", () => {
   it("second 401 in 30 min hard-disables until explicit board re-enable", async () => {
     const s = store({
       strike: {
+        // secretBad:false: the board re-enabled after the first rejection,
+        // clearing secretBad but keeping the rolling failure.
         failures: [new Date(Date.parse(NOW) - 5 * 60_000).toISOString()],
         disabled: false,
         disabledAt: null,
         disabledReason: null,
-        secretBad: true,
+        secretBad: false,
       },
     });
     const summary = await runSync(
@@ -248,14 +250,18 @@ describe("strike budget (TWO-378 lesson)", () => {
     expect(summary.skipped).toBe(true);
     expect(summary.skipReason).toMatch(/Board re-enable required/);
 
+    // The board re-enable keeps the rolling failure (CLIProxy's own 30 min
+    // counter does not reset), but clears the hard stop so the next probe
+    // is allowed — with one strike left in the window.
     const next = await reenableAfterStrike(
       async () => s.strike,
       async (v) => {
         s.strike = v;
       },
+      NOW,
     );
     expect(next.disabled).toBe(false);
-    expect(next.failures).toEqual([]);
+    expect(next.failures).toEqual([NOW]);
     expect(next.secretBad).toBe(false);
   });
 
@@ -266,7 +272,7 @@ describe("strike budget (TWO-378 lesson)", () => {
         disabled: false,
         disabledAt: null,
         disabledReason: null,
-        secretBad: true,
+        secretBad: false,
       },
     });
     await runSync(deps(s, mockFetch({ authFilesStatus: 401 }) as unknown as typeof fetch), {
@@ -274,6 +280,122 @@ describe("strike budget (TWO-378 lesson)", () => {
     });
     expect(s.strike.disabled).toBe(false);
     expect(s.strike.failures).toHaveLength(1); // old one pruned, new one kept
+  });
+
+  it("never re-probes while secretBad is set — only a board re-enable clears it (M2a)", async () => {
+    const s = store({
+      strike: {
+        failures: [new Date(Date.parse(NOW) - 5 * 60_000).toISOString()],
+        disabled: false,
+        disabledAt: null,
+        disabledReason: null,
+        secretBad: true,
+      },
+    });
+    const fetchMock = mockFetch({ authFilesStatus: 401 }) as unknown as typeof fetch;
+    const summary = await runSync(deps(s, fetchMock), { running: false });
+    expect(summary.skipped).toBe(true);
+    expect(summary.skipReason).toMatch(/no probe was sent/);
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(s.strike.failures).toHaveLength(1); // no second strike spent
+    expect(s.failure).toBeNull(); // the skip reuses the recorded auth failure
+  });
+
+  it("re-enable inside a full window does not allow a 3rd rejection (M2b)", async () => {
+    const t0 = new Date(Date.parse(NOW) - 10 * 60_000).toISOString();
+    const t1 = new Date(Date.parse(NOW) - 5 * 60_000).toISOString();
+    const s = store({
+      strike: {
+        failures: [t0, t1],
+        disabled: true,
+        disabledAt: t1,
+        disabledReason: "spent",
+        secretBad: true,
+      },
+    });
+    // Board re-enables, but the window is still full: the budget stays spent
+    // with a wait-until time, and no probe is ever sent.
+    const next = await reenableAfterStrike(
+      async () => s.strike,
+      async (v) => {
+        s.strike = v;
+      },
+      NOW,
+    );
+    expect(next.disabled).toBe(true);
+    expect(next.failures).toEqual([t0, t1]);
+    expect(next.disabledReason).toMatch(/wait until/);
+
+    const fetchMock = mockFetch({ authFilesStatus: 401 }) as unknown as typeof fetch;
+    const summary = await runSync(deps(s, fetchMock), { running: false });
+    expect(summary.skipped).toBe(true);
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(s.strike.failures).toHaveLength(2); // still 2 rejections total
+  });
+
+  it("a full window refuses to probe even when not disabled (M2b guard)", async () => {
+    const t0 = new Date(Date.parse(NOW) - 10 * 60_000).toISOString();
+    const t1 = new Date(Date.parse(NOW) - 5 * 60_000).toISOString();
+    const s = store({
+      strike: { failures: [t0, t1], disabled: false, disabledAt: null, disabledReason: null, secretBad: false },
+    });
+    const fetchMock = mockFetch({ authFilesStatus: 401 }) as unknown as typeof fetch;
+    const summary = await runSync(deps(s, fetchMock), { running: false });
+    expect(summary.skipped).toBe(true);
+    expect(summary.skipReason).toMatch(/wait until/);
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(s.strike.disabled).toBe(true);
+    expect(s.strike.failures).toHaveLength(2);
+  });
+
+  it("companies sharing one origin share one budget: 2 rejections max per 30 min (M1)", async () => {
+    // One shared strike store = one instance-scoped bucket for the origin.
+    const s = store();
+    const badFetch = () => mockFetch({ authFilesStatus: 401 }) as unknown as typeof fetch;
+
+    // Company A syncs at T with a bad key: 1st rejection, secret marked bad.
+    const dA = deps(s, badFetch());
+    const rA = await runSync(dA, { running: false });
+    expect(rA.skipped).toBe(true);
+    expect(s.strike.failures).toHaveLength(1);
+    expect(s.strike.secretBad).toBe(true);
+
+    // Company B syncs at T+5m against the same origin: skipped WITHOUT a
+    // probe — no 2nd rejection while secretBad is set.
+    const fetchB = badFetch();
+    const dB = deps(s, fetchB);
+    dB.now = new Date(Date.parse(NOW) + 5 * 60_000).toISOString();
+    const rB = await runSync(dB, { running: false });
+    expect(rB.skipped).toBe(true);
+    expect(fetchB).not.toHaveBeenCalled();
+    expect(s.strike.failures).toHaveLength(1);
+
+    // Board re-enables (keeps [T]); company B probes at T+6m with the still-
+    // bad key: 2nd rejection, hard-disable.
+    const reenabled = await reenableAfterStrike(
+      async () => s.strike,
+      async (v) => {
+        s.strike = v;
+      },
+      dB.now,
+    );
+    expect(reenabled.disabled).toBe(false);
+    expect(reenabled.failures).toHaveLength(1);
+    const fetchB2 = badFetch();
+    const dB2 = deps(s, fetchB2);
+    dB2.now = new Date(Date.parse(NOW) + 6 * 60_000).toISOString();
+    await runSync(dB2, { running: false });
+    expect(s.strike.disabled).toBe(true);
+    expect(s.strike.failures).toHaveLength(2);
+
+    // Company A syncs at T+10m: skipped without a probe — the host-wide ban
+    // (5 bad keys per 30 min) is never approached.
+    const fetchA2 = badFetch();
+    const dA2 = deps(s, fetchA2);
+    dA2.now = new Date(Date.parse(NOW) + 10 * 60_000).toISOString();
+    await runSync(dA2, { running: false });
+    expect(fetchA2).not.toHaveBeenCalled();
+    expect(s.strike.failures).toHaveLength(2);
   });
 });
 
@@ -316,6 +438,20 @@ describe("run guards", () => {
     const summary = await runSync(d, { running: false });
     expect(summary.skipped).toBe(true);
     expect(fetchMock).not.toHaveBeenCalled();
+    assertNoKeyLeak(s);
+  });
+
+  it("empty resolved secret is recorded + logged like an unresolvable one", async () => {
+    const s = store();
+    const d = deps(s, mockFetch() as unknown as typeof fetch);
+    const fetchMock = d.fetchImpl as unknown as ReturnType<typeof mockFetch>;
+    d.resolveSecret = async () => "";
+    const summary = await runSync(d, { running: false });
+    expect(summary.skipped).toBe(true);
+    expect(summary.skipReason).toMatch(/resolved empty/);
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(s.failure?.message).toMatch(/resolved empty/);
+    expect(s.activity.some((a) => a.message.includes("resolved empty"))).toBe(true);
     assertNoKeyLeak(s);
   });
 

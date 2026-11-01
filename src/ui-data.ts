@@ -13,6 +13,7 @@
  */
 
 import { graceMs, maxAgeMs, type ConnectorConfig } from "./config.js";
+import { strikeWaitUntil } from "./sync.js";
 import type { AccountUsageRow, DriftFinding, StrikeBudgetState, SyncFailure, SyncSummary } from "./types.js";
 
 export const AUDIENCE_NOTICE =
@@ -73,6 +74,13 @@ export interface PageData {
     disabledReason: string | null;
     secretBad: boolean;
     recentFailures: string[];
+    /**
+     * ISO time when the next probe is allowed again (the rolling 30 min
+     * window has room). Null when probing is currently allowed. The page
+     * renders this as "wait until <time>" instead of offering a probe that
+     * would push the host past 2 rejections per 30 min.
+     */
+    waitUntil: string | null;
   };
   drift: DriftFinding[];
   accounts: AccountCard[];
@@ -226,6 +234,7 @@ export function buildPageData(args: {
       disabledReason: strike.disabledReason,
       secretBad: strike.secretBad,
       recentFailures: strike.failures,
+      waitUntil: strikeWaitUntil(strike.failures, nowMs),
     },
     drift: lastSync?.drift ?? [],
     accounts,
