@@ -741,6 +741,15 @@ describe("sanitizeStatusMessage", () => {
     expect(scrubbed).not.toContain("sk.production.a1.b2");
     expect(scrubbed).toContain("[redacted]");
   });
+
+  it("keeps dotted versions and hostnames with several structured mixed labels", () => {
+    const scrubbed =
+      sanitizeStatusMessage("deploy v1.2.3rc1 on s3.us2.amazonaws.com, note sk.production.a1.b2 here") ?? "";
+    expect(scrubbed).toContain("v1.2.3rc1");
+    expect(scrubbed).toContain("s3.us2.amazonaws.com");
+    expect(scrubbed).not.toContain("sk.production.a1.b2");
+    expect(scrubbed).toContain("[redacted]");
+  });
 });
 
 describe("hashIdentity redaction", () => {

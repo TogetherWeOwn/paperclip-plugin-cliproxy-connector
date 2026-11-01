@@ -139,7 +139,11 @@ export function sanitizeStatusMessage(raw: string | null): string | null {
  * `token`, …) or two flat letter-digit fragments (`a1`, `b2`) deny the
  * hostname/version fallback, so `sk.production.a1.b2` redacts while
  * `s3.amazonaws.com` (one flat fragment) and `v1.2.3-beta1` (a hyphenated
- * prerelease part plus a bare version number) keep. Timestamps are exempted
+ * prerelease part plus a bare version number) keep. Several flat mixed
+ * labels deny the fallback unless every one is version/hostname structured
+ * (`v1`, `us2`, `3rc1`) beside a clearly operational part, so `v1.2.3rc1`
+ * and `s3.us2.amazonaws.com` keep while interleaved entropy (`a1b2.c3d4.99`)
+ * still redacts. Timestamps are exempted
  * only when the whole token is a date/time, fractional seconds and numeric
  * offsets included (`2026-11-01T12:00:00.000Z` and `...+00:00` keep), so a
  * date substring cannot launder attached secret material
@@ -164,13 +168,18 @@ function isOperationalToken(tok: string): boolean {
     // operational one of them looks on its own (`production`).
     if (segs.length > 1 && SECRET_DOT_PREFIX.test(segs[0] ?? "")) return false;
     // Segmented secrets spread entropy across several flat letter-digit
-    // labels (`a1.b2`); hostnames carry at most one (`s3`), and dotted
-    // versions structure theirs (`3-beta1`). Two or more flat mixed labels
-    // deny the fallback.
+    // labels (`a1.b2`); hostnames carry version-shaped ones (`s3`, `us2`),
+    // and dotted versions structure theirs (`3rc1`, `3-beta1`). Two or more
+    // flat mixed labels deny the fallback — unless every one is
+    // version/hostname structured and another segment is clearly operational
+    // (a bare number or long word), so `v1.2.3rc1` and
+    // `s3.us2.amazonaws.com` keep while interleaved entropy (`a1b2.c3d4.99`)
+    // still redacts. A leading secret marker already denied above.
     const flatMixed = segs.filter(
       (seg) => !seg.includes("-") && /[a-zA-Z]/.test(seg) && /[0-9]/.test(seg),
     );
-    if (flatMixed.length >= 2) return false;
+    if (flatMixed.length >= 2 && !(segs.some(isStrongDotPart) && flatMixed.every(isVersionShapedPart)))
+      return false;
     return segs.some(isStrongDotPart);
   }
   if (/[/:]/.test(tok)) return !tok.split(/[/:]/).some((seg) => isCredentialCore(seg));
@@ -203,6 +212,15 @@ const SECRET_DOT_PREFIX =
  */
 function isStrongDotPart(seg: string): boolean {
   return /^[a-z]{5,}$/.test(seg) || /^[0-9]+$/.test(seg);
+}
+
+/**
+ * A flat letter-digit label shaped like a version or hostname part: one run
+ * of letters against one run of digits (`v1`, `s3`, `us2`, `3rc1`, `2beta1`).
+ * Interleaved entropy (`a1b2`, `ab12cd`) does not count.
+ */
+function isVersionShapedPart(seg: string): boolean {
+  return /^[a-zA-Z]+[0-9]+$/.test(seg) || /^[0-9]+[a-zA-Z]+[0-9]*$/.test(seg);
 }
 
 /**
