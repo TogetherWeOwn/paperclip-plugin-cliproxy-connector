@@ -53,14 +53,28 @@ describe("per-request guards", () => {
     expect(fetch).not.toHaveBeenCalled();
   });
 
-  it("refuses a different loopback spelling than configured (exact host:port)", async () => {
-    const fetch = vi.fn(async () => json(200, {}));
+  it("treats localhost and 127.0.0.1 as the same canonical origin (no resolver)", async () => {
+    let seenUrl = "";
+    const fetch = vi.fn(async (url: string) => {
+      seenUrl = url;
+      return json(200, {});
+    });
     const guarded = createLoopbackFetch(BASE, { fetchImpl: fetch });
-    // Same port, but `localhost` is a different origin string than `127.0.0.1`.
-    await expect(guarded("http://localhost:8317/v0/management/auth-files")).rejects.toThrow(
-      CliproxyConfigError,
-    );
-    expect(fetch).not.toHaveBeenCalled();
+    // Same port: `localhost` is rewritten to `127.0.0.1` before validation
+    // and before the request leaves, so the OS resolver is never involved.
+    await guarded("http://localhost:8317/v0/management/auth-files");
+    expect(seenUrl).toBe("http://127.0.0.1:8317/v0/management/auth-files");
+  });
+
+  it("fetches a localhost base URL as the 127.0.0.1 literal", async () => {
+    let seenUrl = "";
+    const fetch = vi.fn(async (url: string) => {
+      seenUrl = url;
+      return json(200, {});
+    });
+    const guarded = createLoopbackFetch("http://localhost:8317", { fetchImpl: fetch });
+    await guarded("http://localhost:8317/v0/management/auth-files");
+    expect(seenUrl).toBe("http://127.0.0.1:8317/v0/management/auth-files");
   });
 
   it("refuses an off-loopback target without touching the network", async () => {

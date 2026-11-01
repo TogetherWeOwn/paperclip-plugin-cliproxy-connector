@@ -143,8 +143,9 @@ The redacted `auth-files` fixture in tests mirrors the public CLIProxyAPI source
   allow-list, `api-call` excluded and un-admittable, manual redirects with revalidation
   (max 2, same-origin loopback), 15 s timeouts, 2 MB caps, schema-checked JSON. The worker
   fetches through its own guarded loopback transport (Node fetch, never the host client —
-  the host SSRF guard refuses loopback); the transport re-checks loopback-only, exact
-  origin, GET-only and no auto-redirects per request.
+  the host SSRF guard refuses loopback); the transport re-checks loopback-only, canonical
+  origin (`localhost` is rewritten to `127.0.0.1` so no resolver is involved), GET-only
+  and no auto-redirects per request.
 - Strike budget (host-wide): first 401/403 stops the run and marks the secret bad; sync
   never re-probes while the secret is marked bad. A 2nd auth failure per rolling 30 min
   hard-disables sync until explicit board re-enable (`reenable` route/action, board users
