@@ -1423,7 +1423,7 @@ describe("live provider-API quota (pinned api-call templates)", () => {
     assertNoKeyLeak(s);
   });
 
-  it("two syncs back to back make one api-call per credential (per-index 5-minute throttle)", async () => {
+  it("a throttled rerun reuses the cached answer with the first run's observedAt", async () => {
     const s = store();
     const calls: string[] = [];
     const files = [
@@ -1435,20 +1435,101 @@ describe("live provider-API quota (pinned api-call templates)", () => {
       { provider: "devin", connectionId: "conn-devin" },
     );
     const apiCallLastCall = new Map<string, number>();
+    const apiCallCache = new Map<string, { statusCode: number; body: unknown; observedAt: string }>();
     const first = await runSync(
-      { ...depsWith(s, config, apiFetch(calls, files) as never), apiCallLastCall },
+      { ...depsWith(s, config, apiFetch(calls, files) as never), apiCallLastCall, apiCallCache },
       { running: false },
     );
     expect(first.skipped).toBe(false);
     expect(calls).toHaveLength(2);
+    // A minute later the throttle holds, but the live windows survive with
+    // the first run's observation time — not a fresh stamp, not blank.
+    const later = new Date(Date.parse(NOW) + 60_000).toISOString();
     const second = await runSync(
-      { ...depsWith(s, config, apiFetch(calls, files) as never), apiCallLastCall },
+      {
+        ...depsWith(s, config, apiFetch(calls, files) as never),
+        now: later,
+        apiCallLastCall,
+        apiCallCache,
+      },
       { running: false },
     );
     expect(second.skipped).toBe(false);
-    // No further provider calls: the throttle held both credentials.
     expect(calls).toHaveLength(2);
-    expect([...apiCallLastCall.keys()].sort()).toEqual(["d1", "m1"]);
+    const origin = new URL("http://127.0.0.1:8317").origin;
+    expect([...apiCallLastCall.keys()].sort()).toEqual([`${origin} d1`, `${origin} m1`]);
+    const rows = Object.values(s.savedRows ?? {});
+    const metaRow = rows.find((r) => r.provider === "meta");
+    expect(metaRow?.quotaBlind).toBe(false);
+    expect(metaRow?.limits.map((l) => l.id)).toEqual(["meta:window", "meta:weekly"]);
+    expect(metaRow?.limits.every((l) => l.viaProviderApi === true)).toBe(true);
+    expect(metaRow?.limits.every((l) => l.observedAt === NOW)).toBe(true);
+    const devinRow = rows.find((r) => r.provider === "devin");
+    expect(devinRow?.quotaBlind).toBe(false);
+    expect(devinRow?.limits.every((l) => l.observedAt === NOW)).toBe(true);
     assertNoKeyLeak(s);
+  });
+
+  it("two runs 4m59s apart both call (cron jitter tolerance)", async () => {
+    const s = store();
+    const calls: string[] = [];
+    const files = [{ id: "meta-a", provider: "meta", auth_index: "m1" }];
+    const config = configWith({ provider: "meta", connectionId: "conn-meta" });
+    const apiCallLastCall = new Map<string, number>();
+    const apiCallCache = new Map<string, { statusCode: number; body: unknown; observedAt: string }>();
+    const first = await runSync(
+      { ...depsWith(s, config, apiFetch(calls, files) as never), apiCallLastCall, apiCallCache },
+      { running: false },
+    );
+    expect(first.skipped).toBe(false);
+    expect(calls).toHaveLength(1);
+    const later = new Date(Date.parse(NOW) + (4 * 60 + 59) * 1000).toISOString();
+    const second = await runSync(
+      {
+        ...depsWith(s, config, apiFetch(calls, files) as never),
+        now: later,
+        apiCallLastCall,
+        apiCallCache,
+      },
+      { running: false },
+    );
+    expect(second.skipped).toBe(false);
+    expect(calls).toHaveLength(2);
+    const rows = Object.values(s.savedRows ?? {});
+    expect(rows.find((r) => r.provider === "meta")?.quotaBlind).toBe(false);
+    assertNoKeyLeak(s);
+  });
+
+  it("two companies on the same origin share one call and both get windows", async () => {
+    const sA = store();
+    const sB = store();
+    const calls: string[] = [];
+    const files = [{ id: "meta-a", provider: "meta", auth_index: "m1" }];
+    const config = configWith({ provider: "meta", connectionId: "conn-meta" });
+    const apiCallLastCall = new Map<string, number>();
+    const apiCallCache = new Map<string, { statusCode: number; body: unknown; observedAt: string }>();
+    const base = { apiCallLastCall, apiCallCache };
+    const first = await runSync(
+      { ...depsWith(sA, config, apiFetch(calls, files) as never), companyId: "co-a", ...base },
+      { running: false },
+    );
+    expect(first.skipped).toBe(false);
+    expect(calls).toHaveLength(1);
+    const second = await runSync(
+      { ...depsWith(sB, config, apiFetch(calls, files) as never), companyId: "co-b", ...base },
+      { running: false },
+    );
+    expect(second.skipped).toBe(false);
+    // One call between them; the second company reuses the cached answer.
+    expect(calls).toHaveLength(1);
+    for (const s of [sA, sB]) {
+      const rows = Object.values(s.savedRows ?? {});
+      const metaRow = rows.find((r) => r.provider === "meta");
+      expect(metaRow?.quotaBlind).toBe(false);
+      expect(metaRow?.limits.map((l) => l.id)).toEqual(["meta:window", "meta:weekly"]);
+      expect(metaRow?.limits.every((l) => l.observedAt === NOW)).toBe(true);
+    }
+    assertNoKeyLeak(sA);
+    assertNoKeyLeak(sB);
   });
 });

@@ -29,19 +29,24 @@ import {
 } from "./manifest.js";
 import type { PluginPerformActionContext } from "@paperclipai/plugin-sdk";
 import { route, type RouterCandidate } from "./router.js";
-import { emptyStrikeBudget, reenableAfterStrike, runSync } from "./sync.js";
+import { emptyStrikeBudget, reenableAfterStrike, runSync, type ApiCallCachedEnvelope } from "./sync.js";
 import type { AccountUsageRow, StrikeBudgetState, SyncFailure, SyncSummary } from "./types.js";
 import { buildPageData, buildUsageData, buildWidgetData } from "./ui-data.js";
 
 const inFlight: { running: boolean } = { running: false };
 
 /**
- * Worker-level last provider-API call time per credential `auth_index` (epoch
- * millis). Bounds credential-bearing live quota reads to at most one call per
- * account per 5 minutes across back-to-back resyncs; the scheduled 5-minute
- * cadence never trips it. In memory only, never persisted or logged.
+ * Worker-level last provider-API call time per CLIProxy origin + credential
+ * `auth_index` (epoch millis), plus the last 2xx answer per origin + index.
+ * Bounds credential-bearing live quota reads to at most one call per account
+ * per throttle window across back-to-back resyncs and across companies on the
+ * same CLIProxy; a throttled run reuses the cached answer with its original
+ * observation time instead of blanking the live windows. The scheduled
+ * 5-minute cadence never trips the 4-minute bound. In memory only, never
+ * persisted or logged.
  */
 const apiCallLastCall = new Map<string, number>();
+const apiCallCache = new Map<string, ApiCallCachedEnvelope>();
 
 type CompanyStateKey = { scopeKind: "company"; scopeId: string; namespace: string; stateKey: string };
 type InstanceStateKey = { scopeKind: "instance"; namespace: string; stateKey: string };
@@ -367,6 +372,7 @@ async function runCompanySync(
       },
       logActivity: (message, metadata) => ctx.activity.log({ companyId, message, metadata }),
       apiCallLastCall,
+      apiCallCache,
     },
     inFlight,
   );

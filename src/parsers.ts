@@ -1533,10 +1533,13 @@ export function parseAuthFiles(
      * only field-whitelisted quota shapes are kept. Non-2xx upstream answers
      * warn per file and stay quota-blind (fail open).
      */
-    apiCallPayloadByAuthIndex?: Map<string, { statusCode: number; body: unknown }>;
+    apiCallPayloadByAuthIndex?: Map<string, { statusCode: number; body: unknown; observedAt?: string }>;
     /**
-     * Observation time stamped on live provider-API windows: the sync's fetch
-     * time (one call per account per sync), never the passive `observed_at`.
+     * Fallback observation time for live provider-API windows that carry no
+     * per-payload time: the sync's fetch time, never the passive `observed_at`.
+     * Payloads from the sync loop always carry their own `observedAt` — fresh
+     * fetches stamp sync time, throttled reuses stamp the original fetch —
+     * so the staleness logic ages each answer honestly.
      */
     apiCallObservedAt?: string | null;
   },
@@ -1782,7 +1785,7 @@ export function parseAuthFiles(
     const apiPayload =
       authIndex !== null ? opts.apiCallPayloadByAuthIndex?.get(authIndex) : undefined;
     if (apiPayload !== undefined && !disabled) {
-      const apiObservedAt = opts.apiCallObservedAt ?? opts.now;
+      const apiObservedAt = apiPayload.observedAt ?? opts.apiCallObservedAt ?? opts.now;
       if (apiPayload.statusCode < 200 || apiPayload.statusCode >= 300) {
         parseWarnings.push(
           `${provider}: provider API returned upstream HTTP ${apiPayload.statusCode}; treating this account as unknown for live quota.`,
