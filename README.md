@@ -160,7 +160,21 @@ or no query on older builds) — there are deliberately no config knobs for
 them, and the management key is never sent to `/v1` paths. The served-model list has its
 own pinned path (`/v1/models`, `MODELS_PATH`) fetched with the separate client API key
 (Bearer auth) under the same guarded-fetch rules (loopback, manual redirects, timeouts,
-caps, no key leaks); neither key can travel to the other's paths. If your CLIProxy build
+caps, no key leaks); neither key can travel to the other's paths. Meta, Antigravity and
+Devin publish no passive quota signals, so one pinned `POST /v0/management/api-call`
+per credential per sync reads the same live quota the Management Center panel
+shows: three frozen request templates (exact upstream method, URL, headers and body
+copied from the panel source, `apiCallTemplate()` in `src/cliproxy.ts`) whose only
+variable is the credential `auth_index` — callers cannot supply their own URL, headers
+or body. Upstream `$TOKEN$` placeholders are substituted server-side by CLIProxy; the
+plugin never handles credential material. Meta has a backend boundary: the panel
+authorizes its Muse-key quota call with the downloaded `dca_token`, and this template
+preserves that upstream request shape, but the connector cannot verify which stored
+meta credential form the backend substitutes. If upstream rejects it, the account
+warns and stays unknown; operator resync is the verification. Transport 401/403 spends the strike budget
+like every management GET; an upstream provider-side error travels inside the returned
+envelope and only warns per file (fail open). Live windows are labelled "via provider
+API" on the Usage & quota page. If your CLIProxy build
 differs, change the pinned constants in `src/cliproxy.ts` — everything else follows.
 The quota-fetch wire shape is the lowercase CLIProxyAPI `sdk/pluginapi`
 `QuotaFetchResponse`: `groups[]` → `buckets[]`, with per-bucket `window`,
@@ -179,13 +193,15 @@ tests mirrors the public CLIProxyAPI source shapes.
 - Management key and client API key: each resolved per sync run from its own `secret_ref`,
   in memory only, never persisted, never in UI/agent/log surfaces (redaction tests prove
   it). Client-key 401/403s never spend the management strike budget.
-- Safe path only: loopback base URL, key header attached after origin validation, GET-only
-  allow-list, `api-call` excluded and un-admittable, manual redirects with revalidation
+- Safe path only: loopback base URL, key header attached after origin validation, pinned
+  GET allow-list (`api-call` excluded from it and un-admittable through it) plus the
+  three pinned `api-call` POST templates (exact upstream requests, credential
+  `auth_index` the only variable), manual redirects with revalidation
   (max 2, same-origin loopback), 15 s timeouts, 2 MB caps, schema-checked JSON. The worker
   fetches through its own guarded loopback transport (Node fetch, never the host client —
   the host SSRF guard refuses loopback); the transport re-checks loopback-only, canonical
-  origin (`localhost` is rewritten to `127.0.0.1` so no resolver is involved), GET-only
-  and no auto-redirects per request.
+  origin (`localhost` is rewritten to `127.0.0.1` so no resolver is involved), pinned
+  GET and `api-call` POST methods only, and no auto-redirects per request.
 - Strike budget (host-wide): first 401/403 stops the run and marks the secret bad; sync
   never re-probes while the secret is marked bad. A 2nd auth failure per rolling 30 min
   hard-disables sync until explicit board re-enable (`reenable` route/action, board users
@@ -217,7 +233,7 @@ fixtures incl. the 60%-remaining regression test, bucket-less warnings, `summary
 Devin quota grouped by auth-file provider), `models.test.ts` (served-list parsing,
 namespace-first attribution, Devin `owned_by: anthropic` case, colliding bare-id overlap),
 `cliproxy.test.ts` (management + client allow-lists, redirects, caps, redaction),
-`loopback-fetch.test.ts` (worker-local loopback transport: off-loopback/off-origin/non-GET
+`loopback-fetch.test.ts` (worker-local loopback transport: off-loopback/off-origin/other-method
 refused, no auto-redirects, composition with the client),
 `config.test.ts` (incl. the optional client-key `secret_ref`), `ui-data.test.ts`
 (incl. the usage-page data: verdicts, headroom, resets, freshness, blind badges with

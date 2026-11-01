@@ -83,6 +83,11 @@ export interface AccountCardLimit {
   models: string[] | null;
   /** Display-only quota `summary[]` entries attached to this window. */
   metrics: string[] | null;
+  /**
+   * True when this window came from a live provider API call (pinned
+   * `api-call` template); the usage page labels it "via provider API".
+   */
+  viaProviderApi: boolean | null;
 }
 
 export interface ProviderCard {
@@ -315,6 +320,7 @@ function toAccountDetail(
       stale,
       models: l.models ?? null,
       metrics: l.metrics ?? null,
+      viaProviderApi: l.viaProviderApi ?? null,
     })),
     worstRemaining: remaining.length > 0 ? Math.min(...remaining) : null,
     nextReset,

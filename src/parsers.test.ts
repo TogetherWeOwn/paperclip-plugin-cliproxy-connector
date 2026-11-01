@@ -1062,3 +1062,724 @@ describe("hashIdentity redaction", () => {
     expect(a).not.toContain("id-1");
   });
 });
+
+describe("parseMetaQuota (panel metaQuota.ts shape)", () => {
+  const metaWindows = () => DEFAULT_PROVIDER_WINDOWS.meta as string[];
+  const body = () => ({
+    subs_usage: {
+      tier: "Pro",
+      window: { used_percent: 25, resets_at: Math.floor(NOW_MS / 1000) + 3600, window_duration_mins: 60 },
+      weekly: { used_percent: 10, resets_at: Math.floor(NOW_MS / 1000) + 86400 },
+    },
+    subs_tier_name: "Pro",
+    is_subs_active: true,
+  });
+
+  it("emits window + weekly windows with remaining % and resets, labelled via provider API", async () => {
+    const { parseMetaQuota } = await import("./parsers.js");
+    const parsed = parseMetaQuota(body(), NOW, metaWindows());
+    expect(parsed.warnings).toEqual([]);
+    expect(parsed.planType).toBe("Pro");
+    expect(parsed.limits.map((l) => l.id)).toEqual(["meta:window", "meta:weekly"]);
+    expect(parsed.limits[0]?.remainingPercent).toBe(75);
+    expect(parsed.limits[0]?.usedPercent).toBe(25);
+    expect(parsed.limits[0]?.resetsAt).toBe(iso(NOW_MS + 3600_000));
+    expect(parsed.limits[1]?.remainingPercent).toBe(90);
+    for (const l of parsed.limits) {
+      expect(l.viaProviderApi).toBe(true);
+      expect(l.gating).toBe(true);
+      expect(l.allowed).toBe(true);
+      expect(l.observedAt).toBe(NOW);
+    }
+  });
+
+  it("marks an expected-but-unusable window unknown instead of implying coverage", async () => {
+    const { parseMetaQuota } = await import("./parsers.js");
+    const payload = body();
+    (payload.subs_usage as Record<string, unknown>).weekly = { used_percent: "not-a-number" };
+    const parsed = parseMetaQuota(payload, NOW, metaWindows());
+    expect(parsed.limits.map((l) => l.id)).toEqual(["meta:window", "meta:weekly"]);
+    expect(parsed.limits[1]?.remainingPercent).toBeNull();
+    expect(parsed.limits[1]?.allowed).toBeNull();
+    expect(parsed.limits[1]?.gating).toBe(true);
+    expect(parsed.limits[1]?.viaProviderApi).toBe(true);
+    expect(parsed.warnings.join(" ")).toMatch(/weekly.*unknown/);
+  });
+
+  it("forces exhausted windows when the subscription is inactive", async () => {
+    const { parseMetaQuota } = await import("./parsers.js");
+    const parsed = parseMetaQuota({ ...body(), is_subs_active: false }, NOW, metaWindows());
+    expect(parsed.limits.length).toBe(2);
+    for (const l of parsed.limits) {
+      expect(l.limitReached).toBe(true);
+      expect(l.allowed).toBe(false);
+    }
+    expect(parsed.warnings.join(" ")).toMatch(/inactive/);
+  });
+
+  it("returns plan-only with zero windows when subs_usage is absent (unknown, not zero)", async () => {
+    const { parseMetaQuota } = await import("./parsers.js");
+    const parsed = parseMetaQuota({ subs_tier_name: "Pro", is_subs_active: true }, NOW, metaWindows());
+    expect(parsed.planType).toBe("Pro");
+    expect(parsed.limits).toEqual([]);
+    expect(parsed.warnings.length).toBeGreaterThan(0);
+  });
+
+  it("warns with zero windows on a non-object answer", async () => {
+    const { parseMetaQuota } = await import("./parsers.js");
+    for (const bad of [null, 42, "not-json{{{"]) {
+      const parsed = parseMetaQuota(bad, NOW, metaWindows());
+      expect(parsed.limits).toEqual([]);
+      expect(parsed.warnings.length).toBeGreaterThan(0);
+    }
+  });
+});
+
+describe("parseAntigravitySubscription (panel antigravitySubscription.ts shape)", () => {
+  const antigravityWindows = () => DEFAULT_PROVIDER_WINDOWS.antigravity as string[];
+
+  it("resolves the paid tier over the current tier through PLAN_BY_TIER_ID", async () => {
+    const { parseAntigravitySubscription } = await import("./parsers.js");
+    const parsed = parseAntigravitySubscription(
+      { currentTier: { id: "free-tier", name: "Free" }, paidTier: { id: "g1-pro-tier", name: "Pro" } },
+      NOW,
+      antigravityWindows(),
+    );
+    expect(parsed.planType).toBe("Pro");
+    // Subscription alone carries no quota windows: plan only, still blind.
+    expect(parsed.limits).toEqual([]);
+  });
+
+  it("parses opportunistic quota-summary groups into windows", async () => {
+    const { parseAntigravitySubscription } = await import("./parsers.js");
+    const parsed = parseAntigravitySubscription(
+      {
+        currentTier: { id: "g1-ultra-tier", name: "Ultra" },
+        groups: [
+          {
+            buckets: [
+              { window: "weekly", remainingFraction: 0.4, resetTime: "2026-11-08T12:00:00.000Z", description: "Ultra weekly" },
+            ],
+          },
+        ],
+      },
+      NOW,
+      antigravityWindows(),
+    );
+    expect(parsed.planType).toBe("Ultra");
+    expect(parsed.limits.length).toBe(1);
+    expect(parsed.limits[0]?.remainingPercent).toBe(40);
+    expect(parsed.limits[0]?.gating).toBe(true);
+    expect(parsed.limits[0]?.viaProviderApi).toBe(true);
+  });
+
+  it("reads percent strings at percent scale, not fraction scale", async () => {
+    const { parseAntigravitySubscription } = await import("./parsers.js");
+    const parsed = parseAntigravitySubscription(
+      {
+        currentTier: { id: "g1-pro-tier", name: "Pro" },
+        groups: [
+          {
+            buckets: [
+              { window: "5h", remainingFraction: "42%" },
+              { window: "weekly", remainingFraction: "1%" },
+              { window: "daily", remainingFraction: "0.5%" },
+            ],
+          },
+        ],
+      },
+      NOW,
+      antigravityWindows(),
+    );
+    expect(parsed.limits.map((l) => l.remainingPercent)).toEqual([42, 1, 0.5]);
+    expect(parsed.limits.map((l) => l.usedPercent)).toEqual([58, 99, 99.5]);
+  });
+
+  it("disambiguates repeated bucket windows instead of emitting duplicate ids", async () => {
+    const { parseAntigravitySubscription } = await import("./parsers.js");
+    const parsed = parseAntigravitySubscription(
+      {
+        currentTier: { id: "g1-pro-tier", name: "Pro" },
+        groups: [
+          { buckets: [{ window: "weekly", remainingFraction: 0.4 }] },
+          { buckets: [{ window: "weekly", remainingFraction: 0.25 }] },
+        ],
+      },
+      NOW,
+      antigravityWindows(),
+    );
+    expect(parsed.limits.map((l) => l.id)).toEqual([
+      "antigravity:weekly",
+      "antigravity:weekly#2",
+    ]);
+    expect(parsed.limits.map((l) => l.remainingPercent)).toEqual([40, 25]);
+  });
+
+  it("warns with zero windows when no tier is named", async () => {
+    const { parseAntigravitySubscription } = await import("./parsers.js");
+    const parsed = parseAntigravitySubscription({ currentTier: {}, paidTier: {} }, NOW, antigravityWindows());
+    expect(parsed.limits).toEqual([]);
+    expect(parsed.warnings.length).toBeGreaterThan(0);
+  });
+});
+
+describe("parseDevinQuota (panel devinQuota.ts shape)", () => {
+  const devinWindows = () => DEFAULT_PROVIDER_WINDOWS.devin as string[];
+  const resetUnix = Math.floor(NOW_MS / 1000) + 7200;
+  const body = () => ({
+    userStatus: {
+      planStatus: {
+        dailyQuotaRemainingPercent: 75,
+        dailyQuotaResetAtUnix: resetUnix,
+        weeklyQuotaRemainingPercent: "50",
+        weeklyQuotaResetAtUnix: String(resetUnix),
+        planInfo: { planName: "Devin Pro" },
+      },
+    },
+  });
+
+  it("emits daily + weekly windows from the live RPC with resets and plan", async () => {
+    const { parseDevinQuota } = await import("./parsers.js");
+    const parsed = parseDevinQuota(body(), NOW, devinWindows());
+    expect(parsed.warnings).toEqual([]);
+    expect(parsed.planType).toBe("Devin Pro");
+    expect(parsed.limits.map((l) => l.id)).toEqual(["devin:daily", "devin:weekly"]);
+    expect(parsed.limits[0]?.remainingPercent).toBe(75);
+    expect(parsed.limits[0]?.usedPercent).toBe(25);
+    expect(parsed.limits[0]?.resetsAt).toBe(iso(resetUnix * 1000));
+    expect(parsed.limits[1]?.remainingPercent).toBe(50);
+    for (const l of parsed.limits) {
+      expect(l.viaProviderApi).toBe(true);
+      expect(l.gating).toBe(true);
+      expect(l.allowed).toBe(true);
+    }
+  });
+
+  it("rejects non-strict percents the way the panel does (trailing % is signals-only)", async () => {
+    const { parseDevinQuota } = await import("./parsers.js");
+    const payload = body();
+    (payload.userStatus.planStatus as Record<string, unknown>).dailyQuotaRemainingPercent = "75%";
+    const parsed = parseDevinQuota(payload, NOW, devinWindows());
+    expect(parsed.limits.map((l) => l.id)).toEqual(["devin:daily", "devin:weekly"]);
+    expect(parsed.limits[0]?.remainingPercent).toBeNull();
+    // Unknown but admitted: the verdict stays unknown (vetoing headroom)
+    // instead of tripping the admission-based limiting rule.
+    expect(parsed.limits[0]?.allowed).toBe(true);
+    expect(parsed.limits[0]?.gating).toBe(true);
+    expect(parsed.warnings.join(" ")).toMatch(/daily.*unknown/);
+  });
+
+  it("warns and emits expected unknown windows when the RPC carries no usable quota", async () => {
+    const { parseDevinQuota } = await import("./parsers.js");
+    const parsed = parseDevinQuota({ userStatus: { planStatus: { planInfo: {} } } }, NOW, devinWindows());
+    expect(parsed.limits.map((l) => l.id)).toEqual(["devin:daily", "devin:weekly"]);
+    for (const limit of parsed.limits) {
+      expect(limit.remainingPercent).toBeNull();
+      // A plan-only answer carries no quota evidence: unknown, never
+      // admission-limited, so aggregation cannot report exhaustion.
+      expect(limit.allowed).toBe(true);
+      expect(limit.gating).toBe(true);
+    }
+    expect(parsed.warnings.length).toBeGreaterThan(0);
+  });
+});
+
+describe("parseAuthFiles with live provider-API payloads", () => {
+  const filesFor = (provider: string, authIndex: string) => ({
+    files: [
+      {
+        id: `REDACTED-ID-${provider}`,
+        auth_index: authIndex,
+        name: "REDACTED-NAME",
+        type: "cli",
+        provider,
+        disabled: false,
+        unavailable: false,
+      },
+    ],
+  });
+  const allowLists = () => ({ ...DEFAULT_PROVIDER_WINDOWS });
+
+  it("attaches meta windows to their own account and clears quota-blind", async () => {
+    const { parseAuthFiles } = await import("./parsers.js");
+    const resetUnix = Math.floor(NOW_MS / 1000) + 3600;
+    const { accounts } = parseAuthFiles(filesFor("meta", "m1"), {
+      now: NOW,
+      allowLists: allowLists(),
+      apiCallPayloadByAuthIndex: new Map([
+        [
+          "m1",
+          {
+            statusCode: 200,
+            body: {
+              subs_usage: {
+                window: { used_percent: 20, resets_at: resetUnix },
+                weekly: { used_percent: 5, resets_at: resetUnix + 86400 },
+              },
+              subs_tier_name: "Pro",
+              is_subs_active: true,
+            },
+          },
+        ],
+      ]),
+      apiCallObservedAt: NOW,
+    });
+    expect(accounts).toHaveLength(1);
+    expect(accounts[0]?.quotaBlind).toBe(false);
+    expect(accounts[0]?.planType).toBe("Pro");
+    expect(accounts[0]?.limits.map((l) => l.id)).toEqual(["meta:window", "meta:weekly"]);
+    expect(accounts[0]?.limits.every((l) => l.viaProviderApi === true)).toBe(true);
+  });
+
+  it("a partial meta answer keeps the expected unknown window without quota-blindness", async () => {
+    const { parseAuthFiles } = await import("./parsers.js");
+    const { accounts } = parseAuthFiles(filesFor("meta", "m3"), {
+      now: NOW,
+      allowLists: allowLists(),
+      apiCallPayloadByAuthIndex: new Map([
+        [
+          "m3",
+          {
+            statusCode: 200,
+            body: {
+              subs_usage: {
+                window: { used_percent: 20, resets_at: NOW_MS / 1000 + 3600 },
+                weekly: { used_percent: "not-a-number" },
+              },
+              subs_tier_name: "Pro",
+              is_subs_active: true,
+            },
+          },
+        ],
+      ]),
+      apiCallObservedAt: NOW,
+    });
+    expect(accounts[0]?.quotaBlind).toBe(false);
+    expect(accounts[0]?.limits.map((l) => l.id)).toEqual(["meta:window", "meta:weekly"]);
+    expect(accounts[0]?.limits[1]?.allowed).toBeNull();
+  });
+
+  it("an upstream 429 warns per file and stays quota-blind (fail open)", async () => {
+    const { parseAuthFiles } = await import("./parsers.js");
+    const { accounts } = parseAuthFiles(filesFor("devin", "d9"), {
+      now: NOW,
+      allowLists: allowLists(),
+      apiCallPayloadByAuthIndex: new Map([["d9", { statusCode: 429, body: { error: "slow down" } }]]),
+      apiCallObservedAt: NOW,
+    });
+    expect(accounts[0]?.quotaBlind).toBe(true);
+    expect(accounts[0]?.limits).toEqual([]);
+    expect(accounts[0]?.parseWarnings.join(" ")).toMatch(/429/);
+  });
+
+  it("meta without a live answer stays quota-blind with the upstream reason", async () => {
+    const { parseAuthFiles } = await import("./parsers.js");
+    const { accounts } = parseAuthFiles(filesFor("meta", "m2"), {
+      now: NOW,
+      allowLists: allowLists(),
+    });
+    expect(accounts[0]?.quotaBlind).toBe(true);
+    expect(accounts[0]?.quotaBlindReason).toBe("upstream exposes nothing");
+  });
+});
+
+describe("live windows supersede same-id passive windows", () => {
+  it("keeps one fresh live window instead of a stale passive twin", async () => {
+    const { parseAuthFiles } = await import("./parsers.js");
+    const resetUnix = Math.floor(NOW_MS / 1000) + 7200;
+    const { accounts } = parseAuthFiles(
+      {
+        files: [
+          {
+            id: "REDACTED-ID-DEVIN",
+            auth_index: "d1",
+            name: "REDACTED-NAME",
+            provider: "devin",
+            disabled: false,
+            unavailable: false,
+            quota: {
+              observed_at: "2026-10-01T12:00:00.000Z",
+              signals: {
+                "daily-quota-remaining-percent": "10%",
+                "daily-quota-reset-at": "2026-10-01T13:00:00.000Z",
+                "weekly-quota-remaining-percent": "20%",
+                "weekly-quota-reset-at": "2026-10-08T12:00:00.000Z",
+                plan: "Devin",
+              },
+            },
+          },
+        ],
+      },
+      {
+        now: NOW,
+        allowLists: { ...DEFAULT_PROVIDER_WINDOWS },
+        apiCallPayloadByAuthIndex: new Map([
+          [
+            "d1",
+            {
+              statusCode: 200,
+              body: {
+                userStatus: {
+                  planStatus: {
+                    dailyQuotaRemainingPercent: 60,
+                    dailyQuotaResetAtUnix: resetUnix,
+                    weeklyQuotaRemainingPercent: 80,
+                    weeklyQuotaResetAtUnix: resetUnix + 86400,
+                    planInfo: { planName: "Devin Pro" },
+                  },
+                },
+              },
+            },
+          ],
+        ]),
+        apiCallObservedAt: NOW,
+      },
+    );
+    expect(accounts).toHaveLength(1);
+    const ids = accounts[0]?.limits.map((l) => l.id) ?? [];
+    expect(ids).toEqual(["devin:daily", "devin:weekly"]);
+    expect(accounts[0]?.limits[0]?.remainingPercent).toBe(60);
+    expect(accounts[0]?.limits[0]?.observedAt).toBe(NOW);
+    expect(accounts[0]?.limits.every((l) => l.viaProviderApi === true)).toBe(true);
+    expect(accounts[0]?.quotaBlind).toBe(false);
+  });
+
+  it("an unreadable live answer does not evict usable passive twins", async () => {
+    const { parseAuthFiles } = await import("./parsers.js");
+    const resetUnix = Math.floor(NOW_MS / 1000) + 7200;
+    const { accounts } = parseAuthFiles(
+      {
+        files: [
+          {
+            id: "REDACTED-ID-DEVIN",
+            auth_index: "d1",
+            name: "REDACTED-NAME",
+            provider: "devin",
+            disabled: false,
+            unavailable: false,
+            quota: {
+              observed_at: "2026-10-01T12:00:00.000Z",
+              signals: {
+                "daily-quota-remaining-percent": "10%",
+                "daily-quota-reset-at": "2026-10-01T13:00:00.000Z",
+                "weekly-quota-remaining-percent": "20%",
+                "weekly-quota-reset-at": "2026-10-08T12:00:00.000Z",
+                plan: "Devin",
+              },
+            },
+          },
+        ],
+      },
+      {
+        now: NOW,
+        allowLists: { ...DEFAULT_PROVIDER_WINDOWS },
+        apiCallPayloadByAuthIndex: new Map([
+          [
+            "d1",
+            {
+              statusCode: 200,
+              // Plan-only answer: no usable percents.
+              body: { userStatus: { planStatus: { planInfo: { planName: "Devin Pro" } } } },
+            },
+          ],
+        ]),
+        apiCallObservedAt: NOW,
+      },
+    );
+    expect(accounts).toHaveLength(1);
+    const ids = accounts[0]?.limits.map((l) => l.id) ?? [];
+    expect(ids).toEqual(["devin:daily", "devin:weekly"]);
+    // The usable passive twins survive; no unreadable live row joins them.
+    expect(accounts[0]?.limits[0]?.remainingPercent).toBe(10);
+    expect(accounts[0]?.limits[1]?.remainingPercent).toBe(20);
+    expect(accounts[0]?.limits.every((l) => !l.viaProviderApi)).toBe(true);
+    expect(accounts[0]?.quotaBlind).toBe(false);
+  });
+
+  it("a model-scoped passive twin does not cover an account-wide live unknown row", async () => {
+    const { parseAuthFiles } = await import("./parsers.js");
+    const { aggregateProvider } = await import("./aggregate.js");
+    const { parseConfig } = await import("./config.js");
+    const resetUnix = Math.floor(NOW_MS / 1000) + 7200;
+    const { accounts } = parseAuthFiles(
+      {
+        files: [
+          {
+            id: "REDACTED-ID-DEVIN",
+            auth_index: "d1",
+            name: "REDACTED-NAME",
+            provider: "devin",
+            disabled: false,
+            unavailable: false,
+            model_quotas: {
+              "model-a": {
+                observed_at: NOW,
+                signals: {
+                  "daily-quota-remaining-percent": "50%",
+                  "daily-quota-reset-at": iso(NOW_MS + 3_600_000),
+                },
+              },
+            },
+          },
+        ],
+      },
+      {
+        now: NOW,
+        allowLists: { ...DEFAULT_PROVIDER_WINDOWS },
+        apiCallPayloadByAuthIndex: new Map([
+          [
+            "d1",
+            {
+              statusCode: 200,
+              // No usable daily: only weekly parses, so daily degrades to an
+              // account-wide unknown row.
+              body: {
+                userStatus: {
+                  planStatus: {
+                    weeklyQuotaRemainingPercent: 80,
+                    weeklyQuotaResetAtUnix: resetUnix + 86400,
+                    planInfo: { planName: "Devin Pro" },
+                  },
+                },
+              },
+            },
+          ],
+        ]),
+        apiCallObservedAt: NOW,
+      },
+    );
+    expect(accounts).toHaveLength(1);
+    const limits = accounts[0]?.limits ?? [];
+    // The model-A passive row survives as per-model evidence ...
+    const scoped = limits.find((l) => l.id === "devin:daily" && (l.models ?? []).includes("model-a"));
+    expect(scoped).toMatchObject({ remainingPercent: 50 });
+    expect(scoped?.viaProviderApi).not.toBe(true);
+    // ... and the account-wide live unknown daily joins it instead of being
+    // dropped as a duplicate.
+    const liveDaily = limits.find(
+      (l) => l.id === "devin:daily" && (!l.models || l.models.length === 0) && l.viaProviderApi === true,
+    );
+    expect(liveDaily).toMatchObject({ remainingPercent: null, allowed: true });
+    expect(limits.filter((l) => l.id === "devin:daily")).toHaveLength(2);
+    const { config: cfg, validation } = parseConfig({
+      cliproxyBaseUrl: "http://127.0.0.1:8317",
+      managementKeyHeader: "X-Test-Key",
+      managementSecretRef: { uid: "secret-1" },
+      providers: [{ provider: "devin", connectionId: "conn-devin", completeInventory: true }],
+    });
+    expect(validation.ok).toBe(true);
+    // A request for another model sees the unknown daily, never headroom.
+    const forB = aggregateProvider({
+      provider: "devin",
+      model: "model-b",
+      rows: accounts.map((a) => ({ ...a, source: "test", lastError: null })),
+      completeInventory: true,
+      config: cfg,
+      now: NOW,
+    });
+    expect(forB.state).toBe("unknown");
+  });
+
+  it("a model-scoped passive row still applies to its own model", async () => {
+    const { parseAuthFiles } = await import("./parsers.js");
+    const { aggregateProvider } = await import("./aggregate.js");
+    const { parseConfig } = await import("./config.js");
+    const resetUnix = Math.floor(NOW_MS / 1000) + 7200;
+    const weeklyOnlyLive = {
+      statusCode: 200,
+      body: {
+        userStatus: {
+          planStatus: {
+            weeklyQuotaRemainingPercent: 80,
+            weeklyQuotaResetAtUnix: resetUnix + 86400,
+            planInfo: { planName: "Devin Pro" },
+          },
+        },
+      },
+    };
+    const { config: cfg, validation } = parseConfig({
+      cliproxyBaseUrl: "http://127.0.0.1:8317",
+      managementKeyHeader: "X-Test-Key",
+      managementSecretRef: { uid: "secret-1" },
+      providers: [{ provider: "devin", connectionId: "conn-devin", completeInventory: true }],
+    });
+    expect(validation.ok).toBe(true);
+    const assess = (rows: { limits: unknown }[], model: string) =>
+      aggregateProvider({
+        provider: "devin",
+        model,
+        rows: rows.map((a) => ({ ...a, source: "test", lastError: null })) as never,
+        completeInventory: true,
+        config: cfg,
+        now: NOW,
+      });
+    // Healthy scoped row: kept with its model tag, and the live unknown
+    // daily still vetoes headroom for its own model too.
+    const healthy = parseAuthFiles(
+      {
+        files: [
+          {
+            id: "REDACTED-ID-DEVIN",
+            auth_index: "d1",
+            name: "REDACTED-NAME",
+            provider: "devin",
+            disabled: false,
+            unavailable: false,
+            model_quotas: {
+              "model-a": {
+                observed_at: NOW,
+                signals: {
+                  "daily-quota-remaining-percent": "50%",
+                  "daily-quota-reset-at": iso(NOW_MS + 3_600_000),
+                },
+              },
+            },
+          },
+        ],
+      },
+      {
+        now: NOW,
+        allowLists: { ...DEFAULT_PROVIDER_WINDOWS },
+        apiCallPayloadByAuthIndex: new Map([["d1", weeklyOnlyLive]]),
+        apiCallObservedAt: NOW,
+      },
+    );
+    const scoped = (healthy.accounts[0]?.limits ?? []).find(
+      (l) => l.id === "devin:daily" && (l.models ?? []).includes("model-a"),
+    );
+    expect(scoped).toMatchObject({ remainingPercent: 50 });
+    expect(assess(healthy.accounts, "model-a").state).toBe("unknown");
+    // Exhausted scoped row: it limits its own model but never another one.
+    const exhausted = parseAuthFiles(
+      {
+        files: [
+          {
+            id: "REDACTED-ID-DEVIN",
+            auth_index: "d1",
+            name: "REDACTED-NAME",
+            provider: "devin",
+            disabled: false,
+            unavailable: false,
+            model_quotas: {
+              "model-a": {
+                observed_at: NOW,
+                signals: {
+                  "daily-quota-remaining-percent": "0%",
+                  "daily-quota-reset-at": iso(NOW_MS + 3_600_000),
+                },
+              },
+            },
+          },
+        ],
+      },
+      {
+        now: NOW,
+        allowLists: { ...DEFAULT_PROVIDER_WINDOWS },
+        apiCallPayloadByAuthIndex: new Map([["d1", weeklyOnlyLive]]),
+        apiCallObservedAt: NOW,
+      },
+    );
+    expect(assess(exhausted.accounts, "model-a").state).not.toBe("allowed");
+    expect(assess(exhausted.accounts, "model-b").state).toBe("unknown");
+  });
+
+  it("a usable account-level live row does not evict a model-scoped twin", async () => {
+    const { parseAuthFiles } = await import("./parsers.js");
+    const resetUnix = Math.floor(NOW_MS / 1000) + 7200;
+    const { accounts } = parseAuthFiles(
+      {
+        files: [
+          {
+            id: "REDACTED-ID-DEVIN",
+            auth_index: "d1",
+            name: "REDACTED-NAME",
+            provider: "devin",
+            disabled: false,
+            unavailable: false,
+            model_quotas: {
+              "model-a": {
+                observed_at: NOW,
+                signals: {
+                  "daily-quota-remaining-percent": "50%",
+                  "daily-quota-reset-at": iso(NOW_MS + 3_600_000),
+                },
+              },
+            },
+          },
+        ],
+      },
+      {
+        now: NOW,
+        allowLists: { ...DEFAULT_PROVIDER_WINDOWS },
+        apiCallPayloadByAuthIndex: new Map([
+          [
+            "d1",
+            {
+              statusCode: 200,
+              body: {
+                userStatus: {
+                  planStatus: {
+                    dailyQuotaRemainingPercent: 60,
+                    dailyQuotaResetAtUnix: resetUnix,
+                    weeklyQuotaRemainingPercent: 80,
+                    weeklyQuotaResetAtUnix: resetUnix + 86400,
+                    planInfo: { planName: "Devin Pro" },
+                  },
+                },
+              },
+            },
+          ],
+        ]),
+        apiCallObservedAt: NOW,
+      },
+    );
+    expect(accounts).toHaveLength(1);
+    const dailies = (accounts[0]?.limits ?? []).filter((l) => l.id === "devin:daily");
+    // Per-model evidence is stricter-limit telemetry: both rows survive.
+    expect(dailies).toHaveLength(2);
+    expect(dailies.find((l) => (l.models ?? []).includes("model-a"))).toMatchObject({
+      remainingPercent: 50,
+    });
+    expect(dailies.find((l) => (!l.models || l.models.length === 0) && l.viaProviderApi === true)).toMatchObject({
+      remainingPercent: 60,
+    });
+  });
+
+  it("an unreadable live answer with no twins still marks the windows unknown", async () => {
+    const { parseAuthFiles } = await import("./parsers.js");
+    const { accounts } = parseAuthFiles(
+      {
+        files: [
+          {
+            id: "REDACTED-ID-DEVIN",
+            auth_index: "d1",
+            name: "REDACTED-NAME",
+            provider: "devin",
+            disabled: false,
+            unavailable: false,
+          },
+        ],
+      },
+      {
+        now: NOW,
+        allowLists: { ...DEFAULT_PROVIDER_WINDOWS },
+        apiCallPayloadByAuthIndex: new Map([
+          [
+            "d1",
+            {
+              statusCode: 200,
+              body: { userStatus: { planStatus: { planInfo: { planName: "Devin Pro" } } } },
+            },
+          ],
+        ]),
+        apiCallObservedAt: NOW,
+      },
+    );
+    expect(accounts).toHaveLength(1);
+    const ids = accounts[0]?.limits.map((l) => l.id) ?? [];
+    expect(ids).toEqual(["devin:daily", "devin:weekly"]);
+    expect(accounts[0]?.limits.every((l) => l.remainingPercent === null)).toBe(true);
+    expect(accounts[0]?.limits.every((l) => l.viaProviderApi === true)).toBe(true);
+    expect(accounts[0]?.quotaBlind).toBe(false);
+  });
+});

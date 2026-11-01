@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { parseConfig } from "./config.js";
 import {
+  apiCallOriginKey,
   emptyStrikeBudget,
   reenableAfterStrike,
   runSync,
@@ -1243,5 +1244,305 @@ describe("sync failure visibility (S2)", () => {
     expect(summary.skipped).toBe(true);
     expect(s.failure?.message).toMatch(/could not resolve/);
     assertNoKeyLeak(s);
+  });
+});
+
+describe("live provider-API quota (pinned api-call templates)", () => {
+  const RESET = Math.floor(Date.parse(NOW) / 1000) + 3600;
+  const metaBody = () => ({
+    subs_usage: {
+      window: { used_percent: 20, resets_at: RESET },
+      weekly: { used_percent: 5, resets_at: RESET + 86400 },
+    },
+    subs_tier_name: "Pro",
+    is_subs_active: true,
+  });
+  const devinBody = () => ({
+    userStatus: {
+      planStatus: {
+        dailyQuotaRemainingPercent: 60,
+        dailyQuotaResetAtUnix: RESET,
+        weeklyQuotaRemainingPercent: 80,
+        weeklyQuotaResetAtUnix: RESET + 86400,
+        planInfo: { planName: "Devin Pro" },
+      },
+    },
+  });
+
+  function apiFetch(
+    calls: string[],
+    files: unknown[],
+    opts?: { transportStatus?: number; upstreamStatus?: number },
+  ) {
+    return vi.fn(async (input: string, init?: RequestInit): Promise<Response> => {
+      const url = new URL(String(input));
+      if (url.pathname === "/v0/management/auth-files") return jsonResponse(200, files);
+      if (url.pathname === "/v1/models") return jsonResponse(200, { data: [] });
+      if (url.pathname.includes("/plugins/")) return jsonResponse(200, { groups: [] });
+      if (url.pathname === "/v0/management/api-call") {
+        if (opts?.transportStatus) return new Response("denied", { status: opts.transportStatus });
+        const sent = JSON.parse(String(init?.body)) as { url: string; auth_index: string };
+        calls.push(`${sent.auth_index} ${sent.url}`);
+        expect(sent.auth_index).not.toMatch(/api-call/);
+        const upstream = sent.url.includes("meta.ai") ? metaBody() : devinBody();
+        return jsonResponse(
+          200,
+          { status_code: opts?.upstreamStatus ?? 200, header: {}, body: JSON.stringify(upstream) },
+        );
+      }
+      return new Response("not found", { status: 404 });
+    });
+  }
+
+  function configWith(...providers: Array<{ provider: string; connectionId: string }>) {
+    const raw = baseConfigRaw();
+    raw.providers = providers.map((p) => ({ ...p, completeInventory: false }));
+    return parseConfig(raw).config;
+  }
+
+  function depsWith(s: Store, config: ReturnType<typeof parseConfig>["config"], fetchImpl?: typeof fetch) {
+    const d = deps(s, fetchImpl);
+    return { ...d, config };
+  }
+
+  it("calls one pinned template per credential per sync and attaches windows to their own rows", async () => {
+    const s = store();
+    const calls: string[] = [];
+    const files = [
+      { id: "meta-a", provider: "meta", auth_index: "m1" },
+      { id: "meta-b", provider: "meta", auth_index: "m1" },
+      { id: "devin-a", provider: "devin", auth_index: "d1" },
+      { id: "claude-a", provider: "claude" },
+    ];
+    const config = configWith(
+      { provider: "claude", connectionId: "conn-claude" },
+      { provider: "meta", connectionId: "conn-meta" },
+      { provider: "devin", connectionId: "conn-devin" },
+    );
+    const inFlight = { running: false };
+    const summary = await runSync(depsWith(s, config, apiFetch(calls, files) as never), inFlight);
+    expect(summary.skipped).toBe(false);
+    // One call per distinct credential: the two meta rows share auth_index m1.
+    expect(calls).toHaveLength(2);
+    expect(calls).toEqual(
+      expect.arrayContaining([
+        expect.stringContaining("m1 https://api.meta.ai/muse-code/key"),
+        expect.stringContaining("d1 https://server.codeium.com/"),
+      ]),
+    );
+    const rows = Object.values(s.savedRows ?? {});
+    const metaRows = rows.filter((r) => r.provider === "meta");
+    expect(metaRows).toHaveLength(2);
+    for (const row of metaRows) {
+      expect(row.quotaBlind).toBe(false);
+      expect(row.planType).toBe("Pro");
+      expect(row.limits.map((l) => l.id)).toEqual(["meta:window", "meta:weekly"]);
+      expect(row.limits.every((l) => l.viaProviderApi === true)).toBe(true);
+    }
+    const devinRow = rows.find((r) => r.provider === "devin");
+    expect(devinRow?.quotaBlind).toBe(false);
+    expect(devinRow?.limits.map((l) => l.id)).toEqual(["devin:daily", "devin:weekly"]);
+    assertNoKeyLeak(s);
+  });
+
+  it("skips disabled and cooling accounts (no probe while the provider says wait)", async () => {
+    const s = store();
+    const calls: string[] = [];
+    const files = [
+      { id: "meta-off", provider: "meta", auth_index: "m-off", disabled: true },
+      {
+        id: "meta-cool",
+        provider: "meta",
+        auth_index: "m-cool",
+        unavailable: true,
+        next_retry_after: new Date(Date.parse(NOW) + 3600_000).toISOString(),
+      },
+      { id: "meta-ok", provider: "meta", auth_index: "m-ok" },
+    ];
+    const config = configWith({ provider: "meta", connectionId: "conn-meta" });
+    await runSync(depsWith(s, config, apiFetch(calls, files) as never), { running: false });
+    expect(calls).toHaveLength(1);
+    expect(calls[0]).toContain("m-ok");
+  });
+
+  it("a rejected key on the api-call path stops the run and marks the secret bad", async () => {
+    const s = store();
+    const calls: string[] = [];
+    const files = [{ id: "meta-a", provider: "meta", auth_index: "m1" }];
+    const config = configWith({ provider: "meta", connectionId: "conn-meta" });
+    const summary = await runSync(
+      depsWith(s, config, apiFetch(calls, files, { transportStatus: 401 }) as never),
+      { running: false },
+    );
+    expect(summary.skipped).toBe(true);
+    expect(s.strike.secretBad).toBe(true);
+    expect(s.savedRows).toBeNull();
+  });
+
+  it("an upstream provider error warns per file and stays quota-blind (fail open)", async () => {
+    const s = store();
+    const calls: string[] = [];
+    const files = [{ id: "meta-a", provider: "meta", auth_index: "m1" }];
+    const config = configWith({ provider: "meta", connectionId: "conn-meta" });
+    const summary = await runSync(
+      depsWith(s, config, apiFetch(calls, files, { upstreamStatus: 500 }) as never),
+      { running: false },
+    );
+    expect(summary.skipped).toBe(false);
+    expect(calls).toHaveLength(1);
+    const rows = Object.values(s.savedRows ?? {});
+    expect(rows).toHaveLength(1);
+    expect(rows[0]?.quotaBlind).toBe(true);
+    expect(rows[0]?.limits).toEqual([]);
+    expect((summary.errors.join(" ") + (rows[0]?.lastError ?? ""))).toMatch(/500/);
+    assertNoKeyLeak(s);
+  });
+
+  it("never sends fuzzy provider words through a pinned template (no credential to the wrong request)", async () => {
+    const s = store();
+    const calls: string[] = [];
+    // `gemini`/`gemini-cli` fuzzy-match to antigravity and `metafoo` contains
+    // `meta` under substring matching: none of them may produce an api-call.
+    const files = [
+      { id: "gemini-a", provider: "gemini", auth_index: "g1" },
+      { id: "gemini-cli-a", provider: "gemini-cli", auth_index: "g2" },
+      { id: "metafoo-a", provider: "metafoo", auth_index: "mX" },
+    ];
+    const config = configWith(
+      { provider: "gemini", connectionId: "conn-gemini" },
+      { provider: "gemini-cli", connectionId: "conn-gemini-cli" },
+      { provider: "metafoo", connectionId: "conn-metafoo" },
+    );
+    const summary = await runSync(depsWith(s, config, apiFetch(calls, files) as never), {
+      running: false,
+    });
+    expect(summary.skipped).toBe(false);
+    expect(calls).toHaveLength(0);
+    const rows = Object.values(s.savedRows ?? {});
+    expect(rows).toHaveLength(3);
+    expect(rows.every((r) => r.limits.every((l) => l.viaProviderApi !== true))).toBe(true);
+    assertNoKeyLeak(s);
+  });
+
+  it("a throttled rerun reuses the cached answer with the first run's observedAt", async () => {
+    const s = store();
+    const calls: string[] = [];
+    const files = [
+      { id: "meta-a", provider: "meta", auth_index: "m1" },
+      { id: "devin-a", provider: "devin", auth_index: "d1" },
+    ];
+    const config = configWith(
+      { provider: "meta", connectionId: "conn-meta" },
+      { provider: "devin", connectionId: "conn-devin" },
+    );
+    const apiCallLastCall = new Map<string, number>();
+    const apiCallCache = new Map<string, { statusCode: number; body: unknown; observedAt: string }>();
+    const first = await runSync(
+      { ...depsWith(s, config, apiFetch(calls, files) as never), apiCallLastCall, apiCallCache },
+      { running: false },
+    );
+    expect(first.skipped).toBe(false);
+    expect(calls).toHaveLength(2);
+    // A minute later the throttle holds, but the live windows survive with
+    // the first run's observation time — not a fresh stamp, not blank.
+    const later = new Date(Date.parse(NOW) + 60_000).toISOString();
+    const second = await runSync(
+      {
+        ...depsWith(s, config, apiFetch(calls, files) as never),
+        now: later,
+        apiCallLastCall,
+        apiCallCache,
+      },
+      { running: false },
+    );
+    expect(second.skipped).toBe(false);
+    expect(calls).toHaveLength(2);
+    const origin = new URL("http://127.0.0.1:8317").origin;
+    expect([...apiCallLastCall.keys()].sort()).toEqual([`${origin} d1`, `${origin} m1`]);
+    const rows = Object.values(s.savedRows ?? {});
+    const metaRow = rows.find((r) => r.provider === "meta");
+    expect(metaRow?.quotaBlind).toBe(false);
+    expect(metaRow?.limits.map((l) => l.id)).toEqual(["meta:window", "meta:weekly"]);
+    expect(metaRow?.limits.every((l) => l.viaProviderApi === true)).toBe(true);
+    expect(metaRow?.limits.every((l) => l.observedAt === NOW)).toBe(true);
+    const devinRow = rows.find((r) => r.provider === "devin");
+    expect(devinRow?.quotaBlind).toBe(false);
+    expect(devinRow?.limits.every((l) => l.observedAt === NOW)).toBe(true);
+    assertNoKeyLeak(s);
+  });
+
+  it("two runs 4m59s apart both call (cron jitter tolerance)", async () => {
+    const s = store();
+    const calls: string[] = [];
+    const files = [{ id: "meta-a", provider: "meta", auth_index: "m1" }];
+    const config = configWith({ provider: "meta", connectionId: "conn-meta" });
+    const apiCallLastCall = new Map<string, number>();
+    const apiCallCache = new Map<string, { statusCode: number; body: unknown; observedAt: string }>();
+    const first = await runSync(
+      { ...depsWith(s, config, apiFetch(calls, files) as never), apiCallLastCall, apiCallCache },
+      { running: false },
+    );
+    expect(first.skipped).toBe(false);
+    expect(calls).toHaveLength(1);
+    const later = new Date(Date.parse(NOW) + (4 * 60 + 59) * 1000).toISOString();
+    const second = await runSync(
+      {
+        ...depsWith(s, config, apiFetch(calls, files) as never),
+        now: later,
+        apiCallLastCall,
+        apiCallCache,
+      },
+      { running: false },
+    );
+    expect(second.skipped).toBe(false);
+    expect(calls).toHaveLength(2);
+    const rows = Object.values(s.savedRows ?? {});
+    expect(rows.find((r) => r.provider === "meta")?.quotaBlind).toBe(false);
+    assertNoKeyLeak(s);
+  });
+
+  it("two companies on the same origin share one call and both get windows", async () => {
+    const sA = store();
+    const sB = store();
+    const calls: string[] = [];
+    const files = [{ id: "meta-a", provider: "meta", auth_index: "m1" }];
+    const config = configWith({ provider: "meta", connectionId: "conn-meta" });
+    const apiCallLastCall = new Map<string, number>();
+    const apiCallCache = new Map<string, { statusCode: number; body: unknown; observedAt: string }>();
+    const base = { apiCallLastCall, apiCallCache };
+    const first = await runSync(
+      { ...depsWith(sA, config, apiFetch(calls, files) as never), companyId: "co-a", ...base },
+      { running: false },
+    );
+    expect(first.skipped).toBe(false);
+    expect(calls).toHaveLength(1);
+    const second = await runSync(
+      { ...depsWith(sB, config, apiFetch(calls, files) as never), companyId: "co-b", ...base },
+      { running: false },
+    );
+    expect(second.skipped).toBe(false);
+    // One call between them; the second company reuses the cached answer.
+    expect(calls).toHaveLength(1);
+    for (const s of [sA, sB]) {
+      const rows = Object.values(s.savedRows ?? {});
+      const metaRow = rows.find((r) => r.provider === "meta");
+      expect(metaRow?.quotaBlind).toBe(false);
+      expect(metaRow?.limits.map((l) => l.id)).toEqual(["meta:window", "meta:weekly"]);
+      expect(metaRow?.limits.every((l) => l.observedAt === NOW)).toBe(true);
+    }
+    assertNoKeyLeak(sA);
+    assertNoKeyLeak(sB);
+  });
+
+  it("localhost and 127.0.0.1 spellings share one throttle bucket", () => {
+    expect(apiCallOriginKey("http://localhost:8317")).toBe("http://127.0.0.1:8317");
+    expect(apiCallOriginKey("http://127.0.0.1:8317")).toBe("http://127.0.0.1:8317");
+    expect(apiCallOriginKey("http://localhost:8317")).toBe(
+      apiCallOriginKey("HTTP://127.0.0.1:8317/"),
+    );
+    // A different port is a different CLIProxy: never shared.
+    expect(apiCallOriginKey("http://localhost:8318")).not.toBe(
+      apiCallOriginKey("http://localhost:8317"),
+    );
   });
 });

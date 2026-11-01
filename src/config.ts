@@ -88,6 +88,12 @@ export const DEFAULT_PROVIDER_WINDOWS: Record<string, string[]> = {
   // (`x-codex-primary-used-percent`) alongside namespaced ones (`5h-primary`):
   // both must gate, or stock quotas never constrain routing.
   codex: ["codex", "5h", "weekly", "primary", "secondary"],
+  // Live provider-API windows: the Meta Muse key endpoint serves
+  // `window` + `weekly` (`parseMetaQuota`), the Devin Connect-RPC serves
+  // `daily` + `weekly` (`parseDevinQuota`), and Antigravity quota-summary
+  // buckets gate on their time window (`parseAntigravitySubscription`).
+  meta: ["meta", "window", "weekly"],
+  antigravity: ["antigravity", "5h", "weekly", "daily", "monthly"],
   devin: ["devin", "5h", "weekly", "daily"],
   synthetic: ["weekly", "rolling-5h", "5h", "subscription"],
   "nvidia-nim": ["rpm", "minute"],

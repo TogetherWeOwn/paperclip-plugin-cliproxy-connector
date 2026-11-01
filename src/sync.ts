@@ -2,9 +2,11 @@
  * Sync job (cron 2–5 min + on-demand): CLIProxy → plugin cache.
  *
  * Reads the CLIProxy account list + per-provider quota through the proposal
- * §4 safe path (GET-only allow-list, `api-call` excluded), groups accounts by
- * provider, and normalises into `AiConnectionUsage`-shaped rows in the
- * plugin's own namespace. No core changes, no fork.
+ * §4 safe path (pinned GET allow-list plus the three pinned
+ * `api-call` POST templates for Meta/Antigravity/Devin, one call per account
+ * per sync), groups accounts by provider, and normalises into
+ * `AiConnectionUsage`-shaped rows in the plugin's own namespace. No core
+ * changes, no fork.
  *
  * Security properties (all tested):
  * - the management key is resolved per run and kept in memory only;
@@ -17,6 +19,7 @@
  */
 
 import {
+  apiCallTemplateKeyForProvider,
   CliproxyAuthError,
   CliproxyClientApiClient,
   CliproxyConfigError,
@@ -44,6 +47,46 @@ import type {
 export const STRIKE_WINDOW_MS = 30 * 60_000;
 export const STRIKE_LIMIT = 2;
 export const MIN_SYNC_INTERVAL_MS = 60_000;
+/**
+ * Minimum gap between two credential-bearing provider-API calls for the same
+ * CLIProxy origin + credential (`auth_index`). The scheduled sync runs every 5
+ * minutes, so a 4-minute bound keeps at most one call per account per sync even
+ * when the on-demand resync action fires back to back — repeated provider hits
+ * with stored credentials could otherwise get those accounts flagged — while a
+ * 1-minute jitter tolerance keeps a slightly early cron tick from blanking the
+ * live windows on alternate runs.
+ */
+export const API_CALL_MIN_INTERVAL_MS = 4 * 60_000;
+
+/**
+ * Last known-good live provider-API answer per CLIProxy origin + credential
+ * `auth_index`. Only 2xx envelopes are kept, in memory only, never persisted
+ * or logged — same as the throttle timestamps.
+ */
+export interface ApiCallCachedEnvelope {
+  statusCode: number;
+  body: unknown;
+  /** The sync time the cached answer was fetched (its windows keep this age). */
+  observedAt: string;
+}
+
+/**
+ * Normalise a CLIProxy base URL to its origin for api-call throttle/cache
+ * keying. Two companies pointing at the same CLIProxy share one throttle
+ * bucket and one cache entry per credential; different origins never share.
+ * The `localhost` spelling is normalised exactly the way the transport
+ * canonicalises it, so `localhost` and `127.0.0.1` configurations of one
+ * CLIProxy do not throttle (and call) twice.
+ */
+export function apiCallOriginKey(cliproxyBaseUrl: string): string {
+  try {
+    const url = new URL(cliproxyBaseUrl);
+    if (url.hostname.toLowerCase() === "localhost") url.hostname = "127.0.0.1";
+    return url.origin;
+  } catch {
+    return cliproxyBaseUrl.trim();
+  }
+}
 
 export function emptyStrikeBudget(): StrikeBudgetState {
   return { failures: [], disabled: false, disabledAt: null, disabledReason: null, secretBad: false };
@@ -96,6 +139,20 @@ export interface SyncDeps {
    */
   recordFailure: (failure: SyncFailure | null) => Promise<void>;
   logActivity: (message: string, metadata?: Record<string, unknown>) => Promise<void>;
+  /**
+   * Last provider-API call time per CLIProxy origin + credential `auth_index`
+   * (epoch millis), keyed `${apiCallOriginKey(baseUrl)} ${authIndex}`. The
+   * worker owns one shared map across runs and companies; callers that omit it
+   * get no cross-run throttling. Tests pass their own map to assert the bound.
+   */
+  apiCallLastCall?: Map<string, number>;
+  /**
+   * Last 2xx provider-API answer per CLIProxy origin + credential `auth_index`
+   * (same keying as `apiCallLastCall`). A throttled run reuses the cached
+   * envelope — stamped with its original `observedAt` — instead of blanking
+   * the account's live windows. In memory only, never persisted or logged.
+   */
+  apiCallCache?: Map<string, ApiCallCachedEnvelope>;
 }
 
 function summary(
@@ -303,11 +360,87 @@ export async function runSync(deps: SyncDeps, inFlight: { running: boolean }): P
         }
       }
 
+      // Live provider-API quota: one pinned
+      // `POST /v0/management/api-call` per distinct credential index among the
+      // enabled, configured meta/antigravity/devin accounts — the families the
+      // three frozen templates serve. The template comes from an exact
+      // allow-map on the auth file's raw provider word, never from fuzzy
+      // matching: a `gemini` account must not send its credential through the
+      // Antigravity request. Disabled accounts are never called; cooling
+      // accounts keep their cooldown (no probe while the provider says
+      // wait); one call per index per sync bounds the rate to the sync cadence
+      // (every 5 min), and the per-credential throttle below holds that bound
+      // across back-to-back resyncs. Raw envelopes ride along by `auth_index`
+      // and attach to their own account row at parse time. Failed calls warn
+      // per file and stay quota-blind; only a rejected key (401/403) stops
+      // the run.
+      const apiCallPayloadByAuthIndex = new Map<string, { statusCode: number; body: unknown; observedAt: string }>();
+      const fetchedApiCallIndexes = new Set<string>();
+      const apiOrigin = apiCallOriginKey(deps.config.cliproxyBaseUrl);
+      const configuredProviders = new Set(deps.config.providers.map((p) => p.provider));
+      for (const a of discovered.accounts) {
+        if (a.status === "disabled" || a.status === "cooling") continue;
+        if (!a.authIndex || !configuredProviders.has(a.provider)) continue;
+        const templateKey = apiCallTemplateKeyForProvider(a.provider);
+        if (!templateKey) continue;
+        if (fetchedApiCallIndexes.has(a.authIndex)) continue;
+        fetchedApiCallIndexes.add(a.authIndex);
+        // Cross-run per-credential throttle, keyed by origin + index so two
+        // companies on the same CLIProxy share one bucket per credential.
+        const cacheKey = `${apiOrigin} ${a.authIndex}`;
+        const lastCall = deps.apiCallLastCall?.get(cacheKey);
+        if (lastCall !== undefined && nowMs - lastCall < API_CALL_MIN_INTERVAL_MS) {
+          // Throttled: reuse the last known-good answer with its original
+          // observation time instead of blanking this run's live windows. A
+          // missing cache (never fetched, or the last fetch failed) leaves the
+          // account unknown this run — never headroom.
+          const cached = deps.apiCallCache?.get(cacheKey);
+          if (cached !== undefined) {
+            apiCallPayloadByAuthIndex.set(a.authIndex, {
+              statusCode: cached.statusCode,
+              body: cached.body,
+              observedAt: cached.observedAt,
+            });
+          }
+          continue;
+        }
+        try {
+          const result = await client.postApiCall(templateKey, a.authIndex);
+          deps.apiCallLastCall?.set(cacheKey, nowMs);
+          const observedAt = deps.now;
+          if (result.statusCode >= 200 && result.statusCode < 300) {
+            deps.apiCallCache?.set(cacheKey, {
+              statusCode: result.statusCode,
+              body: result.body,
+              observedAt,
+            });
+          }
+          apiCallPayloadByAuthIndex.set(a.authIndex, {
+            statusCode: result.statusCode,
+            body: result.body,
+            observedAt,
+          });
+        } catch (err) {
+          if (err instanceof CliproxyAuthError) throw err; // stop after first rejected key
+          // A provider hit happened even when it fails (transport error,
+          // upstream envelope rejection), so the throttle still records it.
+          deps.apiCallLastCall?.set(cacheKey, nowMs);
+          // Auth indexes are opaque tokens, but never persist one raw in a
+          // warning: the short hash distinguishes files for debugging.
+          const fileRef = `auth ${hashIdentity([a.authIndex])?.slice(0, 8) ?? "unknown"}`;
+          const rawMessage = err instanceof Error ? err.message : "fetch failed";
+          const safeMessage = rawMessage.split(a.authIndex).join(fileRef);
+          pluginErrors.push(`${a.provider} (provider API, ${fileRef}): ${safeMessage}`);
+        }
+      }
+
       const { accounts, unkeyed, warnings } = parseAuthFiles(authFiles, {
         now: deps.now,
         allowLists: deps.config.providerWindows,
         pluginPayloadByProvider,
         pluginPayloadByAuthIndex,
+        apiCallPayloadByAuthIndex,
+        apiCallObservedAt: deps.now,
       });
 
       // Group by stable row key: duplicates defeat keying (spike G-K1) and

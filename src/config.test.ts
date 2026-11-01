@@ -152,3 +152,19 @@ describe("reserve math (kept from v1)", () => {
     expect(effectiveReservePercent(config, {})).toBe(10);
   });
 });
+
+describe("live provider-API window defaults", () => {
+  it("gates the meta window/weekly and antigravity time windows the live parsers emit", async () => {
+    const { DEFAULT_PROVIDER_WINDOWS } = await import("./config.js");
+    const { isGatingWindow } = await import("./parsers.js");
+    expect(isGatingWindow("meta", "window", DEFAULT_PROVIDER_WINDOWS.meta as string[])).toBe(true);
+    expect(isGatingWindow("meta", "weekly", DEFAULT_PROVIDER_WINDOWS.meta as string[])).toBe(true);
+    for (const w of ["weekly", "5h"]) {
+      expect(isGatingWindow("antigravity", w, DEFAULT_PROVIDER_WINDOWS.antigravity as string[])).toBe(true);
+    }
+    // Devin live-RPC windows keep gating as before.
+    for (const w of ["daily", "weekly"]) {
+      expect(isGatingWindow("devin", w, DEFAULT_PROVIDER_WINDOWS.devin as string[])).toBe(true);
+    }
+  });
+});

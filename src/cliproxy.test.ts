@@ -14,6 +14,8 @@ import {
   CliproxyRedirectError,
   isSafeAuthFileName,
   MODELS_PATH,
+  apiCallTemplate,
+  apiCallTemplateKeyForProvider,
   pluginQuotaPath,
 } from "./cliproxy.js";
 
@@ -469,5 +471,185 @@ describe("plugin quota auth_index (v8.0.49, per-file quota)", () => {
       async () => new Response(null, { status: 302, headers: { location: "/v0/management/plugins/claude-quota/quota?auth_index=..%2Fconfig" } }),
     );
     await expect(client(fetch).getAuthFiles()).rejects.toThrow(CliproxyRedirectError);
+  });
+});
+
+describe("pinned api-call POST (three frozen templates)", () => {
+  const envelope = (statusCode: number, body: unknown) =>
+    json(200, { status_code: statusCode, header: {}, body: JSON.stringify(body) });
+
+  it("rejects unknown template keys before any network happens", async () => {
+    const fetch = vi.fn(async () => json(200, {}));
+    await expect(client(fetch).postApiCall("openai", "abc123")).rejects.toThrow(
+      CliproxyConfigError,
+    );
+    await expect(client(fetch).postApiCall("", "abc123")).rejects.toThrow(
+      CliproxyConfigError,
+    );
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it("resolves template keys by exact provider word only (no fuzzy matching)", async () => {
+    expect(apiCallTemplateKeyForProvider("meta")).toBe("meta");
+    expect(apiCallTemplateKeyForProvider("antigravity")).toBe("antigravity");
+    expect(apiCallTemplateKeyForProvider("devin")).toBe("devin");
+    expect(apiCallTemplateKeyForProvider(" Meta ")).toBe("meta");
+    // Fuzzy/substring lookalikes must never resolve: a Gemini credential must
+    // not travel through the Antigravity request, nor a made-up word through Meta.
+    for (const word of ["gemini", "gemini-cli", "metafoo", "metas", "mydevin", "claude", "", "constructor"]) {
+      expect(apiCallTemplateKeyForProvider(word)).toBeNull();
+    }
+  });
+
+  it("rejects inherited prototype keys, not only unknown names", async () => {
+    const fetch = vi.fn(async () => json(200, {}));
+    for (const key of ["constructor", "toString", "hasOwnProperty"]) {
+      await expect(client(fetch).postApiCall(key, "abc123")).rejects.toThrow(
+        CliproxyConfigError,
+      );
+      expect(() => apiCallTemplate(key)).toThrow(CliproxyConfigError);
+    }
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it("returns a defensive copy that cannot mutate the frozen template table", async () => {
+    const selected = apiCallTemplate("meta");
+    selected.url = "https://example.invalid/";
+    selected.headers.Authorization = "tampered";
+    const fresh = apiCallTemplate("meta");
+    expect(fresh.url).toBe("https://api.meta.ai/muse-code/key");
+    expect(fresh.headers.Authorization).toBe("Bearer $TOKEN$");
+  });
+
+  it("rejects untrusted auth indexes before any network happens", async () => {
+    for (const bad of ["", "../config", "a/b", "x y", "api-call", "a".repeat(200)]) {
+      const fetch = vi.fn(async () => json(200, {}));
+      await expect(client(fetch).postApiCall("meta", bad)).rejects.toThrow(
+        CliproxyConfigError,
+      );
+      expect(fetch).not.toHaveBeenCalled();
+    }
+  });
+
+  it("POSTs the exact frozen meta template with the auth index as the only variable", async () => {
+    let seen: { url?: string; method?: string; headers?: Headers; body?: string } = {};
+    const fetch = vi.fn(async (url: string, init?: RequestInit) => {
+      seen = {
+        url,
+        method: init?.method,
+        headers: new Headers(init?.headers),
+        body: init?.body as string,
+      };
+      return envelope(200, { subs_usage: { window: { used_percent: 10 } } });
+    });
+    const result = await client(fetch).postApiCall("meta", "abc123");
+    expect(seen.url).toBe("http://127.0.0.1:8317/v0/management/api-call");
+    expect(seen.method).toBe("POST");
+    expect(seen.headers?.get("X-Test-Key")).toBe(KEY);
+    expect(seen.headers?.get("Content-Type")).toBe("application/json");
+    const sent = JSON.parse(seen.body as string) as Record<string, unknown>;
+    expect(sent).toEqual({
+      auth_index: "abc123",
+      method: "POST",
+      url: "https://api.meta.ai/muse-code/key",
+      header: {
+        Accept: "application/json",
+        "Content-Type": "application/json",
+        Authorization: "Bearer $TOKEN$",
+        "x-api-version": "1.0.0",
+      },
+      data: "{}",
+    });
+    // The $TOKEN$ placeholder is substituted server-side by CLIProxy — the
+    // plugin sends it verbatim and never handles credential material.
+    expect(seen.body).toContain("$TOKEN$");
+    expect(result.statusCode).toBe(200);
+    expect(result.body).toEqual({ subs_usage: { window: { used_percent: 10 } } });
+  });
+
+  it("POSTs the exact frozen antigravity and devin templates", async () => {
+    for (const [key, url, data] of [
+      [
+        "antigravity",
+        "https://daily-cloudcode-pa.googleapis.com/v1internal:loadCodeAssist",
+        '{"metadata":{"ideType":"ANTIGRAVITY"}}',
+      ],
+      [
+        "devin",
+        "https://server.codeium.com/exa.seat_management_pb.SeatManagementService/GetUserStatus",
+        '{"metadata":{"ideName":"chisel","ideVersion":"3000.10.21","apiKey":"$TOKEN$","locale":"en","os":"darwin","extensionVersion":"3000.10.21","clientName":"chisel"}}',
+      ],
+    ] as const) {
+      let body: string | undefined;
+      const fetch = vi.fn(async (_url: string, init?: RequestInit) => {
+        body = init?.body as string;
+        return envelope(200, {});
+      });
+      await client(fetch).postApiCall(key, "idx1");
+      const sent = JSON.parse(body as string) as Record<string, unknown>;
+      expect(sent.url).toBe(url);
+      expect(sent.data).toBe(data);
+      expect(sent.auth_index).toBe("idx1");
+    }
+  });
+
+  it("returns the upstream status without throwing (provider 4xx is a per-file warning, not a sync failure)", async () => {
+    const fetch = vi.fn(async () => envelope(429, { error: "throttled" }));
+    const result = await client(fetch).postApiCall("devin", "idx1");
+    expect(result.statusCode).toBe(429);
+    expect(result.body).toEqual({ error: "throttled" });
+  });
+
+  it("maps transport 401/403 to CliproxyAuthError (strike budget) and 404/5xx to the GET semantics", async () => {
+    for (const status of [401, 403]) {
+      const fetch = vi.fn(async () => new Response("denied", { status }));
+      const err = await client(fetch)
+        .postApiCall("meta", "idx1")
+        .catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(CliproxyAuthError);
+      expect((err as Error).message).not.toContain(KEY);
+    }
+    {
+      const fetch = vi.fn(async () => new Response("missing", { status: 404 }));
+      const err = await client(fetch)
+        .postApiCall("meta", "idx1")
+        .catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(CliproxyNotFoundError);
+    }
+    {
+      const fetch = vi.fn(async () => new Response("boom", { status: 500 }));
+      const err = await client(fetch)
+        .postApiCall("meta", "idx1")
+        .catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(CliproxyNetworkError);
+    }
+  });
+
+  it("rejects a non-object envelope and an envelope without an upstream status", async () => {
+    for (const payload of [[], "ok", { header: {}, body: "{}" }, { status_code: "200", body: "{}" }]) {
+      const fetch = vi.fn(async () => json(200, payload));
+      const err = await client(fetch)
+        .postApiCall("meta", "idx1")
+        .catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(CliproxyBodyError);
+    }
+  });
+
+  it("refuses a redirect off the pinned api-call path", async () => {
+    const fetch = vi.fn(
+      async () => new Response(null, { status: 302, headers: { location: "/v0/management/auth-files" } }),
+    );
+    const err = await client(fetch)
+      .postApiCall("meta", "idx1")
+      .catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(CliproxyRedirectError);
+  });
+
+  it("the GET allow-list still refuses the api-call path outright", async () => {
+    const fetch = vi.fn(async () => json(200, {}));
+    await expect(client(fetch).getJson("/v0/management/api-call")).rejects.toThrow(
+      CliproxyConfigError,
+    );
+    expect(fetch).not.toHaveBeenCalled();
   });
 });

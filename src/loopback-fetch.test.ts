@@ -98,12 +98,12 @@ describe("per-request guards", () => {
     expect(fetch).not.toHaveBeenCalled();
   });
 
-  it("refuses a non-GET method without touching the network", async () => {
+  it("refuses a non-GET/POST method without touching the network", async () => {
     const fetch = vi.fn(async () => json(200, {}));
     const guarded = createLoopbackFetch(BASE, { fetchImpl: fetch });
     await expect(
-      guarded(`${BASE}/v0/management/auth-files`, { method: "POST", body: "{}" }),
-    ).rejects.toThrow(/GET only/);
+      guarded(`${BASE}/v0/management/auth-files`, { method: "PUT", body: "{}" }),
+    ).rejects.toThrow(/GET and the pinned api-call POST only/);
     expect(fetch).not.toHaveBeenCalled();
   });
 
@@ -121,6 +121,49 @@ describe("per-request guards", () => {
     expect(seen.url).toBe(`${BASE}/v0/management/auth-files`);
     expect(seen.init?.method).toBe("GET");
     expect(new Headers(seen.init?.headers).get("X-Test-Key")).toBe(KEY);
+  });
+
+  it("preserves the pinned api-call POST method and body", async () => {
+    let seen: { url?: string; init?: RequestInit } = {};
+    const fetch = vi.fn(async (url: string, init?: RequestInit) => {
+      seen = { url, init };
+      return json(200, { status_code: 200, header: {}, body: "{}" });
+    });
+    const guarded = createLoopbackFetch(BASE, { fetchImpl: fetch });
+    await guarded(`${BASE}/v0/management/api-call`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ auth_index: "idx1" }),
+    });
+    expect(seen.url).toBe(`${BASE}/v0/management/api-call`);
+    expect(seen.init?.method).toBe("POST");
+    expect(seen.init?.body).toBe(JSON.stringify({ auth_index: "idx1" }));
+  });
+
+  it("refuses a POST outside the pinned api-call path", async () => {
+    const fetch = vi.fn(async () => json(200, {}));
+    const guarded = createLoopbackFetch(BASE, { fetchImpl: fetch });
+    await expect(
+      guarded(`${BASE}/v0/management/config`, { method: "POST", body: "{}" }),
+    ).rejects.toThrow(/POST only to the pinned api-call path/);
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it("refuses a POST to the api-call path with a query string", async () => {
+    const fetch = vi.fn(async () => json(200, {}));
+    const guarded = createLoopbackFetch(BASE, { fetchImpl: fetch });
+    await expect(
+      guarded(`${BASE}/v0/management/api-call?debug=1`, { method: "POST", body: "{}" }),
+    ).rejects.toThrow(/POST only to the pinned api-call path/);
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it("a GET to another management path still passes the transport", async () => {
+    const fetch = vi.fn(async () => json(200, { ok: true }));
+    const guarded = createLoopbackFetch(BASE, { fetchImpl: fetch });
+    const res = await guarded(`${BASE}/v0/management/auth-files`);
+    expect(res.status).toBe(200);
+    expect(fetch).toHaveBeenCalledTimes(1);
   });
 
   it("forces redirect: manual even when the caller asks to follow", async () => {
@@ -226,5 +269,18 @@ describe("composition with the management client (TWO-749)", () => {
     expect(body).toEqual([{ id: "a" }]);
     expect(seen.url).toBe(`${BASE}/v0/management/auth-files`);
     expect(seen.headers?.get("X-Test-Key")).toBe(KEY);
+  });
+
+  it("the pinned api-call POST composes through the same guarded transport", async () => {
+    let seen: { url?: string; method?: string; body?: unknown } = {};
+    const stub = vi.fn(async (url: string, init?: RequestInit) => {
+      seen = { url, method: init?.method, body: init?.body };
+      return json(200, { status_code: 200, header: {}, body: JSON.stringify({ ok: true }) });
+    });
+    const result = await clientWith(stub).postApiCall("devin", "idx1");
+    expect(result).toEqual({ statusCode: 200, body: { ok: true } });
+    expect(seen.url).toBe(`${BASE}/v0/management/api-call`);
+    expect(seen.method).toBe("POST");
+    expect(String(seen.body)).toContain("$TOKEN$");
   });
 });
