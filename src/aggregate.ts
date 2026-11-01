@@ -10,8 +10,10 @@
  *   plugin-route reading.
  * - `exhausted` only when every enabled account is positively out (quota
  *   exhausted, or cooling with a future `next_retry_after`) **and**
- *   `completeInventory` is true. `retryAt` is the earliest reset or cooldown
- *   end across those accounts.
+ *   `completeInventory` is true. `retryAt` is the earliest per-account
+ *   recovery bound across those accounts, where one account's bound is the
+ *   latest required reset among its own limiting windows (an account with
+ *   both 5h and 7d exhausted recovers only when the later clears).
  * - `unknown` otherwise, including stale data and zero visible accounts.
  *   Never claims headroom.
  *
