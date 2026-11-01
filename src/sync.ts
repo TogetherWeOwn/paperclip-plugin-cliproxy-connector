@@ -229,6 +229,11 @@ export async function runSync(deps: SyncDeps, inFlight: { running: boolean }): P
         allowLists: deps.config.providerWindows,
       });
       const enabledIndexesByProvider = new Map<string, Set<string>>();
+      // Same-provider accounts may advertise different quota plugins: keep
+      // each credential's own route so every index is fetched against the
+      // plugin that serves it (first wins per index; the provider hint below
+      // is only the fallback for rows that advertise nothing).
+      const pluginIdByAuthIndex = new Map<string, string>();
       for (const a of discovered.accounts) {
         if (a.status === "disabled" || !a.authIndex) continue;
         let set = enabledIndexesByProvider.get(a.provider);
@@ -237,31 +242,47 @@ export async function runSync(deps: SyncDeps, inFlight: { running: boolean }): P
           enabledIndexesByProvider.set(a.provider, set);
         }
         set.add(a.authIndex);
+        if (a.quotaPluginId && !pluginIdByAuthIndex.has(a.authIndex)) {
+          pluginIdByAuthIndex.set(a.authIndex, a.quotaPluginId);
+        }
       }
       for (const entry of deps.config.providers) {
-        const pluginId = deps.config.pluginQuotaIds[entry.provider];
-        if (!pluginId) continue;
+        // Explicit config wins for the whole provider; otherwise each
+        // credential fetches against its own advertised route
+        // (`quota_plugin_id`, unless `supports_quota: false`), so new quota
+        // plugins need no config change to start syncing.
+        const override = deps.config.pluginQuotaIds[entry.provider];
+        const providerHint = discovered.pluginQuotaHints.get(entry.provider);
+        // Every advertised id also sets the provider hint, so a missing
+        // provider id means no per-index id either: nothing to fetch.
+        if (!override && !providerHint) continue;
         const indexes = [...(enabledIndexesByProvider.get(entry.provider) ?? [])].sort();
+        // Provider-level route for the legacy no-index fetch below.
+        const providerPluginId = (override ?? providerHint) as string;
         if (indexes.length === 0) {
           // No indexed credential for this provider: legacy provider-level
           // fetch (older builds), shared across providers on one plugin id.
-          if (fetchedPluginIds.has(pluginId)) {
-            const first = fetchedPluginIds.get(pluginId) as string;
+          if (fetchedPluginIds.has(providerPluginId)) {
+            const first = fetchedPluginIds.get(providerPluginId) as string;
             const prior = pluginPayloadByProvider.get(first);
             if (prior !== undefined) pluginPayloadByProvider.set(entry.provider, prior);
             continue;
           }
           try {
-            const payload = await client.getPluginQuota(pluginId);
-            fetchedPluginIds.set(pluginId, entry.provider);
+            const payload = await client.getPluginQuota(providerPluginId);
+            fetchedPluginIds.set(providerPluginId, entry.provider);
             pluginPayloadByProvider.set(entry.provider, payload);
           } catch (err) {
             if (err instanceof CliproxyAuthError) throw err; // stop after first rejected key
-            pluginErrors.push(`${entry.provider} (plugin ${pluginId}): ${err instanceof Error ? err.message : "fetch failed"}`);
+            pluginErrors.push(`${entry.provider} (plugin ${providerPluginId}): ${err instanceof Error ? err.message : "fetch failed"}`);
           }
           continue;
         }
         for (const authIndex of indexes) {
+          // Same-provider accounts on different plugins each query their
+          // own route; rows that advertise nothing use the provider hint.
+          const pluginId = override ?? pluginIdByAuthIndex.get(authIndex) ?? providerHint;
+          if (!pluginId) continue;
           const fetchKey = `${pluginId} ${authIndex}`;
           if (fetchedPluginKeys.has(fetchKey)) continue;
           try {
@@ -657,6 +678,7 @@ export function accountsToRows(
       checkedAt: a.checkedAt,
       source: "plugin:cliproxy-connector",
       quotaBlind: a.quotaBlind,
+      quotaBlindReason: a.quotaBlindReason,
       accountHash: a.accountHash,
       lastError: a.parseWarnings.length > 0 ? a.parseWarnings.join(" | ") : null,
       coolingDown: a.coolingDown,

@@ -52,7 +52,7 @@ function authFilesBody() {
 }
 
 function pluginQuotaBody() {
-  return { Groups: [{ Buckets: [{ Window: "weekly", RemainingFraction: 0.8 }] }] };
+  return { groups: [{ buckets: [{ window: "weekly", remainingFraction: 0.8 }] }] };
 }
 
 function modelsBody() {
@@ -287,10 +287,10 @@ describe("happy path", () => {
         quotaUrls.push(url.toString());
         const idx = url.searchParams.get("auth_index");
         if (idx === "aaaabbbbccccdddd") {
-          return jsonResponse(200, { Groups: [{ Buckets: [{ Window: "weekly", RemainingFraction: 0.8 }] }] });
+          return jsonResponse(200, { groups: [{ buckets: [{ window: "weekly", remainingFraction: 0.8 }] }] });
         }
         if (idx === "1111222233334444") {
-          return jsonResponse(200, { Groups: [{ Buckets: [{ Window: "weekly", RemainingFraction: 0.1 }] }] });
+          return jsonResponse(200, { groups: [{ buckets: [{ window: "weekly", remainingFraction: 0.1 }] }] });
         }
         return new Response("auth_index is required", { status: 400 });
       }
@@ -327,7 +327,7 @@ describe("happy path", () => {
       if (url.pathname === "/v0/management/plugins/claude-quota/quota") {
         quotaUrls.push(url.toString());
         if (url.searchParams.get("auth_index") === "7") {
-          return jsonResponse(200, { Groups: [{ Buckets: [{ Window: "weekly", RemainingFraction: 0.6 }] }] });
+          return jsonResponse(200, { groups: [{ buckets: [{ window: "weekly", remainingFraction: 0.6 }] }] });
         }
         return new Response("auth_index is required", { status: 400 });
       }
@@ -360,7 +360,7 @@ describe("happy path", () => {
       }
       if (url.pathname === "/v0/management/plugins/claude-quota/quota") {
         if (url.searchParams.get("auth_index") === "aaaabbbbccccdddd") {
-          return jsonResponse(200, { Groups: [{ Buckets: [{ Window: "weekly", RemainingFraction: 0.8 }] }] });
+          return jsonResponse(200, { groups: [{ buckets: [{ window: "weekly", remainingFraction: 0.8 }] }] });
         }
         return new Response("auth_index is required", { status: 400 });
       }
@@ -411,6 +411,82 @@ describe("happy path", () => {
     for (const r of Object.values(rows)) {
       expect(r.limits.some((l) => l.id === "claude:weekly")).toBe(true);
     }
+    assertNoKeyLeak(s);
+  });
+
+  it("discovers the plugin quota id from quota_plugin_id when config has none", async () => {
+    const quotaUrls: string[] = [];
+    const fetchHinted = vi.fn(async (input: string | URL | Request): Promise<Response> => {
+      const url = new URL(String(input));
+      if (url.pathname === "/v0/management/auth-files") {
+        return jsonResponse(200, [{ id: "claude-1", provider: "claude", quota_plugin_id: "claude-quota" }]);
+      }
+      if (url.pathname === "/v0/management/plugins/claude-quota/quota") {
+        quotaUrls.push(url.toString());
+        return jsonResponse(200, pluginQuotaBody());
+      }
+      if (url.pathname === "/v1/models") return jsonResponse(200, modelsBody());
+      return new Response("not found", { status: 404 });
+    });
+    const s = store();
+    const d = deps(s, fetchHinted as unknown as typeof fetch);
+    // No hand-maintained pluginQuotaIds: discovery drives the fetch.
+    d.config = parseConfig({ ...baseConfigRaw(), pluginQuotaIds: {} }).config;
+    const summary = await runSync(d, { running: false });
+    expect(summary.skipped).toBe(false);
+    expect(quotaUrls).toHaveLength(1);
+    const rows = s.savedRows as Record<string, AccountUsageRow>;
+    for (const r of Object.values(rows).filter((r) => r.provider === "claude")) {
+      expect(r.limits.some((l) => l.id === "claude:weekly")).toBe(true);
+    }
+    expect(summary.errors.some((e) => e.includes("plugin"))).toBe(false);
+    assertNoKeyLeak(s);
+  });
+
+  it("fetches each credential against its own advertised plugin when a provider mixes routes", async () => {
+    const quotaUrls: string[] = [];
+    const fetchMixed = vi.fn(async (input: string | URL | Request): Promise<Response> => {
+      const url = new URL(String(input));
+      if (url.pathname === "/v0/management/auth-files") {
+        return jsonResponse(200, [
+          { id: "claude-1", provider: "claude", auth_index: "aaaabbbbccccdddd", quota_plugin_id: "quota-a" },
+          { id: "claude-2", provider: "claude", auth_index: "1111222233334444", quota_plugin_id: "quota-b" },
+        ]);
+      }
+      if (url.pathname === "/v0/management/plugins/quota-a/quota") {
+        quotaUrls.push(url.toString());
+        return jsonResponse(200, { groups: [{ buckets: [{ window: "weekly", remainingFraction: 0.8 }] }] });
+      }
+      if (url.pathname === "/v0/management/plugins/quota-b/quota") {
+        quotaUrls.push(url.toString());
+        return jsonResponse(200, { groups: [{ buckets: [{ window: "5h", remainingFraction: 0.1 }] }] });
+      }
+      if (url.pathname === "/v1/models") return jsonResponse(200, modelsBody());
+      return new Response("not found", { status: 404 });
+    });
+    const s = store();
+    const d = deps(s, fetchMixed as unknown as typeof fetch);
+    // No hand-maintained pluginQuotaIds: discovery drives both fetches.
+    d.config = parseConfig({ ...baseConfigRaw(), pluginQuotaIds: {} }).config;
+    const summary = await runSync(d, { running: false });
+    expect(summary.skipped).toBe(false);
+    // Each index queried against its own plugin — never cross-fetched.
+    expect(quotaUrls).toHaveLength(2);
+    const byPlugin = new Map(quotaUrls.map((u) => {
+      const parsed = new URL(u);
+      return [parsed.pathname.split("/")[4], parsed.searchParams.get("auth_index")];
+    }));
+    expect(byPlugin.get("quota-a")).toBe("aaaabbbbccccdddd");
+    expect(byPlugin.get("quota-b")).toBe("1111222233334444");
+    // The conflict is still visible (first-wins provider fallback), but
+    // neither fetch failed: fetch errors carry "(plugin …)" with the file ref.
+    expect(summary.errors.some((e) => e.includes("conflicting quota plugin ids"))).toBe(true);
+    expect(summary.errors.some((e) => e.includes("(plugin "))).toBe(false);
+    // Each payload attached to its own account's row.
+    const rows = Object.values(s.savedRows as Record<string, AccountUsageRow>);
+    expect(rows).toHaveLength(2);
+    expect(rows.filter((r) => r.limits.some((l) => l.id === "claude:weekly" && l.remainingPercent === 80))).toHaveLength(1);
+    expect(rows.filter((r) => r.limits.some((l) => l.id === "claude:5h" && l.remainingPercent === 10))).toHaveLength(1);
     assertNoKeyLeak(s);
   });
 

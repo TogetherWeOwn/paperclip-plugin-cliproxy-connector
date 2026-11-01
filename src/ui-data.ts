@@ -20,6 +20,7 @@
 
 import { aggregateProvider } from "./aggregate.js";
 import { graceMs, maxAgeMs, type ConnectorConfig } from "./config.js";
+import { normalizeProvider, quotaBlindReason } from "./parsers.js";
 import { strikeWaitUntil } from "./sync.js";
 import type {
   AccountUsageRow,
@@ -39,17 +40,33 @@ export const AUDIENCE_NOTICE =
 export interface ProviderAccountDetail {
   /** Stable row key (`acct-<hash>`); never a raw identifier. */
   key: string;
+  /**
+   * Display label for the account table: the row key shortened to
+   * `acct-<8hex>…`. Still a hash — never a raw identifier.
+   */
+  maskedLabel: string;
   status: string;
   statusMessage: string | null;
   priority: number | null;
   planType: string | null;
   quotaBlind: boolean;
+  /** Display-only blind reason (null when the account is not blind). */
+  quotaBlindReason: string | null;
   freshness: Freshness;
   checkedAt: string;
   limits: AccountCardLimit[];
+  /**
+   * Worst remaining percent across the account's windows (null when no
+   * window reports one). Drives the usage table's remaining-% sort.
+   */
+  worstRemaining: number | null;
+  /** Earliest reset across the account's windows, when known. */
+  nextReset: string | null;
+  nextResetIn: string | null;
   lastError: string | null;
   coolingDown: boolean;
   cooldownUntil: string | null;
+  cooldownIn: string | null;
 }
 
 export interface AccountCardLimit {
@@ -64,6 +81,8 @@ export interface AccountCardLimit {
   gating: boolean;
   stale: boolean;
   models: string[] | null;
+  /** Display-only quota `summary[]` entries attached to this window. */
+  metrics: string[] | null;
 }
 
 export interface ProviderCard {
@@ -77,6 +96,20 @@ export interface ProviderCard {
   waitResumeOff: boolean;
   enabledAccounts: number;
   headroomAccounts: number;
+  /** Blind enabled accounts under this provider (disabled rows never count). */
+  blindAccounts: number;
+  /**
+   * Earliest known future window reset across the provider's accounts, or
+   * null when none is known. Informational: unlike `retryAt` (set only behind
+   * an exhausted verdict) this is present for allowed providers too.
+   */
+  nextReset: string | null;
+  nextResetIn: string | null;
+  /**
+   * Most common blind reason among the provider's blind accounts (null when
+   * none are blind). Displayed as the blind badge's reason on the usage page.
+   */
+  blindReason: string | null;
   reason: string;
   /** Proven served-model ids for this provider (stock ids), or [] when unknown. */
   models: string[];
@@ -142,6 +175,23 @@ export interface WidgetData {
   earliestResetIn: string | null;
 }
 
+/**
+ * "Usage & quota" page data: the sync summary plus one card per provider
+ * with headroom counts, the earliest reset, freshness, blind badges, and the
+ * per-account table rows (masked labels, bars per window, cooldowns).
+ * Derived entirely from the already-synced cache — never a live read, and
+ * never the destructive usage-queue endpoint.
+ */
+export interface UsagePageData {
+  audienceNotice: string;
+  audienceConfirmed: boolean;
+  generatedAt: string;
+  sync: PageData["sync"];
+  providers: ProviderCard[];
+  earliestReset: string | null;
+  earliestResetIn: string | null;
+}
+
 export function resetIn(resetAt: string | null, nowMs: number): string | null {
   if (!resetAt) return null;
   const t = Date.parse(resetAt);
@@ -165,8 +215,6 @@ export function buildPageData(args: {
 }): PageData {
   const { now, config, rows, lastSync, strike, lastFailure } = args;
   const nowMs = Date.parse(now);
-  const allRows = Object.values(rows);
-  const providerModels = lastSync?.providerModels ?? {};
   const modelOverlaps = lastSync?.modelOverlaps ?? [];
   const catalogError =
     lastSync === null
@@ -179,71 +227,20 @@ export function buildPageData(args: {
         ? (catalogError ?? "model catalog unavailable this run; overlap detection is off.")
         : null;
 
-  const providers: ProviderCard[] = [...config.providers]
-    .sort((a, b) => a.provider.localeCompare(b.provider))
-    .map((entry) => {
-      const verdict = aggregateProvider({
-        provider: entry.provider,
-        model: null,
-        rows: allRows,
-        completeInventory: entry.completeInventory,
-        config,
-        now,
-        poolId: undefined,
-        poolThresholdPercent: undefined,
-      });
-      const providerRows = allRows
-        .filter((r) => r.provider === entry.provider)
-        .sort((a, b) => a.key.localeCompare(b.key));
-      return {
-        provider: entry.provider,
-        connectionId: entry.connectionId,
-        completeInventory: entry.completeInventory,
-        state: verdict.state,
-        retryAt: verdict.retryAt,
-        retryIn: resetIn(verdict.retryAt, nowMs),
-        freshness: verdict.freshness,
-        waitResumeOff: verdict.waitResumeOff,
-        enabledAccounts: verdict.enabledAccounts,
-        headroomAccounts: verdict.headroomAccounts,
-        reason: verdict.waitResumeOff
-          ? `${verdict.reason} Wait/resume is off for this provider: inventory is not confirmed complete.`
-          : verdict.reason,
-        models: providerModels[entry.provider] ?? [],
-        accounts: providerRows.map((row) => toAccountDetail(row, nowMs, maxAgeMs(config), graceMs(config))),
-      };
-    });
+  const providerModels = lastSync?.providerModels ?? {};
+  const providers = buildProviderCards({ config, rows, now, nowMs, providerModels });
 
-  const resets = providers
-    .map((p) => p.retryAt)
-    .filter((r): r is string => r !== null && !Number.isNaN(Date.parse(r)));
-  const earliestReset =
-    resets.length > 0 ? new Date(Math.min(...resets.map((r) => Date.parse(r)))).toISOString() : null;
-
-  const showFailure =
-    lastFailure &&
-    (!lastSync ||
-      Number.isNaN(Date.parse(lastSync.finishedAt)) ||
-      Date.parse(lastFailure.attemptedAt) > Date.parse(lastSync.finishedAt));
+  const earliestReset = earliestRetryAt(providers);
 
   return {
     audienceNotice: AUDIENCE_NOTICE,
     audienceConfirmed: config.audienceConfirmed,
     generatedAt: now,
-    sync: {
-      ranAt: lastSync?.finishedAt ?? null,
-      accountsSeen: lastSync?.accountsSeen ?? 0,
-      rowsWritten: lastSync?.rowsWritten ?? 0,
-      skipped: lastSync?.skipped ?? true,
-      skipReason: lastSync?.skipReason ?? "no sync has run yet.",
-      errors: lastSync?.errors ?? [],
-      // A failure newer than the last successful run is shown explicitly so
-      // the page never silently presents stale success as current state. An
-      // older failure stays recorded but shows neither message nor attempt
-      // time next to the newer success.
-      lastError: showFailure ? (lastFailure as SyncFailure).message : null,
-      lastAttemptAt: showFailure ? (lastFailure as SyncFailure).attemptedAt : null,
-    },
+    // A failure newer than the last successful run is shown explicitly so
+    // the page never silently presents stale success as current state. An
+    // older failure stays recorded but shows neither message nor attempt
+    // time next to the newer success.
+    sync: buildSyncSection(lastSync, lastFailure),
     strike: {
       disabled: strike.disabled,
       disabledAt: strike.disabledAt,
@@ -280,13 +277,29 @@ function toAccountDetail(
           ? "stale"
           : "expired";
   const stale = freshness !== "fresh";
+  // Rows cached before `quotaBlindReason` existed carry no value: derive the
+  // same reason from the provider so old cache rows still badge correctly.
+  const blindReason =
+    row.quotaBlindReason ?? (row.quotaBlind ? quotaBlindReason(normalizeProvider(row.provider), row.limits.length > 0) : null);
+  const remaining = row.limits
+    .map((l) => l.remainingPercent)
+    .filter((v): v is number => typeof v === "number" && Number.isFinite(v));
+  // Only future resets count as "next": a past reset is already spent, and
+  // selecting it would badge the card (and page summary) with a time that
+  // reads "now" while the real upcoming recovery hides behind it.
+  const resetMs = row.limits
+    .map((l) => (l.resetsAt ? Date.parse(l.resetsAt) : NaN))
+    .filter((t) => !Number.isNaN(t) && t > nowMs);
+  const nextReset = resetMs.length > 0 ? new Date(Math.min(...resetMs)).toISOString() : null;
   return {
     key: row.key,
+    maskedLabel: row.key.length > 14 ? `${row.key.slice(0, 13)}…` : row.key,
     status: row.status,
     statusMessage: row.statusMessage,
     priority: row.priority,
     planType: row.planType,
     quotaBlind: row.quotaBlind,
+    quotaBlindReason: blindReason,
     freshness,
     checkedAt: row.checkedAt,
     limits: row.limits.map((l) => ({
@@ -301,10 +314,159 @@ function toAccountDetail(
       gating: l.gating,
       stale,
       models: l.models ?? null,
+      metrics: l.metrics ?? null,
     })),
+    worstRemaining: remaining.length > 0 ? Math.min(...remaining) : null,
+    nextReset,
+    nextResetIn: resetIn(nextReset, nowMs),
     lastError: row.lastError,
     coolingDown: row.coolingDown,
     cooldownUntil: row.cooldownUntil,
+    cooldownIn: resetIn(row.cooldownUntil, nowMs),
+  };
+}
+
+/** One provider card per `providers[]` row, shared by both pages. */
+function buildProviderCards(args: {
+  config: ConnectorConfig;
+  rows: Record<string, AccountUsageRow>;
+  now: string;
+  nowMs: number;
+  providerModels: Record<string, string[]>;
+}): ProviderCard[] {
+  const { config, rows, now, nowMs, providerModels } = args;
+  const allRows = Object.values(rows);
+  return [...config.providers]
+    .sort((a, b) => a.provider.localeCompare(b.provider))
+    .map((entry) => {
+      const verdict = aggregateProvider({
+        provider: entry.provider,
+        model: null,
+        rows: allRows,
+        completeInventory: entry.completeInventory,
+        config,
+        now,
+        poolId: undefined,
+        poolThresholdPercent: undefined,
+      });
+      const providerRows = allRows
+        .filter((r) => r.provider === entry.provider)
+        .sort((a, b) => a.key.localeCompare(b.key));
+      const accounts = providerRows.map((row) =>
+        toAccountDetail(row, nowMs, maxAgeMs(config), graceMs(config)),
+      );
+      // Disabled rows never count toward the blind badge: they get no plugin
+      // quota, so they usually read blind while the enabled accounts are fine.
+      const countable = accounts.filter((a) => a.status !== "disabled");
+      const nextReset = earliestTime(countable.map((a) => a.nextReset));
+      return {
+        provider: entry.provider,
+        connectionId: entry.connectionId,
+        completeInventory: entry.completeInventory,
+        state: verdict.state,
+        retryAt: verdict.retryAt,
+        retryIn: resetIn(verdict.retryAt, nowMs),
+        freshness: verdict.freshness,
+        waitResumeOff: verdict.waitResumeOff,
+        enabledAccounts: verdict.enabledAccounts,
+        headroomAccounts: verdict.headroomAccounts,
+        blindAccounts: countable.filter((a) => a.quotaBlind).length,
+        blindReason: commonBlindReason(countable),
+        nextReset,
+        nextResetIn: resetIn(nextReset, nowMs),
+        reason: verdict.waitResumeOff
+          ? `${verdict.reason} Wait/resume is off for this provider: inventory is not confirmed complete.`
+          : verdict.reason,
+        models: providerModels[entry.provider] ?? [],
+        accounts,
+      };
+    });
+}
+
+/** Most common blind reason among blind accounts; null when none are blind. */
+function commonBlindReason(accounts: ProviderAccountDetail[]): string | null {
+  const counts = new Map<string, number>();
+  for (const a of accounts) {
+    if (!a.quotaBlind || !a.quotaBlindReason) continue;
+    counts.set(a.quotaBlindReason, (counts.get(a.quotaBlindReason) ?? 0) + 1);
+  }
+  let best: string | null = null;
+  let bestCount = 0;
+  for (const [reason, count] of [...counts.entries()].sort()) {
+    if (count > bestCount) {
+      best = reason;
+      bestCount = count;
+    }
+  }
+  return best;
+}
+
+/** Earliest parseable time in the list, or null when there is none. */
+function earliestTime(times: Array<string | null>): string | null {
+  const parsed = times
+    .filter((t): t is string => t !== null && !Number.isNaN(Date.parse(t)))
+    .map((t) => Date.parse(t));
+  return parsed.length > 0 ? new Date(Math.min(...parsed)).toISOString() : null;
+}
+
+function earliestRetryAt(providers: ProviderCard[]): string | null {
+  return earliestTime(providers.map((p) => p.retryAt));
+}
+
+/**
+ * Page-level earliest known recovery for the usage page: the retry times
+ * behind exhausted verdicts plus every card's informational next reset, so
+ * the summary still shows known resets when no provider is exhausted.
+ */
+function earliestKnownReset(providers: ProviderCard[]): string | null {
+  return earliestTime(providers.flatMap((p) => [p.retryAt, p.nextReset]));
+}
+
+function isFailureNewer(lastSync: SyncSummary | null, lastFailure?: SyncFailure | null): boolean {
+  return Boolean(
+    lastFailure &&
+      (!lastSync ||
+        Number.isNaN(Date.parse(lastSync.finishedAt)) ||
+        Date.parse(lastFailure.attemptedAt) > Date.parse(lastSync.finishedAt)),
+  );
+}
+
+function buildSyncSection(
+  lastSync: SyncSummary | null,
+  lastFailure: SyncFailure | null | undefined,
+): PageData["sync"] {
+  const showFailure = isFailureNewer(lastSync, lastFailure);
+  return {
+    ranAt: lastSync?.finishedAt ?? null,
+    accountsSeen: lastSync?.accountsSeen ?? 0,
+    rowsWritten: lastSync?.rowsWritten ?? 0,
+    skipped: lastSync?.skipped ?? true,
+    skipReason: lastSync?.skipReason ?? "no sync has run yet.",
+    errors: lastSync?.errors ?? [],
+    lastError: showFailure ? (lastFailure as SyncFailure).message : null,
+    lastAttemptAt: showFailure ? (lastFailure as SyncFailure).attemptedAt : null,
+  };
+}
+
+export function buildUsageData(args: {
+  now: string;
+  config: ConnectorConfig;
+  rows: Record<string, AccountUsageRow>;
+  lastSync: SyncSummary | null;
+  lastFailure?: SyncFailure | null;
+}): UsagePageData {
+  const { now, config, rows, lastSync, lastFailure } = args;
+  const nowMs = Date.parse(now);
+  const providers = buildProviderCards({ config, rows, now, nowMs, providerModels: {} });
+  const earliestReset = earliestKnownReset(providers);
+  return {
+    audienceNotice: AUDIENCE_NOTICE,
+    audienceConfirmed: config.audienceConfirmed,
+    generatedAt: now,
+    sync: buildSyncSection(lastSync, lastFailure),
+    providers,
+    earliestReset,
+    earliestResetIn: resetIn(earliestReset, nowMs),
   };
 }
 

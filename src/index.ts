@@ -1,4 +1,4 @@
-export { default as manifest, PLUGIN_ID, SYNC_JOB_KEY } from "./manifest.js";
+export { default as manifest, PLUGIN_ID, SYNC_JOB_KEY, USAGE_DATA_KEY } from "./manifest.js";
 export { default as plugin, routeWithCache, toRouterCandidates } from "./plugin.js";
 export type { AccountUsageRow, SyncFailure, SyncSummary, DriftFinding, StrikeBudgetState, ModelOverlap } from "./types.js";
 export {

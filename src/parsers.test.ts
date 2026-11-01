@@ -120,6 +120,7 @@ describe("provider normalization (parser keys only, never identity)", () => {
       expect(hasAdmissionSignal(p)).toBe(true);
     }
     expect(hasAdmissionSignal("meta")).toBe(false);
+    expect(hasAdmissionSignal("openrouter")).toBe(false);
     expect(hasAdmissionSignal("unknown-provider")).toBe(false);
   });
 
@@ -452,7 +453,7 @@ describe("parseAuthFiles (redacted fixture)", () => {
     const { accounts: cf } = parse([{ id: "cf-1", provider: "cloudflare-workers-ai" }], {
       allowLists: { cloudflare: ["daily"] },
       pluginPayloadByProvider: new Map([
-        ["cloudflare-workers-ai", { Groups: [{ Buckets: [{ Window: "daily", RemainingFraction: 0.5 }] }] }],
+        ["cloudflare-workers-ai", { groups: [{ buckets: [{ window: "daily", remainingFraction: 0.5 }] }] }],
       ]),
     });
     const daily = cf[0]?.limits.find((l) => l.id === "cloudflare:daily");
@@ -535,6 +536,54 @@ describe("parseAuthFiles (redacted fixture)", () => {
     expect(modelWindow?.usedPercent).toBe(90);
   });
 
+  it("parses Devin daily/weekly from the auth-files passive signals (live wire shape)", () => {
+    // Live shape (CLIProxy v8.0.49 `internal/auth/devin/record.go` →
+    // `auth_files.go` quota observation): `quota.signals` carries
+    // `daily|weekly_quota_remaining_percent` ("75%") with
+    // `daily|weekly_quota_reset_at` (RFC3339) plus `plan`. No Devin plugin
+    // quota route serves these — the passive loop is the primary source.
+    const { accounts, warnings } = parse(
+      [
+        {
+          id: "REDACTED-ID-DEVIN-2",
+          provider: "devin",
+          quota: {
+            observed_at: NOW,
+            signals: {
+              daily_quota_remaining_percent: "75%",
+              daily_quota_reset_at: iso(NOW_MS + 24 * 3_600_000),
+              weekly_quota_remaining_percent: "0%",
+              weekly_quota_reset_at: iso(NOW_MS + 7 * 24 * 3_600_000),
+              plan: "teams",
+            },
+          },
+        },
+      ],
+      { allowLists: { devin: ["daily", "weekly"] } },
+    );
+    expect(accounts).toHaveLength(1);
+    const devin = accounts[0]!;
+    expect(devin.quotaBlind).toBe(false);
+    expect(devin.planType).toBe("teams");
+    expect(devin.limits.find((l) => l.id === "devin:daily")).toMatchObject({
+      usedPercent: 25,
+      remainingPercent: 75,
+      resetsAt: iso(NOW_MS + 24 * 3_600_000),
+      allowed: true,
+      limitReached: false,
+      gating: true,
+      observedAt: NOW,
+    });
+    expect(devin.limits.find((l) => l.id === "devin:weekly")).toMatchObject({
+      usedPercent: 100,
+      remainingPercent: 0,
+      allowed: false,
+      limitReached: true,
+      gating: true,
+    });
+    expect(warnings).toEqual([]);
+  });
+
   it("reconciles cooling / disabled lifecycle from unavailable + next_retry_after", () => {
     const { accounts } = parse();
     const cooling = accounts.find((a) => a.key !== undefined && a.status === "cooling");
@@ -566,7 +615,7 @@ describe("parseAuthFiles (redacted fixture)", () => {
   });
 
   it("attaches per-provider plugin quota with the sync fetch time as observation", () => {
-    const body = { Subscription: { Plan: "pro" }, Groups: [{ Buckets: [{ Window: "weekly", RemainingFraction: 0.8, ResetTime: iso(NOW_MS + 7 * 24 * 3_600_000) }] }] };
+    const body = { subscription: { plan: "pro" }, summary: ["team plan, resets weekly"], groups: [{ buckets: [{ window: "weekly", remainingFraction: 0.8, resetTime: iso(NOW_MS + 7 * 24 * 3_600_000) }] }] };
     const payload = new Map<string, unknown>([["claude", body]]);
     // The fixture's first claude entry carries a numeric auth_index (1), so it
     // attaches only its own file's payload, never the provider-level one.
@@ -618,15 +667,92 @@ describe("parseAuthFiles (redacted fixture)", () => {
     expect(accounts).toHaveLength(1);
     expect(warnings.some((w) => w.includes("duplicate"))).toBe(true);
   });
+
+  it("stays quiet on the always-present empty signals shell without observed_at", () => {
+    // CLIProxy sends `quota:{signals:{}}` for every provider, even those
+    // with no passive signals: the shell without `observed_at` is expected.
+    const { accounts } = parse([{ id: "m-1", provider: "meta", quota: { signals: {} } }]);
+    expect(accounts).toHaveLength(1);
+    expect(accounts[0]?.limits).toHaveLength(0);
+    expect(accounts[0]?.quotaBlind).toBe(true);
+    expect(accounts[0]?.quotaBlindReason).toBe("upstream exposes nothing");
+    expect(accounts[0]?.parseWarnings.some((w) => w.includes("no quota signals"))).toBe(false);
+  });
+
+  it("still warns when a real observation carries no signals", () => {
+    const { accounts } = parse([
+      { id: "c-1", provider: "claude", quota: { observed_at: NOW, signals: {} } },
+    ]);
+    expect(accounts[0]?.parseWarnings.some((w) => w.includes("no quota signals"))).toBe(true);
+  });
+
+  it("explains blindness per provider kind", () => {
+    const { accounts } = parse([
+      { id: "n-1", provider: "nvidia-nim" },
+      { id: "c-1", provider: "claude" },
+      { id: "m-1", provider: "meta" },
+    ]);
+    expect(accounts.find((a) => a.provider === "nvidia-nim")).toMatchObject({
+      quotaBlind: true,
+      quotaBlindReason: "local estimate",
+    });
+    expect(accounts.find((a) => a.provider === "claude")).toMatchObject({
+      quotaBlind: true,
+      quotaBlindReason: "no usable quota windows",
+    });
+    expect(accounts.find((a) => a.provider === "meta")).toMatchObject({
+      quotaBlind: true,
+      quotaBlindReason: "upstream exposes nothing",
+    });
+  });
+
+  it("routes openrouter to its own display-only parser key", () => {
+    expect(normalizeProvider("openrouter")).toBe("openrouter");
+    expect(normalizeProvider("OpenRouter")).toBe("openrouter");
+  });
+
+  it("keeps openrouter display-only: blind with non-gating windows", () => {
+    const { accounts } = parse([{ id: "o-1", provider: "openrouter" }], {
+      allowLists: { openrouter: ["limit"] },
+      pluginPayloadByProvider: new Map([
+        ["openrouter", { groups: [{ buckets: [{ window: "limit", remainingFraction: 0.9 }] }] }],
+      ]),
+    });
+    expect(accounts).toHaveLength(1);
+    expect(accounts[0]).toMatchObject({ quotaBlind: true, quotaBlindReason: "upstream exposes nothing" });
+    expect(accounts[0]?.limits).toHaveLength(1);
+    expect(accounts[0]?.limits[0]).toMatchObject({ id: "openrouter:limit", gating: false });
+  });
+
+  it("collects advertised quota plugin ids for discovery, skipping opt-outs and junk", () => {
+    const { accounts, pluginQuotaHints, warnings } = parse([
+      { id: "s-1", provider: "synthetic", quota_plugin_id: "synthetic-quota" },
+      { id: "s-2", provider: "synthetic", quota_plugin_id: "other-quota" },
+      { id: "x-1", provider: "xai", quota_plugin_id: "../evil" },
+      { id: "d-1", provider: "devin", quota_plugin_id: "devin-quota", supports_quota: false },
+      { id: "m-1", provider: "meta", disabled: true, quota_plugin_id: "meta-quota" },
+    ]);
+    expect(pluginQuotaHints.get("synthetic")).toBe("synthetic-quota");
+    expect(pluginQuotaHints.get("xai")).toBeUndefined();
+    expect(pluginQuotaHints.get("devin")).toBeUndefined();
+    expect(pluginQuotaHints.get("meta")).toBeUndefined(); // disabled entries never contribute
+    expect(warnings.some((w) => w.includes("conflicting quota plugin ids"))).toBe(true);
+    expect(warnings.some((w) => w.includes("unusable advertised quota plugin id"))).toBe(true);
+    // Same-provider accounts on different plugins keep their own route, so
+    // the sync can fetch each credential against the plugin that serves it.
+    expect(accounts.find((a) => a.quotaPluginId === "synthetic-quota")).toBeDefined();
+    expect(accounts.find((a) => a.quotaPluginId === "other-quota")).toBeDefined();
+    expect(accounts.find((a) => a.provider === "devin")?.quotaPluginId).toBeNull();
+  });
 });
 
-describe("parsePluginQuota", () => {
-  it("maps RemainingFraction to used% with ResetTime and plan", () => {
+describe("parsePluginQuota (lowercase wire shape)", () => {
+  it("maps remainingFraction to used% with resetTime and plan", () => {
     const { limits, planType } = parsePluginQuota(
       "synthetic",
       {
-        Subscription: { Plan: "team" },
-        Groups: [{ Buckets: [{ Window: "weekly", RemainingFraction: 0.8, ResetTime: iso(NOW_MS + 1000) }] }],
+        subscription: { plan: "team" },
+        groups: [{ buckets: [{ window: "weekly", remainingFraction: 0.8, resetTime: iso(NOW_MS + 1000) }] }],
       },
       ["weekly"],
     );
@@ -640,10 +766,65 @@ describe("parsePluginQuota", () => {
     });
   });
 
+  it("parses the lowercase wire shape with zero warnings (no silent blindness)", () => {
+    // The exact CLIProxyAPI `pluginapi` JSON tags: lowercase `groups`,
+    // `buckets`, `window`, `remainingFraction`, `resetTime`. On 0.2.2 this
+    // payload parsed to zero windows (PascalCase-only `Buckets` read) with
+    // no warning, leaving Synthetic/Cloudflare/NIM quota-blind.
+    const { limits, warnings } = parsePluginQuota(
+      "synthetic",
+      {
+        subscription: { plan: "team" },
+        groups: [{ buckets: [{ window: "rolling-5h", remainingFraction: 0.6, resetTime: iso(NOW_MS + 1000) }] }],
+      },
+      ["rolling-5h"],
+      { observedAt: NOW },
+    );
+    expect(warnings).toEqual([]);
+    expect(limits).toHaveLength(1);
+    expect(limits[0]).toMatchObject({
+      id: "synthetic:rolling-5h",
+      remainingPercent: 60,
+      allowed: true,
+      gating: true,
+      observedAt: NOW,
+    });
+  });
+
+  it("warns when a group carries no buckets instead of going silently blind", () => {
+    const { limits, warnings } = parsePluginQuota(
+      "synthetic",
+      { groups: [{ window: "weekly" }] },
+      ["weekly"],
+    );
+    expect(limits).toHaveLength(0);
+    expect(warnings.some((w) => w.includes("no buckets"))).toBe(true);
+  });
+
+  it("warns on a group with an empty buckets array", () => {
+    const { limits, warnings } = parsePluginQuota("synthetic", { groups: [{ buckets: [] }] }, ["weekly"]);
+    expect(limits).toHaveLength(0);
+    expect(warnings.some((w) => w.includes("no buckets"))).toBe(true);
+  });
+
+  it("still accepts the PascalCase aliases shape-tolerantly", () => {
+    const { limits, warnings } = parsePluginQuota(
+      "synthetic",
+      {
+        Subscription: { Plan: "team" },
+        Groups: [{ Buckets: [{ Window: "weekly", RemainingFraction: 0.8, ResetTime: iso(NOW_MS + 1000) }] }],
+      },
+      ["weekly"],
+    );
+    expect(warnings).toEqual([]);
+    expect(limits).toHaveLength(1);
+    expect(limits[0]).toMatchObject({ remainingPercent: 80 });
+  });
+
   it("zero remaining exhausts with allowed=false", () => {
     const { limits } = parsePluginQuota(
       "synthetic",
-      { Groups: [{ Buckets: [{ Window: "weekly", RemainingFraction: 0 }] }] },
+      { groups: [{ buckets: [{ window: "weekly", remainingFraction: 0 }] }] },
       ["weekly"],
       { observedAt: NOW },
     );
@@ -654,6 +835,95 @@ describe("parsePluginQuota", () => {
     const { limits, warnings } = parsePluginQuota("synthetic", "nope", ["weekly"]);
     expect(limits).toHaveLength(0);
     expect(warnings.length).toBeGreaterThan(0);
+  });
+
+  it("carries summary[] as a display-only per-row metrics array", () => {
+    const { limits } = parsePluginQuota(
+      "synthetic",
+      {
+        subscription: { plan: "team" },
+        summary: ["team plan, resets weekly"],
+        groups: [
+          {
+            buckets: [
+              {
+                window: "weekly",
+                remainingFraction: 0.8,
+                summary: ["burst allowance included"],
+              },
+            ],
+          },
+        ],
+      },
+      ["weekly"],
+    );
+    expect(limits).toHaveLength(1);
+    expect(limits[0]?.metrics).toEqual(["team plan, resets weekly", "burst allowance included"]);
+    expect(limits[0]?.gating).toBe(true);
+  });
+
+  it("scrubs account identifiers from summary[] before surfacing metrics", () => {
+    const { limits } = parsePluginQuota(
+      "synthetic",
+      {
+        summary: ["team plan, resets weekly", "owner ops@example.com", "refresh ab12cd34ef"],
+        groups: [{ buckets: [{ window: "weekly", remainingFraction: 0.8 }] }],
+      },
+      ["weekly"],
+    );
+    expect(limits[0]?.metrics).toEqual([
+      "team plan, resets weekly",
+      "owner [redacted-email]",
+      "refresh [redacted]",
+    ]);
+  });
+
+  it("parses Devin daily/weekly remaining-percent fields, stripping %", () => {
+    const { limits, warnings } = parsePluginQuota(
+      "devin",
+      {
+        daily_quota_remaining_percent: "75%",
+        daily_reset_at: iso(NOW_MS + 24 * 3_600_000),
+        weekly_quota_remaining_percent: "50",
+        weekly_reset_at: iso(NOW_MS + 7 * 24 * 3_600_000),
+      },
+      ["daily", "weekly"],
+      { observedAt: NOW },
+    );
+    expect(warnings).toEqual([]);
+    expect(limits).toHaveLength(2);
+    expect(limits.find((l) => l.id === "devin:daily")).toMatchObject({
+      usedPercent: 25,
+      remainingPercent: 75,
+      resetsAt: iso(NOW_MS + 24 * 3_600_000),
+      allowed: true,
+      gating: true,
+      observedAt: NOW,
+    });
+    expect(limits.find((l) => l.id === "devin:weekly")).toMatchObject({
+      usedPercent: 50,
+      remainingPercent: 50,
+      allowed: true,
+      gating: true,
+    });
+  });
+
+  it("exhausts a zero-percent Devin window and skips unusable percents with a warning", () => {
+    const { limits, warnings } = parsePluginQuota(
+      "devin",
+      {
+        daily_quota_remaining_percent: "0%",
+        weekly_quota_remaining_percent: "plenty",
+      },
+      ["daily", "weekly"],
+    );
+    expect(limits.find((l) => l.id === "devin:daily")).toMatchObject({
+      remainingPercent: 0,
+      allowed: false,
+      limitReached: true,
+    });
+    expect(limits.some((l) => l.id === "devin:weekly")).toBe(false);
+    expect(warnings.some((w) => w.includes("weekly quota percent"))).toBe(true);
   });
 });
 

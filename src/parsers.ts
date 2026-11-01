@@ -14,15 +14,24 @@
  *    (`quota{observed_at, signals}`, `model_quotas` keyed by model). Signal
  *    maps carry raw upstream header names to string values
  *    (`anthropic-ratelimit-unified-*-utilization`, `x-codex-*-used-percent`,
- *    `retry-after`, …) — see `quota_signals.go` in CLIProxyAPI. Exact live
- *    management JSON is still operator-captured when available; until then
- *    the fixture in `sync.test.ts` mirrors the source shapes above.
- * 2. Plugin quota routes: the normalized `QuotaFetchResponse` shape
- *    (`Subscription`, `Summary`, `Groups[].Buckets[]` with `Window`,
- *    `RemainingFraction`, `ResetTime`) our five provider plugins return.
+ *    `retry-after`, …) — see `quota_signals.go` in CLIProxyAPI. CLIProxy
+ *    always sends the `quota:{signals:{}}` shell, even for providers that
+ *    publish no passive signals: an empty shell with no `observed_at` is
+ *    expected, not a warning. Exact live management JSON is still
+ *    operator-captured when available; until then the fixture in
+ *    `sync.test.ts` mirrors the source shapes above.
+ * 2. Plugin quota routes: the normalized `QuotaFetchResponse` shape our
+ *    provider plugins return, serialized with lowercase JSON tags
+ *    (`subscription{plan,…}`, `summary[]`, `groups[].buckets[]` with
+ *    `window`, `remainingFraction`, `resetTime`, `description`). Devin
+ *    daily/weekly windows come primarily from auth-files passive signals
+ *    (see `parseHeaderSignals`): the `daily|weekly_quota_remaining_percent`
+ *    / `daily|weekly_quota_reset_at` fields sometimes echoed at the plugin
+ *    payload root are accepted only as a fallback.
  */
 
 import { createHash } from "node:crypto";
+import { SINGLE_SEGMENT } from "./config.js";
 import type { AccountStatus, UsageLimitRow } from "./types.js";
 
 /* ------------------------------------------------------------------ */
@@ -305,6 +314,7 @@ export type ProviderKey =
   | "compat"
   | "synthetic"
   | "nvidia-nim"
+  | "openrouter"
   | "cloudflare"
   | "zai"
   | "opencode-go"
@@ -327,6 +337,7 @@ export function normalizeProvider(channel: unknown): ProviderKey {
   if (c.includes("antigravity") || c.includes("gemini")) return "antigravity";
   if (c.includes("xai") || c.includes("grok")) return "xai";
   if (c.includes("kimi") || c.includes("moonshot")) return "kimi";
+  if (c.includes("openrouter")) return "openrouter";
   if (c.includes("opencode-go") || c.includes("opencodego")) return "opencode-go";
   if (c.includes("opencode") || c.includes("compat") || c.includes("zen")) return "compat";
   if (c.includes("synthetic")) return "synthetic";
@@ -407,6 +418,7 @@ function makeLimit(init: {
   gating?: boolean;
   observedAt?: string | null;
   models?: string[] | null;
+  metrics?: string[] | null;
 }): UsageLimitRow {
   return {
     id: init.id,
@@ -419,6 +431,7 @@ function makeLimit(init: {
     gating: init.gating ?? false,
     observedAt: init.observedAt ?? null,
     models: init.models ?? null,
+    metrics: init.metrics ?? null,
   };
 }
 
@@ -433,12 +446,91 @@ export interface ParsedPluginQuota {
 }
 
 /**
+ * Display-only quota `summary[]` entries, normalized to short strings.
+ * Payload- and bucket-level summaries merge onto every emitted window row
+ * (`metrics`, never gating). Upstream text can carry account identifiers, so
+ * every entry is scrubbed like status notes (emails and credential-like
+ * tokens redacted) before it reaches the page. Non-string entries stringify
+ * defensively; bounded (32 entries, 240 chars) so a chatty plugin cannot
+ * bloat the cache.
+ */
+function summarizeMetrics(value: unknown): string[] | null {
+  if (!Array.isArray(value)) return null;
+  const out: string[] = [];
+  for (const item of value.slice(0, 32)) {
+    const push = (raw: string) => {
+      const clean = sanitizeStatusMessage(raw.slice(0, 240));
+      if (clean) out.push(clean);
+    };
+    if (typeof item === "string" && item.trim()) push(item.trim());
+    else if (typeof item === "number" && Number.isFinite(item)) push(String(item));
+    else if (item !== null && typeof item === "object") {
+      try {
+        const s = JSON.stringify(item);
+        if (s && s !== "{}" && s !== "[]") push(s);
+      } catch {
+        /* unstringifiable entry: dropped, never headroom */
+      }
+    }
+  }
+  return out.length > 0 ? out : null;
+}
+
+/**
+ * Parse a Devin-style remaining-percent field (`"75%"`, `"75"` or `75`)
+ * into 0–100 remaining. Returns null when the value is absent or unusable
+ * (unknown, never headroom).
+ */
+function parseRemainingPercentField(value: unknown): number | null {
+  let raw: string | number | null = null;
+  if (typeof value === "number" && Number.isFinite(value)) raw = value;
+  else if (typeof value === "string" && value.trim()) {
+    const stripped = value.trim().replace(/%$/, "").trim();
+    if (stripped && Number.isFinite(Number(stripped))) raw = Number(stripped);
+  }
+  if (raw === null || raw < 0 || raw > 100) return null;
+  return raw;
+}
+
+/**
+ * Display-only blind reason for a quota-blind account row. Providers whose
+ * upstream exposes no quota read "upstream exposes nothing"; NIM-style
+ * local estimates read "local estimate"; a gated provider that simply
+ * reported no usable windows reads "no usable quota windows".
+ */
+export function quotaBlindReason(parserKey: ProviderKey, hasWindows: boolean): string | null {
+  switch (parserKey) {
+    case "meta":
+    case "antigravity":
+    case "xai":
+    case "kimi":
+    case "compat":
+    case "openrouter":
+    case "unknown-provider":
+      return "upstream exposes nothing";
+    case "nvidia-nim":
+      return "local estimate";
+    default:
+      return hasWindows ? null : "no usable quota windows";
+  }
+}
+
+/**
  * Parse the normalized `QuotaFetchResponse` our provider plugins return
- * (`Subscription{Plan,TierName,TierID}`, `Summary[]`, `Groups[].Buckets[]`
- * with `Window`, `RemainingFraction`, `ResetTime`, `Description`).
+ * (lowercase wire tags: `subscription{plan,tierName,tierId}`, `summary[]`,
+ * `groups[].buckets[]` with `window`, `remainingFraction`, `resetTime`,
+ * `description`; PascalCase aliases accepted shape-tolerantly).
  *
- * Mapping: `usedPercent = (1 − RemainingFraction) × 100`,
- * `resetsAt = ResetTime`, `allowed = RemainingFraction > 0`.
+ * Devin daily/weekly fallback: when the payload root carries
+ * `daily|weekly_quota_remaining_percent` (trailing `%` stripped, with
+ * `daily|weekly_quota_reset_at` / `daily|weekly_reset_at`), they parse into
+ * `daily` / `weekly` windows under the same allow-list gating. This is only
+ * a fallback — the primary source is the auth-files passive observation
+ * (`quota.signals` on the Devin entry, parsed by `parseHeaderSignals`),
+ * because no Devin plugin quota route serves these fields.
+ *
+ * Mapping: `usedPercent = (1 − remainingFraction) × 100`,
+ * `resetsAt = resetTime`, `allowed = remainingFraction > 0`.
  * Per-window tolerance (G-G2 lesson): one malformed bucket never blinds the
  * rest — it is skipped with a warning.
  */
@@ -460,23 +552,33 @@ export function parsePluginQuota(
   const planType =
     getStr(sub ?? {}, "Plan", "plan", "TierName", "tierName", "PlanName", "planName") ?? null;
 
+  // Payload-level `summary[]`: display-only context merged onto every row.
+  const payloadMetrics = summarizeMetrics(root.Summary ?? root.summary ?? null);
+
   const groups = Array.isArray(root.Groups)
     ? root.Groups
     : Array.isArray(root.groups)
       ? root.groups
       : null;
-  if (!groups) {
-    warnings.push(`${provider}: plugin quota payload has no Groups; treating as unknown.`);
-    return { planType, limits, warnings };
-  }
 
-  for (const g of groups) {
+  for (const g of groups ?? []) {
     const group = asObj(g);
     if (!group) {
       warnings.push(`${provider}: skipping a malformed quota group.`);
       continue;
     }
-    const buckets = Array.isArray(group.Buckets) ? group.Buckets : [];
+    // Wire shape is lowercase `buckets` (CLIProxyAPI `pluginapi` JSON tags);
+    // PascalCase accepted shape-tolerantly. A group with no buckets array
+    // parses to zero windows with a warning — never silent blindness.
+    const buckets = Array.isArray(group.Buckets)
+      ? group.Buckets
+      : Array.isArray(group.buckets)
+        ? group.buckets
+        : null;
+    if (!buckets || buckets.length === 0) {
+      warnings.push(`${provider}: quota group has no buckets; treating this group as unknown.`);
+      continue;
+    }
     for (const b of buckets) {
       const bucket = asObj(b);
       if (!bucket) {
@@ -496,6 +598,10 @@ export function parsePluginQuota(
       );
       const description = getStr(bucket, "Description", "description");
       const scope = bucket.Scope ?? bucket.scope ?? null;
+      // Bucket-level `summary[]` merges with the payload-level entries.
+      const bucketMetrics = summarizeMetrics(bucket.Summary ?? bucket.summary ?? null);
+      const metrics =
+        payloadMetrics || bucketMetrics ? [...(payloadMetrics ?? []), ...(bucketMetrics ?? [])] : null;
 
       let usedPercent: number | null = null;
       let remainingPercent: number | null = null;
@@ -530,11 +636,69 @@ export function parsePluginQuota(
           gating,
           // Fetched at sync time: its observation is as fresh as the cache row.
           observedAt: opts?.observedAt ?? null,
+          models: null,
+          metrics,
         }),
       );
     }
   }
+
+  // Devin percent fields fallback (`daily_quota_remaining_percent` /
+  // `weekly_quota_remaining_percent`, trailing `%` stripped) with
+  // `daily|weekly_quota_reset_at` (also `daily|weekly_reset_at` tolerated).
+  // Same gating, same observation. A Groups-less payload that carries only
+  // these fields still parses — the missing-groups warning fires only when
+  // no window came from either shape. Primary source stays the auth-files
+  // passive signals (see `parseHeaderSignals`); this root shape exists only
+  // for plugin payloads that echo the fields.
+  for (const window of ["daily", "weekly"] as const) {
+    const raw =
+      root[`${window}_quota_remaining_percent`] ??
+      root[`${window}QuotaRemainingPercent`] ??
+      root[`${capitalize(window)}QuotaRemainingPercent`] ??
+      null;
+    if (raw === null || raw === undefined) continue;
+    const remainingPercent = parseRemainingPercentField(raw);
+    if (remainingPercent === null) {
+      warnings.push(`${provider}: ${window} quota percent is unusable; skipping.`);
+      continue;
+    }
+    const usedPercent = 100 - remainingPercent;
+    const exhausted = remainingPercent <= 0;
+    const gating =
+      opts?.softGating === true ? false : isGatingWindow(provider, window, allowList);
+    limits.push(
+      makeLimit({
+        id: `${provider}:${window}`,
+        label: `${provider} ${window}`,
+        usedPercent,
+        remainingPercent,
+        resetsAt: toIsoTimestamp(
+          root[`${window}_quota_reset_at`] ??
+            root[`${window}_reset_at`] ??
+            root[`${window}QuotaResetAt`] ??
+            root[`${window}ResetAt`] ??
+            root[`${capitalize(window)}QuotaResetAt`] ??
+            root[`${capitalize(window)}ResetAt`] ??
+            null,
+        ),
+        limitReached: exhausted,
+        allowed: exhausted ? false : true,
+        gating,
+        observedAt: opts?.observedAt ?? null,
+        models: null,
+        metrics: payloadMetrics,
+      }),
+    );
+  }
+  if (limits.length === 0 && (!groups || groups.length === 0)) {
+    warnings.push(`${provider}: plugin quota payload has no Groups; treating as unknown.`);
+  }
   return { planType, limits, warnings };
+}
+
+function capitalize(s: string): string {
+  return s ? s[0]!.toUpperCase() + s.slice(1) : s;
 }
 
 /* ------------------------------------------------------------------ */
@@ -593,7 +757,13 @@ function toUsedPercent(v: number): number | null {
  * (`utilization` fraction, `reset` timestamp, `status` allowed/rejected).
  * Codex windows come from `x-codex-[<ns>-]<primary|secondary>-<metric>`
  * (`used-percent` 0–100, `reset-at` unix, `reset-after-seconds`,
- * `allowed`, `limit-reached`). A bare `retry-after` (seconds) is an explicit
+ * `allowed`, `limit-reached`). Devin daily/weekly windows are the primary
+ * source for that provider and come from the auth-files passive observation
+ * (`internal/auth/devin/record.go` writes them into `quotaSignals`, served
+ * as `quota.signals` on the Devin entry):
+ * `<daily|weekly>-quota-remaining-percent` (`"75%"`, trailing `%` stripped,
+ * `used = 100 − remaining`), `<daily|weekly>-quota-reset-at` (RFC3339) and
+ * `plan`. A bare `retry-after` (seconds) is an explicit
  * 429 watermark for any provider and always limits.
  */
 export function parseHeaderSignals(
@@ -715,6 +885,32 @@ export function parseHeaderSignals(
         ignored += 1;
       }
       continue;
+    }
+    // Devin passive observation (primary source for daily/weekly — no Devin
+    // plugin quota route serves these): `<daily|weekly>-quota-remaining-
+    // percent` (`"75%"`, trailing `%` stripped via parseRemainingPercentField,
+    // `used = 100 − remaining`), `<daily|weekly>-quota-reset-at` (RFC3339)
+    // and `plan`. Unknown-provider stays tolerant so a Devin-shaped entry
+    // filed under a future provider word still parses.
+    if (provider === "devin" || provider === "unknown-provider") {
+      const dm = /^(daily|weekly)-quota-(remaining-percent|reset-at)$/.exec(key);
+      if (dm) {
+        const a = acc(dm[1]!);
+        if (dm[2] === "remaining-percent") {
+          const remaining = parseRemainingPercentField(value);
+          if (remaining !== null) a.used = Math.max(a.used ?? -Infinity, 100 - remaining);
+          else ignored += 1;
+        } else {
+          const iso = toIsoTimestamp(value);
+          if (iso) a.extraResetMs.push(Date.parse(iso));
+          else ignored += 1;
+        }
+        continue;
+      }
+      if (key === "plan") {
+        planType = value;
+        continue;
+      }
     }
     ignored += 1;
   }
@@ -872,6 +1068,14 @@ export interface ParsedAccount {
    * validated as a single safe value before any network happens.
    */
   authIndex: string | null;
+  /**
+   * This entry's advertised plugin quota route (`quota_plugin_id`), or null
+   * when it advertises none, opts out (`supports_quota: false`), or the id
+   * is unusable. Lets same-provider accounts on different plugins each fetch
+   * their own quota; the provider-level hint is only the fallback for rows
+   * that advertise nothing.
+   */
+  quotaPluginId: string | null;
   /** Reconciled lifecycle state. */
   status: AccountStatus;
   /** CLIProxy `status_message`, when present (operational note). */
@@ -882,6 +1086,8 @@ export interface ParsedAccount {
   planType: string | null;
   checkedAt: string;
   quotaBlind: boolean;
+  /** Display-only blind reason (null when the account is not blind). */
+  quotaBlindReason: string | null;
   accountHash: string | null;
   coolingDown: boolean;
   cooldownUntil: string | null;
@@ -918,9 +1124,21 @@ export function parseAuthFiles(
      */
     pluginPayloadByAuthIndex?: Map<string, unknown>;
   },
-): { accounts: ParsedAccount[]; unkeyed: number; warnings: string[] } {
+): {
+  accounts: ParsedAccount[];
+  unkeyed: number;
+  warnings: string[];
+  /**
+   * Per-provider plugin quota ids advertised by the entries themselves
+   * (`quota_plugin_id`, unless `supports_quota: false`). First valid id wins
+   * per provider; the operator config still wins over discovery. Only valid
+   * single-segment ids are collected — anything else warns, never fetches.
+   */
+  pluginQuotaHints: Map<string, string>;
+} {
   const warnings: string[] = [];
   const accounts: ParsedAccount[] = [];
+  const pluginQuotaHints = new Map<string, string>();
   let unkeyed = 0;
 
   const root = asObj(payload);
@@ -933,7 +1151,7 @@ export function parseAuthFiles(
       : [];
   if (entries.length === 0) {
     warnings.push("auth-files payload holds no entries; every configured provider will drift-warn as having no enabled accounts.");
-    return { accounts, unkeyed, warnings };
+    return { accounts, unkeyed, warnings, pluginQuotaHints };
   }
 
   const seenKeys = new Map<string, number>();
@@ -974,6 +1192,34 @@ export function parseAuthFiles(
     }
 
     const disabled = entry.disabled === true;
+    // Operator-free plugin quota discovery: an entry may advertise its own
+    // plugin route (`quota_plugin_id`), unless it opts out with
+    // `supports_quota: false`. Only keyed, enabled entries contribute —
+    // unkeyed repeats and disabled credentials never drive fetches.
+    // The validated per-entry id rides on the parsed row (see quotaPluginId):
+    // same-provider accounts on different plugins each fetch their own quota
+    // instead of all sharing the first-wins provider hint.
+    let advertisedPluginId: string | null = null;
+    if (!disabled) {
+      const supportsQuota = entry.supports_quota ?? entry.supportsQuota ?? null;
+      const hintedId = getStr(entry, "quota_plugin_id", "quotaPluginId");
+      if (hintedId !== null && supportsQuota !== false) {
+        if (SINGLE_SEGMENT.test(hintedId)) {
+          advertisedPluginId = hintedId;
+          const prior = pluginQuotaHints.get(provider);
+          if (prior === undefined) pluginQuotaHints.set(provider, hintedId);
+          else if (prior !== hintedId) {
+            warnings.push(
+              `${provider}: entries advertise conflicting quota plugin ids; using ${JSON.stringify(prior)}.`,
+            );
+          }
+        } else {
+          warnings.push(
+            `${provider}: ignoring an unusable advertised quota plugin id; configure pluginQuotaIds explicitly.`,
+          );
+        }
+      }
+    }
     const unavailable = entry.unavailable === true;
     const nextRetryAfter = toIsoTimestamp(entry.next_retry_after ?? entry.nextRetryAfter ?? null);
     const nowMs = Date.parse(opts.now);
@@ -1004,7 +1250,9 @@ export function parseAuthFiles(
     const allowList = opts.allowLists[provider] ?? opts.allowLists[parserKey] ?? [];
     // NIM is local-estimate only: its numbers ride along as non-gating
     // context (soft signal), and the account stays quota-blind for routing.
-    const softGating = parserKey === "nvidia-nim";
+    // OpenRouter is display-only the same way until its plugin reports real
+    // limits (its current no-limit bucket must never gate).
+    const softGating = parserKey === "nvidia-nim" || parserKey === "openrouter";
     const labelPrefix =
       parserKey === "claude" ? "Claude unified" : parserKey === "codex" ? "Codex" : parserKey === "devin" ? "Devin" : provider;
 
@@ -1079,7 +1327,11 @@ export function parseAuthFiles(
         labelPrefix,
       });
       parseWarnings.push(...parsed.warnings);
-      if (Object.keys(input.signals).length === 0) {
+      // CLIProxy always sends the `quota:{signals:{}}` shell for providers
+      // other than claude, codex and devin: an empty shell with no
+      // `observed_at` is expected, not a warning. A real observation (with
+      // `observed_at`) that carries no signals still warns once.
+      if (Object.keys(input.signals).length === 0 && input.observed !== null) {
         parseWarnings.push(`${provider}: account observation carries no quota signals; treating as unknown.`);
       }
       limits.push(...stampLimits(parsed.limits, input.observed, opts.now));
@@ -1117,6 +1369,7 @@ export function parseAuthFiles(
       parserKey === "xai" ||
       parserKey === "kimi" ||
       parserKey === "compat" ||
+      parserKey === "openrouter" ||
       parserKey === "unknown-provider" ||
       parserKey === "nvidia-nim" ||
       (stamped.length === 0 && pluginLimits.length === 0);
@@ -1131,11 +1384,13 @@ export function parseAuthFiles(
       channel,
       fileName,
       authIndex,
+      quotaPluginId: advertisedPluginId,
       status,
       statusMessage,
       priority,
       limits: stamped,
       planType,
+      quotaBlindReason: quotaBlind ? quotaBlindReason(parserKey, stamped.length > 0) : null,
       // Cache age: the sync's own fetch time. It drives the bounded fail-open
       // then unknown when sync dies — never the passive observed_at, which
       // only refreshes when the account serves traffic (an idle healthy
@@ -1160,7 +1415,7 @@ export function parseAuthFiles(
       parseWarnings: [...parseWarnings, ...(pluginQuota?.warnings ?? [])],
     });
   }
-  return { accounts, unkeyed, warnings };
+  return { accounts, unkeyed, warnings, pluginQuotaHints };
 }
 
 /**

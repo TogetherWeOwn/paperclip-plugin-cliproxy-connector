@@ -1,9 +1,10 @@
 import type { PaperclipPluginManifestV1 } from "@paperclipai/plugin-sdk";
 
 export const PLUGIN_ID = "togetherweown.cliproxy-connector";
-export const PLUGIN_VERSION = "0.2.2";
+export const PLUGIN_VERSION = "0.2.3";
 export const SYNC_JOB_KEY = "cliproxy-sync";
 export const PAGE_DATA_KEY = "cliproxy-page";
+export const USAGE_DATA_KEY = "cliproxy-usage";
 export const WIDGET_DATA_KEY = "cliproxy-widget";
 export const RESYNC_ACTION_KEY = "cliproxy-resync";
 export const REENABLE_ACTION_KEY = "cliproxy-reenable";
@@ -71,6 +72,12 @@ const manifest: PaperclipPluginManifestV1 = {
         id: "cliproxy-accounts",
         displayName: "CLIProxy Accounts",
         exportName: "CliProxyPage",
+      },
+      {
+        type: "page",
+        id: "cliproxy-usage",
+        displayName: "Usage & Quota",
+        exportName: "CliProxyUsagePage",
       },
       {
         type: "dashboardWidget",

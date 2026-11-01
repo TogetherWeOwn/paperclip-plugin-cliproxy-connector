@@ -24,13 +24,14 @@ import {
   STATE_NAMESPACE,
   STRIKE_STATE_KEY,
   SYNC_JOB_KEY,
+  USAGE_DATA_KEY,
   WIDGET_DATA_KEY,
 } from "./manifest.js";
 import type { PluginPerformActionContext } from "@paperclipai/plugin-sdk";
 import { route, type RouterCandidate } from "./router.js";
 import { emptyStrikeBudget, reenableAfterStrike, runSync } from "./sync.js";
 import type { AccountUsageRow, StrikeBudgetState, SyncFailure, SyncSummary } from "./types.js";
-import { buildPageData, buildWidgetData } from "./ui-data.js";
+import { buildPageData, buildUsageData, buildWidgetData } from "./ui-data.js";
 
 const inFlight: { running: boolean } = { running: false };
 
@@ -186,6 +187,18 @@ const plugin = definePlugin({
     ctx.data.register(PAGE_DATA_KEY, async (params) => {
       const companyId = String((params as Record<string, unknown>).companyId ?? "");
       return pageData(ctx, companyId, new Date().toISOString());
+    });
+    // "Usage & quota" page: same sync cache, usage-shaped. Read-only —
+    // the destructive usage-queue endpoint is never called.
+    ctx.data.register(USAGE_DATA_KEY, async (params) => {
+      const companyId = String((params as Record<string, unknown>).companyId ?? "");
+      const config = await resolveCompany(ctx, companyId).then((r) => r.config);
+      const [rows, lastSync, lastFailure] = await Promise.all([
+        loadRows(ctx, companyId),
+        loadLastSync(ctx, companyId),
+        loadLastFailure(ctx, companyId),
+      ]);
+      return buildUsageData({ now: new Date().toISOString(), config, rows, lastSync, lastFailure });
     });
     ctx.data.register(WIDGET_DATA_KEY, async (params) => {
       const companyId = String((params as Record<string, unknown>).companyId ?? "");
