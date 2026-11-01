@@ -270,15 +270,27 @@ export async function runSync(deps: SyncDeps, inFlight: { running: boolean }): P
       // Accounts with no usable file name (or a failed fetch) keep the
       // heuristic — that is the fallback. Disabled accounts are excluded
       // everywhere else (quota aggregation, served-set fetching); they are
-      // excluded here too, so disabling a credential clears its claims.
+      // excluded here too, so disabling a credential clears its claims —
+      // including `owned_by` claims, which read scope (not quota keys).
       const quotaAccounts = accounts.filter(
         (a) => a.status !== "disabled" && !(a.fileName && servedSets.okFiles.has(a.fileName)),
+      );
+      const disabledProviders = new Set(
+        accounts.filter((a) => a.status === "disabled").map((a) => a.provider),
+      );
+      const enabledProviders = new Set(
+        accounts.filter((a) => a.status !== "disabled").map((a) => a.provider),
       );
       const derivation = deriveProviderModels(catalog.served, {
         authProviders: [
           ...new Set([
-            ...accounts.map((a) => a.provider),
-            ...deps.config.providers.map((p) => p.provider),
+            ...enabledProviders,
+            // Configured-but-undiscovered providers keep the heuristic
+            // fallback; a configured provider whose credentials are all
+            // disabled claims nothing.
+            ...deps.config.providers
+              .map((p) => p.provider)
+              .filter((p) => enabledProviders.has(p) || !disabledProviders.has(p)),
           ]),
         ],
         observedKeysByProvider: observedModelKeysByProvider(quotaAccounts),

@@ -514,6 +514,59 @@ describe("served-model catalog (/v1/models + auth-files)", () => {
     assertNoKeyLeak(s);
   });
 
+  it("a disabled credential's owned_by cannot fabricate an overlap", async () => {
+    // Same shape as above, but the catalog attributes the shared id to
+    // claude via owned_by. Scope — not quota keys — carries that claim, so
+    // disabling the credential must clear it too: no overlap, antigravity
+    // proven.
+    const fetchOwnedBy = vi.fn(async (input: string | URL | Request): Promise<Response> => {
+      const url = new URL(String(input));
+      if (url.pathname === "/v0/management/auth-files") {
+        return jsonResponse(200, [
+          {
+            id: "claude-1",
+            provider: "claude",
+            disabled: true,
+            model_quotas: {
+              "shared-live-model": {
+                observed_at: NOW,
+                signals: { "anthropic-ratelimit-unified-5h-utilization": "0.2" },
+              },
+            },
+          },
+          { id: "antigravity-1", name: "antigravity-file", provider: "antigravity" },
+        ]);
+      }
+      if (url.pathname === "/v0/management/auth-files/models") {
+        if (url.searchParams.get("name") !== "antigravity-file") {
+          return new Response("no such file", { status: 404 });
+        }
+        return jsonResponse(200, { data: [{ id: "shared-live-model" }] });
+      }
+      if (url.pathname === "/v1/models") {
+        return jsonResponse(200, { data: [{ id: "shared-live-model", owned_by: "anthropic" }] });
+      }
+      return new Response("not found", { status: 404 });
+    });
+    const s = store();
+    const d = deps(s, fetchOwnedBy as unknown as typeof fetch);
+    d.config = parseConfig({
+      ...baseConfigRaw(),
+      providers: [
+        { provider: "claude", connectionId: "conn-claude", completeInventory: true },
+        { provider: "antigravity", connectionId: "conn-antigravity", completeInventory: true },
+      ],
+      pluginQuotaIds: {},
+    }).config;
+    const summary = await runSync(d, { running: false });
+    expect(summary.skipped).toBe(false);
+    expect(summary.modelOverlaps).toEqual([]);
+    expect(summary.providerModels?.antigravity).toEqual(["shared-live-model"]);
+    const overlapDrift = (summary.drift ?? []).filter((f) => f.kind === "model-overlap");
+    expect(overlapDrift).toEqual([]);
+    assertNoKeyLeak(s);
+  });
+
   it("a 404 served-set endpoint on every file degrades to the heuristic with a warning", async () => {
     const fetchNoServedSet = vi.fn(async (input: string | URL | Request): Promise<Response> => {
       const url = new URL(String(input));
