@@ -167,7 +167,11 @@ shows: three frozen request templates (exact upstream method, URL, headers and b
 copied from the panel source, `apiCallTemplate()` in `src/cliproxy.ts`) whose only
 variable is the credential `auth_index` — callers cannot supply their own URL, headers
 or body. Upstream `$TOKEN$` placeholders are substituted server-side by CLIProxy; the
-plugin never handles credential material. Transport 401/403 spends the strike budget
+plugin never handles credential material. Meta has a backend boundary: the panel
+authorizes its Muse-key quota call with the downloaded `dca_token`, and this template
+preserves that upstream request shape, but the connector cannot verify which stored
+meta credential form the backend substitutes. If upstream rejects it, the account
+warns and stays unknown; operator resync is the verification. Transport 401/403 spends the strike budget
 like every management GET; an upstream provider-side error travels inside the returned
 envelope and only warns per file (fail open). Live windows are labelled "via provider
 API" on the Usage & quota page. If your CLIProxy build
@@ -196,8 +200,8 @@ tests mirrors the public CLIProxyAPI source shapes.
   (max 2, same-origin loopback), 15 s timeouts, 2 MB caps, schema-checked JSON. The worker
   fetches through its own guarded loopback transport (Node fetch, never the host client —
   the host SSRF guard refuses loopback); the transport re-checks loopback-only, canonical
-  origin (`localhost` is rewritten to `127.0.0.1` so no resolver is involved), GET-only
-  and no auto-redirects per request.
+  origin (`localhost` is rewritten to `127.0.0.1` so no resolver is involved), pinned
+  GET and `api-call` POST methods only, and no auto-redirects per request.
 - Strike budget (host-wide): first 401/403 stops the run and marks the secret bad; sync
   never re-probes while the secret is marked bad. A 2nd auth failure per rolling 30 min
   hard-disables sync until explicit board re-enable (`reenable` route/action, board users
@@ -229,7 +233,7 @@ fixtures incl. the 60%-remaining regression test, bucket-less warnings, `summary
 Devin quota grouped by auth-file provider), `models.test.ts` (served-list parsing,
 namespace-first attribution, Devin `owned_by: anthropic` case, colliding bare-id overlap),
 `cliproxy.test.ts` (management + client allow-lists, redirects, caps, redaction),
-`loopback-fetch.test.ts` (worker-local loopback transport: off-loopback/off-origin/non-GET
+`loopback-fetch.test.ts` (worker-local loopback transport: off-loopback/off-origin/other-method
 refused, no auto-redirects, composition with the client),
 `config.test.ts` (incl. the optional client-key `secret_ref`), `ui-data.test.ts`
 (incl. the usage-page data: verdicts, headroom, resets, freshness, blind badges with

@@ -14,6 +14,7 @@ import {
   CliproxyRedirectError,
   isSafeAuthFileName,
   MODELS_PATH,
+  apiCallTemplate,
   pluginQuotaPath,
 } from "./cliproxy.js";
 
@@ -485,6 +486,26 @@ describe("pinned api-call POST (TWO-801, three frozen templates)", () => {
       CliproxyConfigError,
     );
     expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it("rejects inherited prototype keys, not only unknown names", async () => {
+    const fetch = vi.fn(async () => json(200, {}));
+    for (const key of ["constructor", "toString", "hasOwnProperty"]) {
+      await expect(client(fetch).postApiCall(key, "abc123")).rejects.toThrow(
+        CliproxyConfigError,
+      );
+      expect(() => apiCallTemplate(key)).toThrow(CliproxyConfigError);
+    }
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it("returns a defensive copy that cannot mutate the frozen template table", async () => {
+    const selected = apiCallTemplate("meta");
+    selected.url = "https://example.invalid/";
+    selected.headers.Authorization = "tampered";
+    const fresh = apiCallTemplate("meta");
+    expect(fresh.url).toBe("https://api.meta.ai/muse-code/key");
+    expect(fresh.headers.Authorization).toBe("Bearer $TOKEN$");
   });
 
   it("rejects untrusted auth indexes before any network happens", async () => {

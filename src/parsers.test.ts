@@ -1093,6 +1093,19 @@ describe("parseMetaQuota (panel metaQuota.ts shape)", () => {
     }
   });
 
+  it("marks an expected-but-unusable window unknown instead of implying coverage", async () => {
+    const { parseMetaQuota } = await import("./parsers.js");
+    const payload = body();
+    (payload.subs_usage as Record<string, unknown>).weekly = { used_percent: "not-a-number" };
+    const parsed = parseMetaQuota(payload, NOW, metaWindows());
+    expect(parsed.limits.map((l) => l.id)).toEqual(["meta:window", "meta:weekly"]);
+    expect(parsed.limits[1]?.remainingPercent).toBeNull();
+    expect(parsed.limits[1]?.allowed).toBeNull();
+    expect(parsed.limits[1]?.gating).toBe(true);
+    expect(parsed.limits[1]?.viaProviderApi).toBe(true);
+    expect(parsed.warnings.join(" ")).toMatch(/weekly.*unknown/);
+  });
+
   it("forces exhausted windows when the subscription is inactive", async () => {
     const { parseMetaQuota } = await import("./parsers.js");
     const parsed = parseMetaQuota({ ...body(), is_subs_active: false }, NOW, metaWindows());
@@ -1160,6 +1173,48 @@ describe("parseAntigravitySubscription (panel antigravitySubscription.ts shape)"
     expect(parsed.limits[0]?.viaProviderApi).toBe(true);
   });
 
+  it("reads percent strings at percent scale, not fraction scale", async () => {
+    const { parseAntigravitySubscription } = await import("./parsers.js");
+    const parsed = parseAntigravitySubscription(
+      {
+        currentTier: { id: "g1-pro-tier", name: "Pro" },
+        groups: [
+          {
+            buckets: [
+              { window: "5h", remainingFraction: "42%" },
+              { window: "weekly", remainingFraction: "1%" },
+              { window: "daily", remainingFraction: "0.5%" },
+            ],
+          },
+        ],
+      },
+      NOW,
+      antigravityWindows(),
+    );
+    expect(parsed.limits.map((l) => l.remainingPercent)).toEqual([42, 1, 0.5]);
+    expect(parsed.limits.map((l) => l.usedPercent)).toEqual([58, 99, 99.5]);
+  });
+
+  it("disambiguates repeated bucket windows instead of emitting duplicate ids", async () => {
+    const { parseAntigravitySubscription } = await import("./parsers.js");
+    const parsed = parseAntigravitySubscription(
+      {
+        currentTier: { id: "g1-pro-tier", name: "Pro" },
+        groups: [
+          { buckets: [{ window: "weekly", remainingFraction: 0.4 }] },
+          { buckets: [{ window: "weekly", remainingFraction: 0.25 }] },
+        ],
+      },
+      NOW,
+      antigravityWindows(),
+    );
+    expect(parsed.limits.map((l) => l.id)).toEqual([
+      "antigravity:weekly",
+      "antigravity:weekly#2",
+    ]);
+    expect(parsed.limits.map((l) => l.remainingPercent)).toEqual([40, 25]);
+  });
+
   it("warns with zero windows when no tier is named", async () => {
     const { parseAntigravitySubscription } = await import("./parsers.js");
     const parsed = parseAntigravitySubscription({ currentTier: {}, paidTier: {} }, NOW, antigravityWindows());
@@ -1205,14 +1260,22 @@ describe("parseDevinQuota (panel devinQuota.ts shape)", () => {
     const payload = body();
     (payload.userStatus.planStatus as Record<string, unknown>).dailyQuotaRemainingPercent = "75%";
     const parsed = parseDevinQuota(payload, NOW, devinWindows());
-    expect(parsed.limits.map((l) => l.id)).toEqual(["devin:weekly"]);
-    expect(parsed.warnings.join(" ")).toMatch(/daily/);
+    expect(parsed.limits.map((l) => l.id)).toEqual(["devin:daily", "devin:weekly"]);
+    expect(parsed.limits[0]?.remainingPercent).toBeNull();
+    expect(parsed.limits[0]?.allowed).toBeNull();
+    expect(parsed.limits[0]?.gating).toBe(true);
+    expect(parsed.warnings.join(" ")).toMatch(/daily.*unknown/);
   });
 
-  it("warns with zero windows when the RPC carries no usable quota (empty_data)", async () => {
+  it("warns and emits expected unknown windows when the RPC carries no usable quota", async () => {
     const { parseDevinQuota } = await import("./parsers.js");
     const parsed = parseDevinQuota({ userStatus: { planStatus: { planInfo: {} } } }, NOW, devinWindows());
-    expect(parsed.limits).toEqual([]);
+    expect(parsed.limits.map((l) => l.id)).toEqual(["devin:daily", "devin:weekly"]);
+    for (const limit of parsed.limits) {
+      expect(limit.remainingPercent).toBeNull();
+      expect(limit.allowed).toBeNull();
+      expect(limit.gating).toBe(true);
+    }
     expect(parsed.warnings.length).toBeGreaterThan(0);
   });
 });
@@ -1262,6 +1325,34 @@ describe("parseAuthFiles with live provider-API payloads (TWO-801)", () => {
     expect(accounts[0]?.planType).toBe("Pro");
     expect(accounts[0]?.limits.map((l) => l.id)).toEqual(["meta:window", "meta:weekly"]);
     expect(accounts[0]?.limits.every((l) => l.viaProviderApi === true)).toBe(true);
+  });
+
+  it("a partial meta answer keeps the expected unknown window without quota-blindness", async () => {
+    const { parseAuthFiles } = await import("./parsers.js");
+    const { accounts } = parseAuthFiles(filesFor("meta", "m3"), {
+      now: NOW,
+      allowLists: allowLists(),
+      apiCallPayloadByAuthIndex: new Map([
+        [
+          "m3",
+          {
+            statusCode: 200,
+            body: {
+              subs_usage: {
+                window: { used_percent: 20, resets_at: NOW_MS / 1000 + 3600 },
+                weekly: { used_percent: "not-a-number" },
+              },
+              subs_tier_name: "Pro",
+              is_subs_active: true,
+            },
+          },
+        ],
+      ]),
+      apiCallObservedAt: NOW,
+    });
+    expect(accounts[0]?.quotaBlind).toBe(false);
+    expect(accounts[0]?.limits.map((l) => l.id)).toEqual(["meta:window", "meta:weekly"]);
+    expect(accounts[0]?.limits[1]?.allowed).toBeNull();
   });
 
   it("an upstream 429 warns per file and stays quota-blind (fail open)", async () => {

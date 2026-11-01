@@ -14,7 +14,8 @@
  *   request leaves, so the OS resolver can never steer a key-bearing request
  *   (`https://localhost` is refused outright: the rewrite would mismatch a
  *   localhost certificate at TLS verification time)
- * - GET only; `redirect: "manual"` is forced so a redirect is never followed
+ * - GET and the pinned `api-call` POST only, with the caller's method and body
+ *   preserved; `redirect: "manual"` is forced so a redirect is never followed
  *   automatically (the management client re-validates every hop itself)
  * - caller timeout via `AbortSignal` (default 15 s)
  *
@@ -88,8 +89,9 @@ export function createLoopbackFetch(baseUrl: string, opts: LoopbackFetchOptions 
   const underlying = opts.fetchImpl ?? fetch;
   const timeoutMs = opts.timeoutMs ?? MANAGEMENT_TIMEOUT_MS;
   return async (input: string, init?: RequestInit): Promise<Response> => {
-    if (init?.method !== undefined && init.method.toUpperCase() !== "GET") {
-      throw new CliproxyConfigError("loopback transport allows GET only; refusing to send another method.");
+    const method = init?.method?.toUpperCase() ?? "GET";
+    if (method !== "GET" && method !== "POST") {
+      throw new CliproxyConfigError("loopback transport allows GET and the pinned api-call POST only; refusing to send another method.");
     }
     const url = canonicalLoopbackUrl(input);
     // Canonical origin (host:port from config), and loopback: a request to
@@ -100,7 +102,7 @@ export function createLoopbackFetch(baseUrl: string, opts: LoopbackFetchOptions 
     try {
       return await underlying(url.toString(), {
         ...init,
-        method: "GET",
+        method,
         // Never follow automatically: the management client surfaces the 3xx
         // and re-validates (same-origin loopback, pinned allow-list) per hop.
         redirect: "manual",
@@ -109,9 +111,10 @@ export function createLoopbackFetch(baseUrl: string, opts: LoopbackFetchOptions 
     } catch (err) {
       // The management client reports only `err.name`; keep the root cause
       // visible (e.g. `TimeoutError`, not `Error`). The message carries the
-      // pathname only — never the query, headers or key material.
+      // method and pathname only — never the query, headers, body or key
+      // material.
       const label = err instanceof Error && err.name ? err.name : "fetch failed";
-      const wrapped = new CliproxyNetworkError(`loopback GET ${url.pathname} failed: ${label}`);
+      const wrapped = new CliproxyNetworkError(`loopback ${method} ${url.pathname} failed: ${label}`);
       wrapped.name = label;
       throw wrapped;
     }

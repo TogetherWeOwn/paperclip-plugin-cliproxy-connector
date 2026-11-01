@@ -51,6 +51,9 @@ const PLUGIN_QUOTA_SHAPE = /^\/v0\/management\/plugins\/[A-Za-z0-9][A-Za-z0-9_-]
  * backend substitutes the stored credential server-side (`resolveTokenForAuth`
  * — per-provider refresh/mint, including the JSON-escaped substitution inside
  * `data`), so the plugin never handles, logs or persists credential material.
+ * Provider-side behavior stays backend-owned: the connector sees only the
+ * returned envelope and cannot scope server-side substitution or any upstream
+ * redirect the backend follows.
  */
 export const API_CALL_PATH = "/v0/management/api-call";
 
@@ -74,6 +77,24 @@ export interface ApiCallTemplate {
 }
 
 /**
+ * Runtime-freeze one pinned template, including its nested headers object.
+ * The `as const` assertion is compile-time only; without this, a caller
+ * holding a returned template could mutate the shared table entry.
+ */
+function freezeApiCallTemplate(template: ApiCallTemplate): ApiCallTemplate {
+  Object.freeze(template.headers);
+  return Object.freeze(template);
+}
+
+/**
+ * Return a defensive copy of a frozen template: selections can read the
+ * pinned fields but cannot alter the shared frozen entry through the result.
+ */
+function copyApiCallTemplate(template: ApiCallTemplate): ApiCallTemplate {
+  return { ...template, headers: { ...template.headers } };
+}
+
+/**
  * The three pinned `api-call` templates (TWO-801). Frozen: callers select by
  * key (`ApiCallTemplateKey`) and can never supply their own URL, headers or
  * body, so the guarded POST below cannot send an arbitrary upstream request.
@@ -85,7 +106,12 @@ export interface ApiCallTemplate {
  *   reads from the downloaded auth file; the connector cannot download auth
  *   files (credential-bearing), so the template carries `Bearer $TOKEN$` and
  *   CLIProxy substitutes the stored meta credential server-side (backend
- *   `resolveTokenForAuth` → `resolveMetaToken`).
+ *   `resolveTokenForAuth` → `resolveMetaToken`). Known backend boundary: the
+ *   panel authorizes this exact call with the downloaded `dca_token`, and this
+ *   template preserves that request shape, but the connector cannot verify
+ *   which stored meta credential form the backend substitutes. An upstream
+ *   rejection warns per file and stays unknown; operator resync is the
+ *   verification. Backend DCA substitution would be follow-up work.
  * - Antigravity: the Code Assist subscription call (panel
  *   `src/services/api/antigravitySubscription.ts` `antigravitySubscriptionApi.get`
  *   with `ANTIGRAVITY_CODE_ASSIST_URL`, `ANTIGRAVITY_REQUEST_HEADERS` and
@@ -101,7 +127,7 @@ export interface ApiCallTemplate {
  *   `quota.signals` — which is why the connector saw nothing for Devin.
  */
 const API_CALL_TEMPLATES = {
-  meta: {
+  meta: freezeApiCallTemplate({
     provider: "meta",
     method: "POST",
     url: "https://api.meta.ai/muse-code/key",
@@ -112,8 +138,8 @@ const API_CALL_TEMPLATES = {
       "x-api-version": "1.0.0",
     },
     data: "{}",
-  },
-  antigravity: {
+  }),
+  antigravity: freezeApiCallTemplate({
     provider: "antigravity",
     method: "POST",
     url: "https://daily-cloudcode-pa.googleapis.com/v1internal:loadCodeAssist",
@@ -123,8 +149,8 @@ const API_CALL_TEMPLATES = {
       "User-Agent": "antigravity/hub/2.23.0 darwin/arm64",
     },
     data: '{"metadata":{"ideType":"ANTIGRAVITY"}}',
-  },
-  devin: {
+  }),
+  devin: freezeApiCallTemplate({
     provider: "devin",
     method: "POST",
     url: "https://server.codeium.com/exa.seat_management_pb.SeatManagementService/GetUserStatus",
@@ -133,18 +159,19 @@ const API_CALL_TEMPLATES = {
       "Connect-Protocol-Version": "1",
     },
     data: '{"metadata":{"ideName":"chisel","ideVersion":"3000.10.21","apiKey":"$TOKEN$","locale":"en","os":"darwin","extensionVersion":"3000.10.21","clientName":"chisel"}}',
-  },
+  }),
 } as const satisfies Record<string, ApiCallTemplate>;
+Object.freeze(API_CALL_TEMPLATES);
 
 export type ApiCallTemplateKey = keyof typeof API_CALL_TEMPLATES;
 
 /** Select a frozen template by key. Unknown keys reject before any network happens. */
 export function apiCallTemplate(key: string): ApiCallTemplate {
-  const template = (API_CALL_TEMPLATES as Record<string, ApiCallTemplate>)[key];
-  if (!template) {
+  if (!Object.prototype.hasOwnProperty.call(API_CALL_TEMPLATES, key)) {
     throw new CliproxyConfigError(`refusing an api-call request for an unknown provider: ${key}`);
   }
-  return template;
+  const template = (API_CALL_TEMPLATES as Record<string, ApiCallTemplate>)[key] as ApiCallTemplate;
+  return copyApiCallTemplate(template);
 }
 
 /** All pinned template keys (one per provider family served through `api-call`). */

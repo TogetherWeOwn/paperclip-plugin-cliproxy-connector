@@ -437,6 +437,35 @@ function makeLimit(init: {
   };
 }
 
+/**
+ * Emit an expected live window whose percent is missing or unusable. The row
+ * carries no usable percent, so aggregation treats it as unknown — and for an
+ * admission-signal provider as limiting (fail closed) — rather than letting
+ * a sibling usable window imply full coverage. The row still marks the window
+ * as expected, so it clears quota-blind when at least one gating window was
+ * expected.
+ */
+function makeUnknownProviderWindow(args: {
+  provider: "meta" | "devin";
+  id: string;
+  label: string;
+  observedAt: string | null;
+  allowList: string[];
+}): UsageLimitRow {
+  return makeLimit({
+    id: `${args.provider}:${args.id}`,
+    label: args.label,
+    usedPercent: null,
+    remainingPercent: null,
+    resetsAt: null,
+    limitReached: false,
+    allowed: null,
+    gating: isGatingWindow(args.provider, args.id, args.allowList),
+    observedAt: args.observedAt,
+    viaProviderApi: true,
+  });
+}
+
 /* ------------------------------------------------------------------ */
 /* plugin normalized quota shape                                       */
 /* ------------------------------------------------------------------ */
@@ -722,9 +751,8 @@ export type ApiCallProvider = "meta" | "antigravity" | "devin";
  * src/features/quota/providers/metaQuota.ts`): `used_percent` clamps to
  * 0–100, `resets_at` is epoch seconds (dropped when not positive), and the
  * duration is display context only. Returns null when the window carries no
- * usable percent — a percent-less window is skipped with a warning, never
- * emitted as an `allowed:null` row (which would read as limiting for
- * admission-signal providers and veto headroom everywhere else).
+ * usable percent; the caller converts that null into an explicit unknown
+ * window row, so a partial response cannot imply coverage it did not report.
  */
 function parseMetaWindow(
   id: "window" | "weekly",
@@ -796,7 +824,17 @@ export function parseMetaQuota(
   for (const id of ["window", "weekly"] as const) {
     const parsed = parseMetaWindow(id, usage[id], observedAt, allowList);
     if (!parsed) {
-      warnings.push(`meta: window ${JSON.stringify(id)} has no usable percent; skipping.`);
+      warnings.push(`meta: window ${JSON.stringify(id)} has no usable percent; marking it unknown.`);
+      const unknownWindow = makeUnknownProviderWindow({
+        provider: "meta",
+        id,
+        label: `meta ${id}`,
+        observedAt,
+        allowList,
+      });
+      limits.push(
+        inactive ? { ...unknownWindow, limitReached: true, allowed: false } : unknownWindow,
+      );
       continue;
     }
     limits.push(
@@ -828,6 +866,33 @@ function normalizeTier(value: unknown): { id: string | null; name: string | null
   const name = getStr(o, "name");
   if (!id && !name) return null;
   return { id, name };
+}
+
+/**
+ * Parse an Antigravity quota percent into 0–100 remaining. A trailing `%`
+ * means the digits are already a percent (`"42%"` → 42); a bare number or a
+ * string without `%` is a 0–1 fraction (`0.4` → 40). This distinction matters:
+ * stripping `%` without remembering it turns `"1%"` into 100%.
+ */
+function parseAntigravityRemainingPercent(value: unknown): number | null {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    if (value < 0 || value > 1.5) return null;
+    const fraction = value > 1 ? value / 100 : value;
+    return Math.max(0, Math.min(100, fraction * 100));
+  }
+  if (typeof value !== "string") return null;
+  const text = value.trim();
+  if (!text) return null;
+  const isPercent = text.endsWith("%");
+  const digits = (isPercent ? text.slice(0, -1) : text).trim();
+  if (!digits || !Number.isFinite(Number(digits))) return null;
+  const number = Number(digits);
+  if (isPercent) {
+    return number >= 0 && number <= 100 ? number : null;
+  }
+  if (number < 0 || number > 1.5) return null;
+  const fraction = number > 1 ? number / 100 : number;
+  return Math.max(0, Math.min(100, fraction * 100));
 }
 
 /**
@@ -877,6 +942,7 @@ export function parseAntigravitySubscription(
   // `AntigravityQuotaSummaryGroupPayload.buckets[]`).
   const limits: UsageLimitRow[] = [];
   const groups = Array.isArray(root.groups) ? root.groups : null;
+  const seenBucketWindows = new Map<string, number>();
   if (groups) {
     for (const g of groups) {
       const group = asObj(g);
@@ -895,30 +961,24 @@ export function parseAntigravitySubscription(
           warnings.push("antigravity: skipping a malformed quota bucket.");
           continue;
         }
-        const windowName =
+        const baseWindowName =
           getStr(bucket, "window", "window_name", "name", "id", "displayName", "display_name") ?? "window";
-        // `remainingFraction` 0–1 (panel `AntigravityQuotaSummaryBucketPayload`
-        // also allows a percent string such as `"42%"`).
-        const fracRaw: unknown =
-          bucket.remainingFraction ?? bucket.remaining_fraction ?? null;
-        let remaining: number | null = null;
-        if (typeof fracRaw === "number" && Number.isFinite(fracRaw)) {
-          remaining = fracRaw;
-        } else if (typeof fracRaw === "string" && fracRaw.trim()) {
-          const stripped = fracRaw.trim().replace(/%$/, "").trim();
-          if (stripped && Number.isFinite(Number(stripped))) remaining = Number(stripped);
-        }
-        let usedPercent: number | null = null;
-        let remainingPercent: number | null = null;
-        if (remaining !== null && remaining >= 0 && remaining <= 1.5) {
-          const frac = remaining > 1 ? remaining / 100 : remaining;
-          remainingPercent = Math.max(0, Math.min(100, frac * 100));
-          usedPercent = 100 - remainingPercent;
-        }
-        if (usedPercent === null || remainingPercent === null) {
+        // Identical upstream window names can repeat across groups. Rows are
+        // keyed by id, so disambiguate repeats rather than emitting duplicate
+        // ids (which would let one row overwrite or mask another downstream).
+        const repeats = seenBucketWindows.get(baseWindowName) ?? 0;
+        seenBucketWindows.set(baseWindowName, repeats + 1);
+        const windowName = repeats === 0 ? baseWindowName : `${baseWindowName}#${repeats + 1}`;
+        // `remainingFraction` is a 0–1 fraction, while a trailing `%` marks an
+        // already-percent string (`"42%"` → 42, not 0.42).
+        const remainingPercent = parseAntigravityRemainingPercent(
+          bucket.remainingFraction ?? bucket.remaining_fraction ?? null,
+        );
+        if (remainingPercent === null) {
           warnings.push(`antigravity: bucket ${JSON.stringify(windowName)} has no usable percent; skipping.`);
           continue;
         }
+        const usedPercent = 100 - remainingPercent;
         const exhausted = remainingPercent <= 0;
         limits.push(
           makeLimit({
@@ -929,7 +989,7 @@ export function parseAntigravitySubscription(
             resetsAt: toIsoTimestamp(bucket.resetTime ?? bucket.reset_time ?? null),
             limitReached: exhausted,
             allowed: exhausted ? false : true,
-            gating: isGatingWindow("antigravity", windowName, allowList),
+            gating: isGatingWindow("antigravity", baseWindowName, allowList),
             observedAt,
             viaProviderApi: true,
           }),
@@ -976,9 +1036,11 @@ function parseDevinUnixSeconds(value: unknown): string | null {
  * digits-only) and `{daily,weekly}QuotaResetAtUnix` (unix seconds), plus
  * `planInfo.planName`. This reads the live RPC — never auth-file metadata or
  * `quota.signals` — which is why the connector saw nothing for Devin before
- * TWO-801. Windows without a usable percent are skipped with a warning (an
- * `allowed:null` row would read as limiting for Devin); zero usable windows
- * is `empty_data`-equivalent: plan only, account stays unknown.
+ * TWO-801. An expected window without a usable percent is emitted as an
+ * explicit unknown row: for Devin's admission semantics that unknown is
+ * limiting (fail closed), so a partial response cannot leave a usable sibling
+ * as false headroom. Zero usable windows is `empty_data`-equivalent: plan
+ * only, account stays unknown.
  */
 export function parseDevinQuota(
   body: unknown,
@@ -1006,7 +1068,16 @@ export function parseDevinQuota(
   for (const window of ["daily", "weekly"] as const) {
     const remainingPercent = parseDevinPercent(status[`${window}QuotaRemainingPercent`]);
     if (remainingPercent === null) {
-      warnings.push(`devin: ${window} quota percent is unusable; skipping.`);
+      warnings.push(`devin: ${window} quota percent is unusable; marking it unknown.`);
+      limits.push(
+        makeUnknownProviderWindow({
+          provider: "devin",
+          id: window,
+          label: `devin ${window}`,
+          observedAt,
+          allowList,
+        }),
+      );
       continue;
     }
     const usedPercent = 100 - remainingPercent;
