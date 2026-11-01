@@ -216,6 +216,32 @@ describe("parseHeaderSignals (source-mirrored header maps)", () => {
     });
   });
 
+  it("tier windows never gate under the default codex allow-list: bare and namespaced agree", () => {
+    // Gating is an allow-list (time-window) decision, not a tier decision:
+    // `primary`/`secondary` tier names gate only when the operator lists them
+    // via providerWindows. Bare `primary` and namespaced `acme-primary` parse
+    // to the same non-gating window under defaults, so a stock Codex
+    // exhaustion signal aggregates to unknown (fail open), never headroom —
+    // the same verdict as when the headers were dropped pre-parse.
+    const expected = { allowed: false, limitReached: true, gating: false };
+    const bare = parseHeaderSignals(
+      "codex",
+      { "x-codex-primary-allowed": "false" },
+      NOW,
+      DEFAULT_PROVIDER_WINDOWS.codex,
+    );
+    expect(bare.limits).toHaveLength(1);
+    expect(bare.limits[0]).toMatchObject({ id: "codex:primary", ...expected });
+    const namespaced = parseHeaderSignals(
+      "codex",
+      { "x-codex-acme-primary-allowed": "false" },
+      NOW,
+      DEFAULT_PROVIDER_WINDOWS.codex,
+    );
+    expect(namespaced.limits).toHaveLength(1);
+    expect(namespaced.limits[0]).toMatchObject({ id: "codex:acme-primary", ...expected });
+  });
+
   it("reads codex used-percent on the 0–100 scale (1% is not exhaustion)", () => {
     for (const [raw, used] of [
       ["0", 0],
