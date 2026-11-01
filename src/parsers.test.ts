@@ -727,6 +727,20 @@ describe("sanitizeStatusMessage", () => {
     }
     expect(scrubbed).not.toContain("[redacted]");
   });
+
+  it("keeps fractional-second and offset timestamps out of the redactor", () => {
+    const scrubbed =
+      sanitizeStatusMessage("retry 2026-11-01T12:00:00.000Z, backoff 2026-11-01T12:00:00+00:00") ?? "";
+    expect(scrubbed).toContain("2026-11-01T12:00:00.000Z");
+    expect(scrubbed).toContain("2026-11-01T12:00:00+00:00");
+    expect(scrubbed).not.toContain("[redacted]");
+  });
+
+  it("redacts dotted credentials that hide behind an operational-looking label", () => {
+    const scrubbed = sanitizeStatusMessage("note sk.production.a1.b2 here") ?? "";
+    expect(scrubbed).not.toContain("sk.production.a1.b2");
+    expect(scrubbed).toContain("[redacted]");
+  });
 });
 
 describe("hashIdentity redaction", () => {

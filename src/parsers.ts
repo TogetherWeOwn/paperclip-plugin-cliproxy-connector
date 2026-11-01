@@ -134,16 +134,22 @@ export function sanitizeStatusMessage(raw: string | null): string | null {
  * redacts). Dots stay inside the slug judgment as version separators
  * (`claude-3.5-sonnet` keeps), with a per-segment fallback for hostnames and
  * dotted versions (`s3.amazonaws.com`, `v1.2.3-beta1` keep) that still rejects
- * dotted credentials (`sk.live.a1.b2` redacts). Timestamps are exempted only
- * when the whole token is a date/time (`2026-11-01T12:00Z` keeps), so a date
- * substring cannot launder attached secret material (`sk-2026-11-01-ab12`
- * redacts).
+ * dotted credentials (`sk.live.a1.b2` redacts). A strong dot-segment cannot
+ * launder a secret-shaped token: a leading secret marker (`sk`, `secret`,
+ * `token`, …) or two flat letter-digit fragments (`a1`, `b2`) deny the
+ * hostname/version fallback, so `sk.production.a1.b2` redacts while
+ * `s3.amazonaws.com` (one flat fragment) and `v1.2.3-beta1` (a hyphenated
+ * prerelease part plus a bare version number) keep. Timestamps are exempted
+ * only when the whole token is a date/time, fractional seconds and numeric
+ * offsets included (`2026-11-01T12:00:00.000Z` and `...+00:00` keep), so a
+ * date substring cannot launder attached secret material
+ * (`sk-2026-11-01-ab12` redacts).
  */
 function isOperationalToken(tok: string): boolean {
   const eq = tok.lastIndexOf("=");
   if (eq >= 0) return !isCredentialCore(tok.slice(eq + 1));
   if (
-    /^\d{4}-\d{2}-\d{2}([T ]\d{2}:\d{2}(:\d{2})?Z?)?$/.test(tok) ||
+    /^\d{4}-\d{2}-\d{2}([T ]\d{2}:\d{2}(:\d{2}(\.\d+)?)?(Z|[+-]\d{2}:?\d{2})?)?$/.test(tok) ||
     /^\d{2}:\d{2}(:\d{2})?$/.test(tok)
   )
     return true;
@@ -153,6 +159,18 @@ function isOperationalToken(tok: string): boolean {
     if (isSlugLike(tok.replace(/\./g, "-"), 1)) return true;
     const segs = tok.split(".");
     if (segs.some((seg) => isCredentialCore(seg))) return false;
+    // A secret marker up front (`sk`, `secret`, `token`, …) means the rest
+    // of the labels are key material, not a hostname — however
+    // operational one of them looks on its own (`production`).
+    if (segs.length > 1 && SECRET_DOT_PREFIX.test(segs[0] ?? "")) return false;
+    // Segmented secrets spread entropy across several flat letter-digit
+    // labels (`a1.b2`); hostnames carry at most one (`s3`), and dotted
+    // versions structure theirs (`3-beta1`). Two or more flat mixed labels
+    // deny the fallback.
+    const flatMixed = segs.filter(
+      (seg) => !seg.includes("-") && /[a-zA-Z]/.test(seg) && /[0-9]/.test(seg),
+    );
+    if (flatMixed.length >= 2) return false;
     return segs.some(isStrongDotPart);
   }
   if (/[/:]/.test(tok)) return !tok.split(/[/:]/).some((seg) => isCredentialCore(seg));
@@ -168,6 +186,15 @@ function isCredentialCore(core: string): boolean {
     !isOperationalToken(core)
   );
 }
+
+/**
+ * A leading dot-segment that marks a dotted token as secret-shaped: the
+ * usual key-material prefixes. Common subdomain words (`api`, `auth`) are
+ * deliberately absent — `api.example.com` keeps via the slug judgment or
+ * the fallback, and must not redact.
+ */
+const SECRET_DOT_PREFIX =
+  /^(sk|secret|secrets|key|keys|token|tokens|bearer|session|password|passwd|pwd|private|credentials?)$/i;
 
 /**
  * A dot-separated segment that marks a dotted token operational on its own:
