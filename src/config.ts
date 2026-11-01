@@ -264,9 +264,12 @@ export function parseConfig(raw: unknown): { config: ConnectorConfig; validation
     }
   }
 
-  // v2: one plugin quota route per provider (not per account). The fetched
-  // windows are attached to every enabled account row of that provider with
-  // the sync fetch time as their observation.
+  // v2: one plugin quota route per provider (not per account). Each fetch
+  // carries the credential's `auth_index` (required since CLIProxy v8.0.49),
+  // so the fetched windows attach to their own account row — not to every
+  // row of the provider — with the sync fetch time as their observation.
+  // Entries without an `auth_index` (older builds) keep one provider-level
+  // fetch. Failed quota fetches are best-effort and never spend strikes.
   const pluginQuotaIds: Record<string, string> = {};
   const pluginQuotaIdsIn = (r.pluginQuotaIds ?? {}) as Record<string, unknown>;
   if (isPlainObject(pluginQuotaIdsIn)) {

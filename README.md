@@ -88,7 +88,10 @@ the operator. You read redacted output only.
    state (proposal §4.4).
 5. Add optional per-provider plugin quota routes (`pluginQuotaIds: { "claude": "<plugin id>" }`)
    for the five quota plugins (Synthetic, NIM, Cloudflare, z.ai, opencode-go); without one,
-   the provider routes on passive signals (or unknown).
+   the provider routes on passive signals (or unknown). Each fetch sends the credential's
+   `auth_index` from the `auth-files` list (`?auth_index=…`, required since CLIProxy
+   v8.0.49), so every account attaches its own file's quota; failed fetches are
+   best-effort and never spend strikes.
 6. Confirm the sync ran (plugin page shows one card per provider with its proven models),
    then run traffic — an all-cooling provider shows `exhausted` with the earliest reset as
    `retryAt`, and core wait/resume fires automatically.
@@ -117,14 +120,15 @@ the operator. You read redacted output only.
 | `maxAgeMultiplier` / `graceMultiplier` | `2` / `3` | Freshness = sync interval × 2; grace = freshness × 3. |
 | `providers` | `[]` | One `{ provider, connectionId, completeInventory }` row per CLIProxy provider family. The provider word is the raw auth-file string (e.g. `cloudflare-workers-ai`); any string is accepted, duplicates error, and a row that matches no accounts drift-warns as having zero enabled accounts. Empty warns. |
 | `providerWindows` | spike matrix §2 | Per-provider gating-window allow-lists (lowercased substrings). |
-| `pluginQuotaIds` | `{}` | CLIProxy plugin id per provider for quota fetch. |
+| `pluginQuotaIds` | `{}` | CLIProxy plugin id per provider for quota fetch. Fetched per auth file with its `auth_index` (v8.0.49+); entries without one keep one provider-level fetch. |
 | `audienceConfirmed` | `false` | Page shows upstream quota state; confirm the audience, then set `true`. |
 
 ## Endpoint assumptions
 
 The management paths are pinned in code (`/v0/management/auth-files`,
 `/v0/management/auth-files/models?name=<file>` and
-`/v0/management/plugins/<segment>/quota`) — there are deliberately no config knobs for
+`/v0/management/plugins/<segment>/quota` with exactly one `auth_index` query value,
+or no query on older builds) — there are deliberately no config knobs for
 them, and the management key is never sent to `/v1` paths. The served-model list has its
 own pinned path (`/v1/models`, `MODELS_PATH`) fetched with the separate client API key
 (Bearer auth) under the same guarded-fetch rules (loopback, manual redirects, timeouts,

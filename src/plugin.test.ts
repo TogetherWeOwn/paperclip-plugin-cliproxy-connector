@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createTestHarness } from "@paperclipai/plugin-sdk/testing";
 import manifest, {
+  LAST_ERROR_STATE_KEY,
   LAST_SYNC_STATE_KEY,
   PAGE_DATA_KEY,
   REENABLE_ACTION_KEY,
@@ -97,6 +98,21 @@ describe("sync job", () => {
     expect(rows[keys[0] as string]?.quotaBlind).toBe(false);
     const summary = harness.getState(stateKey(LAST_SYNC_STATE_KEY)) as { skipped: boolean };
     expect(summary.skipped).toBe(false);
+  });
+
+  it("a clean sync reports success and clears last-error (delete, never set-null)", async () => {
+    const { harness } = await setup();
+    // A previous failure is recorded under its own key…
+    harness.ctx.state.set(stateKey(LAST_ERROR_STATE_KEY), {
+      attemptedAt: "2026-11-01T11:00:00.000Z",
+      message: "sync failed: boom",
+    } as never);
+    await harness.runJob(SYNC_JOB_KEY);
+    const summary = harness.getState(stateKey(LAST_SYNC_STATE_KEY)) as { skipped: boolean };
+    expect(summary.skipped).toBe(false);
+    // …and the clean sync removes the key instead of writing null (the host
+    // rejects a null value_json, which used to surface as "sync failed").
+    expect(harness.getState(stateKey(LAST_ERROR_STATE_KEY))).toBeUndefined();
   });
 
   it("skips without probing when the company config is invalid", async () => {
