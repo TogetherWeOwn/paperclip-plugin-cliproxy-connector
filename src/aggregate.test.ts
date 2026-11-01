@@ -115,6 +115,34 @@ describe("aggregate truth table", () => {
     expect(a.freshness).toBe("expired");
   });
 
+  it("unknown: future-dated cache beyond the skew is missing, never fresh", () => {
+    const future = iso(NOW_MS + 3_600_000); // beyond default futureSkewSeconds (30 s)
+    const a = assess([row({ checkedAt: future })]);
+    expect(a.state).toBe("unknown");
+    expect(a.freshness).toBe("missing");
+  });
+
+  it("unknown: a healthy window plus an unknown window is unknown, never headroom", () => {
+    const r = row({
+      limits: [
+        limit(),
+        limit({
+          id: "claude:7d",
+          label: "Claude unified 7d",
+          usedPercent: null,
+          remainingPercent: null,
+          allowed: true,
+          resetsAt: null,
+          limitReached: false,
+          observedAt: NOW,
+        }),
+      ],
+    });
+    const a = assess([r]);
+    expect(a.state).toBe("unknown");
+    expect(a.headroomAccounts).toBe(0);
+  });
+
   it("exhausted: every enabled account cooling with future recovery → earliest retryAt", () => {
     const rows = [
       row({ key: "acct-a", coolingDown: true, cooldownUntil: iso(NOW_MS + 3 * 3_600_000), limits: [] }),

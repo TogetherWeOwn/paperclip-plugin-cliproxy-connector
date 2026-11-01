@@ -194,6 +194,46 @@ describe("parseHeaderSignals (source-mirrored header maps)", () => {
     expect(limits[0]?.resetsAt).not.toBeNull();
   });
 
+  it("parses the stock unnamespaced codex primary headers (never silently quota-blind)", () => {
+    const { limits } = parseHeaderSignals(
+      "codex",
+      {
+        "x-codex-primary-used-percent": "35",
+        "x-codex-primary-reset-at": String(Math.floor((NOW_MS + 3_600_000) / 1000)),
+        "x-codex-primary-allowed": "true",
+        "x-codex-plan-type": "plus",
+      },
+      NOW,
+      ["primary"],
+    );
+    expect(limits).toHaveLength(1);
+    expect(limits[0]).toMatchObject({
+      id: "codex:primary",
+      usedPercent: 35,
+      remainingPercent: 65,
+      allowed: true,
+      gating: true,
+    });
+  });
+
+  it("reads codex used-percent on the 0–100 scale (1% is not exhaustion)", () => {
+    for (const [raw, used] of [
+      ["0", 0],
+      ["1", 1],
+      ["1.5", 1.5],
+      ["35", 35],
+    ] as const) {
+      const { limits } = parseHeaderSignals(
+        "codex",
+        { "x-codex-5h-primary-used-percent": raw },
+        NOW,
+        ["5h-primary"],
+      );
+      expect(limits).toHaveLength(1);
+      expect(limits[0]).toMatchObject({ usedPercent: used, limitReached: false });
+    }
+  });
+
   it("a bare retry-after is an explicit 429 watermark for any provider", () => {
     const { limits } = parseHeaderSignals("meta", { "retry-after": "120" }, NOW, []);
     expect(limits).toHaveLength(1);
@@ -202,6 +242,7 @@ describe("parseHeaderSignals (source-mirrored header maps)", () => {
       remainingPercent: 0,
       limitReached: true,
       allowed: false,
+      gating: true,
       resetsAt: iso(NOW_MS + 120_000),
     });
   });
@@ -327,6 +368,18 @@ describe("parseAuthFiles (redacted fixture)", () => {
     expect(cooling?.coolingDown).toBe(true);
     expect(cooling?.cooldownUntil).toBe(iso(NOW_MS + 30 * 60_000));
     expect(accounts.find((a) => a.provider === "meta")?.status).toBe("disabled");
+  });
+
+  it("keeps a past next_retry_after so a lifted cooldown reads unknown, not out", () => {
+    const { accounts } = parse([
+      { id: "c-1", provider: "claude", unavailable: true, next_retry_after: iso(NOW_MS - 60_000) },
+    ]);
+    expect(accounts).toHaveLength(1);
+    expect(accounts[0]).toMatchObject({
+      status: "error",
+      coolingDown: true,
+      cooldownUntil: iso(NOW_MS - 60_000),
+    });
   });
 
   it("tags model_quotas windows with their model and keeps account-level windows model-free", () => {

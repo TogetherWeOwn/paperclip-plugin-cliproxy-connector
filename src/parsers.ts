@@ -449,8 +449,8 @@ export function parseHeaderSignals(
     }
     if (provider === "codex" && key === "x-codex-credits-balance") continue; // informational only
     if (provider === "codex" && key.endsWith("-limit-name")) {
-      const m = /^x-codex-(.*?)-(?:primary|secondary)-limit-name$/.exec(key);
-      if (m) acc(m[1] === "" ? "primary" : m[1]).labelExtra = value;
+      const m = /^x-codex-(?:(.*?)-)?(?:primary|secondary)-limit-name$/.exec(key);
+      if (m) acc(m[1] ? m[1] : "primary").labelExtra = value;
       continue;
     }
 
@@ -477,13 +477,20 @@ export function parseHeaderSignals(
       continue;
     }
     // Codex namespaced: x-codex-[<ns>-]<primary|secondary>-<metric>.
-    m = /^x-codex-(.*?)-(primary|secondary)-(used-percent|window-minutes|reset-at|reset-after-seconds|allowed|limit-reached|over-secondary-limit-percent)$/.exec(key);
+    // The namespace and its separator are one optional unit, so the stock
+    // unnamespaced `x-codex-primary-*` headers parse too (never silently
+    // quota-blind).
+    m = /^x-codex-(?:(.*?)-)?(primary|secondary)-(used-percent|window-minutes|reset-at|reset-after-seconds|allowed|limit-reached|over-secondary-limit-percent)$/.exec(key);
     if (m && (provider === "codex" || provider === "unknown-provider")) {
       const window = m[1] ? `${m[1]}-${m[2]}` : m[2];
       const a = acc(window);
       const metric = m[3];
       if (metric === "used-percent") {
-        const used = toUsedPercent(Number(value));
+        // Codex `used-percent` is already 0–100 (unlike Claude's fractional
+        // utilization): a nearly-unused account reads "1", never 100.
+        const direct = Number(value);
+        const used =
+          Number.isFinite(direct) && direct >= 0 && direct <= 150 ? direct : null;
         if (used !== null) a.used = Math.max(a.used ?? -Infinity, used);
         else ignored += 1;
       } else if (metric === "reset-at") {
@@ -550,7 +557,10 @@ export function parseHeaderSignals(
         resetsAt: new Date(resetMs).toISOString(),
         limitReached: true,
         allowed: false,
-        gating: isGatingWindow(provider, "retry-after", allowList),
+        // An explicit 429 watermark always limits, whatever the provider's
+        // quota-window allow-list names: it is evidence of throttling, not a
+        // quota window.
+        gating: true,
         observedAt,
         models: opts?.models ?? null,
       }),
@@ -907,7 +917,10 @@ export function parseAuthFiles(
         stableId,
       ]),
       coolingDown: unavailable,
-      cooldownUntil: retryFuture ? (nextRetryAfter as string) : null,
+      // Keep a past retry time: it lets the aggregator tell "cooldown lifted,
+      // no fresh telemetry" (unknown) apart from "no recovery bound at all"
+      // (out). Nulling it here dead-coded that branch and re-waited forever.
+      cooldownUntil: nextRetryAfter,
       parseWarnings: [...parseWarnings, ...(pluginQuota?.warnings ?? [])],
     });
   }
