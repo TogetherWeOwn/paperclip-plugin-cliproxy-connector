@@ -132,13 +132,29 @@ export function sanitizeStatusMessage(raw: string | null): string | null {
  * `:`/`/` tokens are operational only when no separated segment is itself
  * credential-shaped (`error=429` and `HTTP/1.1` keep; `token:ab12cd34ef`
  * redacts). Dots stay inside the slug judgment as version separators
- * (`claude-3.5-sonnet` keeps). Timestamps are exempted first so their
- * letter/digit segments (`2026-11-01T12`) never misfire.
+ * (`claude-3.5-sonnet` keeps), with a per-segment fallback for hostnames and
+ * dotted versions (`s3.amazonaws.com`, `v1.2.3-beta1` keep) that still rejects
+ * dotted credentials (`sk.live.a1.b2` redacts). Timestamps are exempted only
+ * when the whole token is a date/time (`2026-11-01T12:00Z` keeps), so a date
+ * substring cannot launder attached secret material (`sk-2026-11-01-ab12`
+ * redacts).
  */
 function isOperationalToken(tok: string): boolean {
   const eq = tok.lastIndexOf("=");
   if (eq >= 0) return !isCredentialCore(tok.slice(eq + 1));
-  if (/\d{4}-\d{2}-\d{2}/.test(tok) || /\d{2}:\d{2}:\d{2}/.test(tok)) return true;
+  if (
+    /^\d{4}-\d{2}-\d{2}([T ]\d{2}:\d{2}(:\d{2})?Z?)?$/.test(tok) ||
+    /^\d{2}:\d{2}(:\d{2})?$/.test(tok)
+  )
+    return true;
+  if (tok.includes(".")) {
+    // Judge the dotted token as one slug first, so version continuations
+    // (`5-sonnet` in `claude-3.5-sonnet`) are not mistaken for credentials.
+    if (isSlugLike(tok.replace(/\./g, "-"), 1)) return true;
+    const segs = tok.split(".");
+    if (segs.some((seg) => isCredentialCore(seg))) return false;
+    return segs.some(isStrongDotPart);
+  }
   if (/[/:]/.test(tok)) return !tok.split(/[/:]/).some((seg) => isCredentialCore(seg));
   return isSlugLike(tok.replace(/\./g, "-"));
 }
@@ -154,21 +170,34 @@ function isCredentialCore(core: string): boolean {
 }
 
 /**
+ * A dot-separated segment that marks a dotted token operational on its own:
+ * a real word (`amazonaws`) or a bare version number (`2`). Short entropy
+ * fragments (`a1`, `sk`) do not count.
+ */
+function isStrongDotPart(seg: string): boolean {
+  return /^[a-z]{5,}$/.test(seg) || /^[0-9]+$/.test(seg);
+}
+
+/**
  * Lowercase hyphenated slug (`gpt-4o-mini`) that is not credential-shaped.
  * Every non-initial segment must be a model-id part: a word (`mini`), a
  * small number (`4`, `70`), a leading run plus letters (`4o`, `70b`), or a
  * trailing single digit (`v3`, `o1`). Anything else — an internal digit run
  * (`abc123def`), a trailing run (`abc123`), interleaved alphanumerics
- * (`a1b2c3d4`) — reads as a credential and redacts. At most one segment may
- * mix letters and digits: model ids carry a single version-ish part, while
- * `sk-live-a1-b2-c3-d4` spreads its entropy across four.
+ * (`a1b2c3d4`) — reads as a credential and redacts. Mixed letter-digit
+ * segments may not outnumber the plain words: model ids are mostly words
+ * with version annotations (`gpt-4o-mini-v2` keeps), while segmented
+ * credentials spread their entropy across many mixed parts
+ * (`sk-live-a1-b2-c3-d4` redacts). Callers judging dotted tokens pass an
+ * explicit budget of 1, since dots already had their own fallback.
  */
-function isSlugLike(core: string): boolean {
+function isSlugLike(core: string, maxMixed?: number): boolean {
   const parts = core.split("-");
   if (parts.length < 2 || !/^[a-z]+$/.test(parts[0] as string)) return false;
   const rest = parts.slice(1) as string[];
   const mixed = rest.filter((seg) => /[a-z]/.test(seg) && /[0-9]/.test(seg));
-  if (mixed.length > 1) return false;
+  const budget = maxMixed ?? parts.filter((seg) => /^[a-z]+$/.test(seg)).length;
+  if (mixed.length > budget) return false;
   return rest.every(
     (seg) =>
       /^[a-z]+$/.test(seg) ||

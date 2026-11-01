@@ -689,6 +689,31 @@ describe("sanitizeStatusMessage", () => {
     expect(scrubbed).toContain("[redacted]");
   });
 
+  it("keeps multi-version model ids while redacting segmented credentials", () => {
+    const scrubbed =
+      sanitizeStatusMessage("model gpt-4o-mini-v2 unavailable, key sk-live-a1-b2-c3-d4 rejected") ?? "";
+    expect(scrubbed).toContain("gpt-4o-mini-v2");
+    expect(scrubbed).not.toContain("sk-live-a1-b2-c3-d4");
+    expect(scrubbed).toContain("[redacted]");
+  });
+
+  it("keeps dotted hostnames and versions but redacts dotted credentials", () => {
+    const scrubbed =
+      sanitizeStatusMessage("lookup s3.amazonaws.com failed, deploy v1.2.3-beta1 ready, note sk.live.a1.b2 here") ??
+      "";
+    expect(scrubbed).toContain("s3.amazonaws.com");
+    expect(scrubbed).toContain("v1.2.3-beta1");
+    expect(scrubbed).not.toContain("sk.live.a1.b2");
+    expect(scrubbed).toContain("[redacted]");
+  });
+
+  it("redacts date-shaped credentials while keeping bare timestamps", () => {
+    const scrubbed = sanitizeStatusMessage("key sk-2026-11-01-ab12 seen 2026-11-01T12:00Z") ?? "";
+    expect(scrubbed).not.toContain("sk-2026-11-01-ab12");
+    expect(scrubbed).toContain("2026-11-01T12:00Z");
+    expect(scrubbed).toContain("[redacted]");
+  });
+
   it("keeps dotted model ids and minute-precision timestamps out of the redactor", () => {
     const scrubbed =
       sanitizeStatusMessage("reset 2026-11-01T12:00Z for claude-3.5-sonnet, gemini-2.5-flash-lite, llama-3.1-70b-instruct") ?? "";
