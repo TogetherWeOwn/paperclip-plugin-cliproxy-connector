@@ -209,7 +209,9 @@ function assessAccount(
   }
 
   if (limiting.length > 0) return { kind: "out", resets: [] };
-  if (headroom) return { kind: "headroom" };
+  // Positive evidence on one window must not override missing evidence on
+  // another: mixed healthy/unknown is unknown, never headroom.
+  if (headroom && unknownWindows.length === 0) return { kind: "headroom" };
   return { kind: "unknown", reason: `no fresh verdict on ${unknownWindows.join(", ")}; unknown.` };
 }
 
@@ -253,12 +255,11 @@ export function aggregateProvider(args: {
   }
 
   // Cache age: the newest row fetch is the sync's fetch time; the oldest
-  // bounds trust. An expired cache is unknown, never a verdict.
-  const ages = enabled.map((r) => {
-    const t = parseTime(r.checkedAt);
-    return t === null ? null : nowMs - Math.min(t, nowMs);
-  });
-  if (ages.some((a) => a === null)) {
+  // bounds trust. An expired cache is unknown, never a verdict. Row fetch
+  // times go through the same future-skew rejection as window observations:
+  // a checkedAt beyond the skew is missing, never fresh.
+  const infos = enabled.map((r) => classifyFreshness(r.checkedAt, nowMs, maxAge, grace, futureSkewMs));
+  if (infos.some((i) => i.freshness === "missing")) {
     return {
       provider,
       model,
@@ -271,7 +272,7 @@ export function aggregateProvider(args: {
       reason: `telemetry for ${provider} has no usable fetch time; unknown.`,
     };
   }
-  const oldest = Math.max(...(ages as number[]));
+  const oldest = Math.max(...infos.map((i) => i.ageMs as number));
   const freshness: Freshness = oldest <= maxAge ? "fresh" : oldest <= grace ? "stale" : "expired";
   if (freshness === "expired") {
     return {

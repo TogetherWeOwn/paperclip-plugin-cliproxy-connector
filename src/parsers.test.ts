@@ -194,6 +194,130 @@ describe("parseHeaderSignals (source-mirrored header maps)", () => {
     expect(limits[0]?.resetsAt).not.toBeNull();
   });
 
+  it("parses the stock unnamespaced codex primary headers (never silently quota-blind)", () => {
+    const { limits } = parseHeaderSignals(
+      "codex",
+      {
+        "x-codex-primary-used-percent": "35",
+        "x-codex-primary-reset-at": String(Math.floor((NOW_MS + 3_600_000) / 1000)),
+        "x-codex-primary-allowed": "true",
+        "x-codex-plan-type": "plus",
+      },
+      NOW,
+      ["primary"],
+    );
+    expect(limits).toHaveLength(1);
+    expect(limits[0]).toMatchObject({
+      id: "codex:primary",
+      usedPercent: 35,
+      remainingPercent: 65,
+      allowed: true,
+      gating: true,
+    });
+  });
+
+  it("tier windows never gate under the default codex allow-list: bare and namespaced agree", () => {
+    // Gating is an allow-list (time-window) decision, not a tier decision:
+    // `primary`/`secondary` tier names gate only when the operator lists them
+    // via providerWindows. Bare `primary` and namespaced `acme-primary` parse
+    // to the same non-gating window under defaults, so a stock Codex
+    // exhaustion signal aggregates to unknown (fail open), never headroom —
+    // the same verdict as when the headers were dropped pre-parse.
+    const expected = { allowed: false, limitReached: true, gating: false };
+    const bare = parseHeaderSignals(
+      "codex",
+      { "x-codex-primary-allowed": "false" },
+      NOW,
+      DEFAULT_PROVIDER_WINDOWS.codex,
+    );
+    expect(bare.limits).toHaveLength(1);
+    expect(bare.limits[0]).toMatchObject({ id: "codex:primary", ...expected });
+    const namespaced = parseHeaderSignals(
+      "codex",
+      { "x-codex-acme-primary-allowed": "false" },
+      NOW,
+      DEFAULT_PROVIDER_WINDOWS.codex,
+    );
+    expect(namespaced.limits).toHaveLength(1);
+    expect(namespaced.limits[0]).toMatchObject({ id: "codex:acme-primary", ...expected });
+  });
+
+  it("a bare secondary limit-name labels the secondary window, not primary", () => {
+    const { limits } = parseHeaderSignals(
+      "codex",
+      {
+        "x-codex-secondary-used-percent": "35",
+        "x-codex-secondary-limit-name": "Plus",
+      },
+      NOW,
+      ["secondary"],
+    );
+    expect(limits).toHaveLength(1);
+    expect(limits[0]).toMatchObject({ id: "codex:secondary" });
+    expect(limits[0]?.label).toContain("Plus");
+  });
+
+  it("a namespaced limit-name labels its own tier window, not a phantom namespace window", () => {
+    const { limits } = parseHeaderSignals(
+      "codex",
+      {
+        "x-codex-acme-primary-used-percent": "10",
+        "x-codex-acme-primary-limit-name": "Plus",
+      },
+      NOW,
+      ["acme-primary"],
+    );
+    expect(limits).toHaveLength(1);
+    expect(limits[0]).toMatchObject({ id: "codex:acme-primary" });
+    expect(limits[0]?.label).toContain("Plus");
+  });
+
+  it("a limit-name alone emits no window (metadata is never quota evidence)", () => {
+    // A bare label for an allow-listed namespace must not fabricate an
+    // allowed:null row: for admission-signal providers that reads as
+    // limiting and would false-exhaust the account.
+    const { limits, warnings } = parseHeaderSignals(
+      "codex",
+      { "x-codex-weekly-primary-limit-name": "Plus" },
+      NOW,
+      DEFAULT_PROVIDER_WINDOWS.codex,
+    );
+    expect(limits).toHaveLength(0);
+    expect(warnings.length).toBeGreaterThan(0);
+  });
+
+  it("a reset timestamp alone emits no window (a bound without a reading is metadata)", () => {
+    // A lone reset-at for an allow-listed window would otherwise emit an
+    // allowed:null row, which reads as limiting for admission-signal
+    // providers and false-exhausts the account until the reset passes.
+    const { limits, warnings } = parseHeaderSignals(
+      "codex",
+      { "x-codex-weekly-primary-reset-at": String(Math.floor((NOW_MS + 3_600_000) / 1000)) },
+      NOW,
+      DEFAULT_PROVIDER_WINDOWS.codex,
+    );
+    expect(limits).toHaveLength(0);
+    expect(warnings.length).toBeGreaterThan(0);
+  });
+
+  it("reads codex used-percent on the 0–100 scale (1% is not exhaustion)", () => {
+    for (const [raw, used] of [
+      ["0", 0],
+      ["1", 1],
+      ["1.5", 1.5],
+      ["35", 35],
+    ] as const) {
+      const { limits } = parseHeaderSignals(
+        "codex",
+        { "x-codex-5h-primary-used-percent": raw },
+        NOW,
+        ["5h-primary"],
+      );
+      expect(limits).toHaveLength(1);
+      expect(limits[0]).toMatchObject({ usedPercent: used, limitReached: false });
+    }
+  });
+
   it("a bare retry-after is an explicit 429 watermark for any provider", () => {
     const { limits } = parseHeaderSignals("meta", { "retry-after": "120" }, NOW, []);
     expect(limits).toHaveLength(1);
@@ -202,6 +326,7 @@ describe("parseHeaderSignals (source-mirrored header maps)", () => {
       remainingPercent: 0,
       limitReached: true,
       allowed: false,
+      gating: true,
       resetsAt: iso(NOW_MS + 120_000),
     });
   });
@@ -327,6 +452,18 @@ describe("parseAuthFiles (redacted fixture)", () => {
     expect(cooling?.coolingDown).toBe(true);
     expect(cooling?.cooldownUntil).toBe(iso(NOW_MS + 30 * 60_000));
     expect(accounts.find((a) => a.provider === "meta")?.status).toBe("disabled");
+  });
+
+  it("keeps a past next_retry_after so a lifted cooldown reads unknown, not out", () => {
+    const { accounts } = parse([
+      { id: "c-1", provider: "claude", unavailable: true, next_retry_after: iso(NOW_MS - 60_000) },
+    ]);
+    expect(accounts).toHaveLength(1);
+    expect(accounts[0]).toMatchObject({
+      status: "error",
+      coolingDown: true,
+      cooldownUntil: iso(NOW_MS - 60_000),
+    });
   });
 
   it("tags model_quotas windows with their model and keeps account-level windows model-free", () => {
