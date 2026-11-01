@@ -209,7 +209,11 @@ function assessAccount(
   }
 
   if (limiting.length > 0) return { kind: "out", resets: [] };
-  if (headroom) return { kind: "headroom" };
+  // Positive headroom requires fresh evidence on EVERY applicable window: a
+  // single unknown window (missing or stale telemetry) vetoes headroom, or a
+  // healthy 5h reading would mask an exhausted 7d window.
+  if (headroom && unknownWindows.length === 0) return { kind: "headroom" };
+  if (headroom) return { kind: "unknown", reason: `fresh headroom on some windows but no fresh verdict on ${unknownWindows.join(", ")}; unknown.` };
   return { kind: "unknown", reason: `no fresh verdict on ${unknownWindows.join(", ")}; unknown.` };
 }
 
@@ -253,12 +257,11 @@ export function aggregateProvider(args: {
   }
 
   // Cache age: the newest row fetch is the sync's fetch time; the oldest
-  // bounds trust. An expired cache is unknown, never a verdict.
-  const ages = enabled.map((r) => {
-    const t = parseTime(r.checkedAt);
-    return t === null ? null : nowMs - Math.min(t, nowMs);
-  });
-  if (ages.some((a) => a === null)) {
+  // bounds trust. An expired cache is unknown, never a verdict. A fetch time
+  // later than now + future skew is rejected outright (same rule as
+  // classifyFreshness): otherwise a future-dated row stays "fresh" forever.
+  const checked = enabled.map((r) => parseTime(r.checkedAt));
+  if (checked.some((t) => t === null || (t as number) > nowMs + futureSkewMs)) {
     return {
       provider,
       model,
@@ -271,7 +274,7 @@ export function aggregateProvider(args: {
       reason: `telemetry for ${provider} has no usable fetch time; unknown.`,
     };
   }
-  const oldest = Math.max(...(ages as number[]));
+  const oldest = Math.max(...(checked as number[]).map((t) => nowMs - Math.min(t, nowMs)));
   const freshness: Freshness = oldest <= maxAge ? "fresh" : oldest <= grace ? "stale" : "expired";
   if (freshness === "expired") {
     return {
@@ -288,7 +291,11 @@ export function aggregateProvider(args: {
   }
 
   let headroomAccounts = 0;
-  const outResets: string[] = [];
+  // Per-account recovery bounds: an account recovers only when ALL of its
+  // limiting windows clear, so its bound is the LATEST required reset (not the
+  // earliest). The provider wakes when the FIRST account may have recovered,
+  // so the aggregate retry is the earliest per-account bound.
+  const perAccountBounds: number[] = [];
   let allOut = true;
   for (const row of enabled) {
     const verdict = assessAccount(row, model, nowMs, reserve, maxAge, grace, futureSkewMs);
@@ -296,19 +303,23 @@ export function aggregateProvider(args: {
       headroomAccounts += 1;
       allOut = false;
     } else if (verdict.kind === "out") {
-      // Limiting windows carry their resets in the row; collect the future
-      // ones as this account's recovery bound.
+      const bounds: number[] = [];
       for (const w of row.limits) {
         if (!w.gating || !windowAppliesToModel(w, model, provider)) continue;
         const resetMs = w.resetsAt ? parseTime(w.resetsAt) : null;
-        if ((w.allowed === false || w.limitReached) && resetMs !== null && resetMs > nowMs && w.resetsAt) {
-          outResets.push(w.resetsAt);
-        }
+        // Any limiting signal counts, including low-remaining windows whose
+        // `allowed` is still true: the account cannot route until they clear.
+        const limiting =
+          w.allowed === false || w.limitReached || (w.remainingPercent !== null && w.remainingPercent <= reserve);
+        if (limiting && resetMs !== null && resetMs > nowMs) bounds.push(resetMs);
       }
       if (row.cooldownUntil) {
         const untilMs = parseTime(row.cooldownUntil);
-        if (untilMs !== null && untilMs > nowMs) outResets.push(row.cooldownUntil);
+        if (untilMs !== null && untilMs > nowMs) bounds.push(untilMs);
       }
+      // An out account with no future bound still re-wakes at the recheck
+      // cadence so exhaustion never waits forever on a missing reset.
+      perAccountBounds.push(bounds.length > 0 ? Math.max(...bounds) : nowMs + config.recheckSeconds * 1000);
     } else {
       allOut = false;
     }
@@ -328,9 +339,7 @@ export function aggregateProvider(args: {
     };
   }
   if (allOut && args.completeInventory) {
-    const future = outResets
-      .map((r) => parseTime(r))
-      .filter((t): t is number => t !== null && t > nowMs);
+    const future = perAccountBounds.filter((t) => t > nowMs);
     let retryAt =
       future.length > 0
         ? new Date(Math.min(...future)).toISOString()

@@ -30,7 +30,7 @@ import {
   parseModelsPayload,
   type ServedModel,
 } from "./models.js";
-import { parseAuthFiles, type ParsedAccount } from "./parsers.js";
+import { hashIdentity, parseAuthFiles, type ParsedAccount } from "./parsers.js";
 import type {
   AccountUsageRow,
   DriftFinding,
@@ -274,6 +274,15 @@ export async function runSync(deps: SyncDeps, inFlight: { running: boolean }): P
       const quotaAccounts = accounts.filter(
         (a) => a.status !== "disabled" && !(a.fileName && servedSets.okFiles.has(a.fileName)),
       );
+      // The `owned_by` fallback must not let a provider without credential
+      // evidence claim catalog ids: a disabled Claude file would let
+      // `anthropic` claim a model only Antigravity can serve, hiding
+      // Antigravity's usable model as an overlap. Namespace attribution still
+      // uses the full scope (including configured rows); only the `owned_by`
+      // fallback requires an enabled account with no live evidence.
+      const ownedByEligible = [
+        ...new Set(accounts.filter((a) => a.status !== "disabled").map((a) => a.provider)),
+      ];
       const derivation = deriveProviderModels(catalog.served, {
         authProviders: [
           ...new Set([
@@ -281,6 +290,7 @@ export async function runSync(deps: SyncDeps, inFlight: { running: boolean }): P
             ...deps.config.providers.map((p) => p.provider),
           ]),
         ],
+        ownedByEligible,
         observedKeysByProvider: observedModelKeysByProvider(quotaAccounts),
         servedByProvider: servedSets.byProvider,
         liveOkProviders: [...servedSets.okProviders],
@@ -399,6 +409,9 @@ async function fetchServedSets(
   let ok = 0;
   let notFound = 0;
   for (const [name, providers] of [...providersByName.entries()].sort()) {
+    // Auth-file names can be emails: never persist them raw in warnings.
+    // The short hash distinguishes files for debugging without leaking PII.
+    const fileRef = `auth file ${hashIdentity([name])?.slice(0, 8) ?? "unknown"}`;
     let payload: unknown;
     try {
       payload = await client.getAuthFileModels(name);
@@ -407,12 +420,12 @@ async function fetchServedSets(
       if (err instanceof CliproxyNotFoundError) {
         notFound += 1;
         warnings.push(
-          `${[...providers].sort().join(", ")}: served-set fetch for auth file ${JSON.stringify(name)} returned 404; no served evidence from this file this run.`,
+          `${[...providers].sort().join(", ")}: served-set fetch for ${fileRef} returned 404; no served evidence from this file this run.`,
         );
         continue;
       }
       warnings.push(
-        `${[...providers].sort().join(", ")}: served-set fetch for auth file ${JSON.stringify(name)} failed (${err instanceof Error ? err.message : "fetch failed"}); no served evidence from this file this run.`,
+        `${[...providers].sort().join(", ")}: served-set fetch for ${fileRef} failed (${err instanceof Error ? err.message : "fetch failed"}); no served evidence from this file this run.`,
       );
       continue;
     }
@@ -424,7 +437,7 @@ async function fetchServedSets(
     okFiles.add(name);
     for (const provider of providers) okProviders.add(provider);
     for (const w of parsed.warnings) {
-      warnings.push(`${[...providers].sort().join(", ")} served set (${JSON.stringify(name)}): ${w}`);
+      warnings.push(`${[...providers].sort().join(", ")} served set (${fileRef}): ${w}`);
     }
     for (const m of parsed.models) {
       for (const provider of providers) {

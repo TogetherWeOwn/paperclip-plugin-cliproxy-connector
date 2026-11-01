@@ -84,7 +84,10 @@ export const DEFAULTS = {
  */
 export const DEFAULT_PROVIDER_WINDOWS: Record<string, string[]> = {
   claude: ["5h", "7d", "unified"],
-  codex: ["codex", "5h", "weekly"],
+  // Stock CLIProxy Codex headers carry bare `primary` / `secondary` windows
+  // (`x-codex-primary-used-percent`) alongside namespaced ones (`5h-primary`):
+  // both must gate, or stock quotas never constrain routing.
+  codex: ["codex", "5h", "weekly", "primary", "secondary"],
   devin: ["devin", "5h", "weekly"],
   synthetic: ["weekly", "rolling-5h", "5h", "subscription"],
   "nvidia-nim": ["rpm", "minute"],

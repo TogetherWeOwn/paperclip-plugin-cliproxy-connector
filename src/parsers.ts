@@ -90,6 +90,23 @@ export function toIsoTimestamp(v: unknown): string | null {
   return new Date(ms).toISOString();
 }
 
+/**
+ * Scrub an upstream `status_message` before it reaches the plugin page.
+ * Emails become `[redacted-email]`, long identifier-like tokens become
+ * `[redacted]`, and the note is capped at 120 chars. Short operational notes
+ * ("ok", "429 rate limited") pass through unchanged.
+ */
+export function sanitizeStatusMessage(raw: string | null): string | null {
+  if (!raw) return null;
+  let s = raw.trim();
+  if (!s) return null;
+  s = s.replace(/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g, "[redacted-email]");
+  // Long bearer/token-like runs (20+ word chars) are never operational notes.
+  s = s.replace(/[A-Za-z0-9_\-]{20,}/g, "[redacted]");
+  if (s.length > 120) s = `${s.slice(0, 117)}...`;
+  return s;
+}
+
 /** Opaque sha256 of an upstream account identity. Null when there is nothing to hash. */
 export function hashIdentity(parts: Array<string | null | undefined>): string | null {
   const joined = parts
@@ -449,8 +466,8 @@ export function parseHeaderSignals(
     }
     if (provider === "codex" && key === "x-codex-credits-balance") continue; // informational only
     if (provider === "codex" && key.endsWith("-limit-name")) {
-      const m = /^x-codex-(.*?)-(?:primary|secondary)-limit-name$/.exec(key);
-      if (m) acc(m[1] === "" ? "primary" : m[1]).labelExtra = value;
+      const m = /^x-codex-(?:(.*?)-)?(primary|secondary)-limit-name$/.exec(key);
+      if (m) acc(m[1] ? `${m[1]}-${m[2]}` : m[2]).labelExtra = value;
       continue;
     }
 
@@ -477,13 +494,17 @@ export function parseHeaderSignals(
       continue;
     }
     // Codex namespaced: x-codex-[<ns>-]<primary|secondary>-<metric>.
-    m = /^x-codex-(.*?)-(primary|secondary)-(used-percent|window-minutes|reset-at|reset-after-seconds|allowed|limit-reached|over-secondary-limit-percent)$/.exec(key);
+    m = /^x-codex-(?:(.*?)-)?(primary|secondary)-(used-percent|window-minutes|reset-at|reset-after-seconds|allowed|limit-reached|over-secondary-limit-percent)$/.exec(key);
     if (m && (provider === "codex" || provider === "unknown-provider")) {
       const window = m[1] ? `${m[1]}-${m[2]}` : m[2];
       const a = acc(window);
       const metric = m[3];
       if (metric === "used-percent") {
-        const used = toUsedPercent(Number(value));
+        // Codex reports 0-100 percent directly (unlike Claude's 0-1
+        // utilization fraction): never route through toUsedPercent, which
+        // would turn 1% into 100%.
+        const n = Number(value);
+        const used = Number.isFinite(n) && n >= 0 && n <= 100 ? n : null;
         if (used !== null) a.used = Math.max(a.used ?? -Infinity, used);
         else ignored += 1;
       } else if (metric === "reset-at") {
@@ -550,7 +571,10 @@ export function parseHeaderSignals(
         resetsAt: new Date(resetMs).toISOString(),
         limitReached: true,
         allowed: false,
-        gating: isGatingWindow(provider, "retry-after", allowList),
+        // An explicit 429 watermark gates for every provider: it is an
+        // admission signal, not a provider window name, so the allow-list
+        // (which carries window substrings like "5h") must not filter it.
+        gating: true,
         observedAt,
         models: opts?.models ?? null,
       }),
@@ -753,7 +777,11 @@ export function parseAuthFiles(
           ? "cooling"
           : "error"
         : "active";
-    const statusMessage = getStr(entry, "status_message", "statusMessage", "StatusMessage");
+    // Upstream text can carry account identifiers: never persist it raw.
+    // Keep a short operational note with emails and long tokens stripped.
+    const statusMessage = sanitizeStatusMessage(
+      getStr(entry, "status_message", "statusMessage", "StatusMessage"),
+    );
     const priorityRaw = entry.priority ?? entry.Priority ?? null;
     const priority =
       typeof priorityRaw === "number" && Number.isFinite(priorityRaw)
@@ -907,7 +935,11 @@ export function parseAuthFiles(
         stableId,
       ]),
       coolingDown: unavailable,
-      cooldownUntil: retryFuture ? (nextRetryAfter as string) : null,
+      // Keep the parsed retry time even when it has passed: the aggregator
+      // needs the past timestamp to tell "cooldown lifted → unknown" from
+      // "unavailable with no retry time → out with no bound". Dropping it
+      // here made every lifted cooldown stay exhausted forever.
+      cooldownUntil: unavailable ? nextRetryAfter : null,
       parseWarnings: [...parseWarnings, ...(pluginQuota?.warnings ?? [])],
     });
   }

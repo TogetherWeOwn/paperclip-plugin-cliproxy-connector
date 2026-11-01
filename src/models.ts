@@ -196,6 +196,14 @@ export function deriveProviderModels(
      * covers providers without live evidence.
      */
     liveOkProviders?: string[];
+    /**
+     * Lowercase providers eligible to claim via the `owned_by` fallback:
+     * enabled discovered providers (at least one non-disabled account). A
+     * disabled or configured-but-accountless provider has no credential
+     * evidence and must not claim through `owned_by`. Defaults to the full
+     * scope when omitted (callers without credential data).
+     */
+    ownedByEligible?: string[];
   },
 ): { providerModels: Record<string, string[]>; overlaps: ModelOverlap[]; warnings: string[] } {
   const warnings: string[] = [];
@@ -239,8 +247,15 @@ export function deriveProviderModels(
     const ownedInScope = ownedBy ? providerForOwnedBy(ownedBy, inScope) : null;
     // Live membership supersedes the fallback: a provider whose served set
     // answered successfully never claims via `owned_by` (its live set — even
-    // an empty one — already says what it serves).
-    const ownedClaimed = ownedInScope && !liveOk.has(ownedInScope) ? ownedInScope : null;
+    // an empty one — already says what it serves). Providers without an
+    // enabled account never claim via `owned_by` either: a disabled or
+    // accountless provider's fallback claim would fabricate overlaps that
+    // hide the actually-serving provider's usable model.
+    const eligible = opts.ownedByEligible ? new Set(opts.ownedByEligible.map((p) => p.toLowerCase())) : null;
+    const ownedClaimed =
+      ownedInScope && !liveOk.has(ownedInScope) && (!eligible || eligible.has(ownedInScope))
+        ? ownedInScope
+        : null;
     const parties = [...new Set([...claimants, ...(ownedClaimed ? [ownedClaimed] : [])])].sort();
     if (parties.length === 1) {
       give(parties[0] as string, id);

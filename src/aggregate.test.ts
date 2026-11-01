@@ -141,6 +141,57 @@ describe("aggregate truth table", () => {
     expect(a.retryAt).toBe(iso(NOW_MS + 2 * 3_600_000));
   });
 
+  it("unknown: one healthy window plus one unknown window is never headroom", () => {
+    const r = row({
+      limits: [
+        limit({ observedAt: NOW }), // fresh 5h headroom
+        // 7d reports allowed with no usable percent: no evidence either way.
+        limit({
+          id: "claude:7d",
+          usedPercent: null,
+          remainingPercent: null,
+          allowed: true,
+          limitReached: false,
+          observedAt: NOW,
+        }),
+      ],
+    });
+    const a = assess([r]);
+    expect(a.state).toBe("unknown");
+    expect(a.headroomAccounts).toBe(0);
+  });
+
+  it("exhausted: one account out on both 5h and 7d waits for the later reset", () => {
+    const r = row({
+      key: "acct-a",
+      limits: [
+        limit({ remainingPercent: 0, usedPercent: 100, limitReached: true, resetsAt: iso(NOW_MS + 1 * 3_600_000) }),
+        limit({
+          id: "claude:7d",
+          label: "Claude unified 7d",
+          usedPercent: 100,
+          remainingPercent: 0,
+          resetsAt: iso(NOW_MS + 5 * 3_600_000),
+          limitReached: true,
+          allowed: false,
+          gating: true,
+          observedAt: NOW,
+          models: null,
+        }),
+      ],
+    });
+    const a = assess([r]);
+    expect(a.state).toBe("exhausted");
+    expect(a.retryAt).toBe(iso(NOW_MS + 5 * 3_600_000));
+  });
+
+  it("unknown: a future-dated fetch time is rejected, never trusted", () => {
+    const r = row({ checkedAt: iso(NOW_MS + 3_600_000) });
+    const a = assess([r]);
+    expect(a.state).toBe("unknown");
+    expect(a.freshness).toBe("missing");
+  });
+
   it("unknown + waitResumeOff: all out but inventory unconfirmed → never wait", () => {
     const rows = [
       row({ key: "acct-a", coolingDown: true, cooldownUntil: iso(NOW_MS + 3_600_000), limits: [] }),

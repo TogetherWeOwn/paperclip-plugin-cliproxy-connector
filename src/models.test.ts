@@ -221,6 +221,25 @@ describe("deriveProviderModels", () => {
     expect(overlaps).toEqual([{ id: "shared-bare-model", providers: ["claude", "codex"] }]);
   });
 
+  it("a disabled provider cannot claim via owned_by and hide the serving provider", () => {
+    // Disabled Claude plus enabled Antigravity, catalog owned_by: anthropic.
+    // Without the eligibility gate both claim claude-sonnet-4-6 and the id
+    // becomes an overlap, hiding Antigravity's usable model. With it, only
+    // Antigravity (enabled, with credential evidence) claims.
+    const served = parseModelsPayload({ data: [{ id: "claude-sonnet-4-6", owned_by: "anthropic" }] }).models;
+    const { providerModels, overlaps } = deriveProviderModels(served, {
+      authProviders: ["claude", "antigravity"],
+      observedKeysByProvider: new Map(),
+      // Antigravity's live served set proves it serves the id; Claude is
+      // disabled, so only Antigravity may claim through the fallback path.
+      servedByProvider: new Map([["antigravity", new Set(["claude-sonnet-4-6"])]]),
+      ownedByEligible: ["antigravity"],
+    });
+    expect(providerModels.antigravity).toEqual(["claude-sonnet-4-6"]);
+    expect(providerModels.claude ?? []).not.toContain("claude-sonnet-4-6");
+    expect(overlaps).toEqual([]);
+  });
+
   it("leaves an unattributable bare id out with a warning, never headroom", () => {
     const served = parseModelsPayload({ data: [{ id: "mystery-model" }] }).models;
     const { providerModels, overlaps, warnings } = deriveProviderModels(served, {

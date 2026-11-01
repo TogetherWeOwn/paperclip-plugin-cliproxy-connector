@@ -179,6 +179,29 @@ describe("happy path", () => {
     expect(summary.drift.find((d) => d.kind === "no-enabled-accounts")?.provider).toBe("meta");
   });
 
+  it("never leaks email-style auth-file names into page warnings", async () => {
+    const emailName = "user@example.com.json";
+    const fetchEmail = vi.fn(async (input: string | URL | Request): Promise<Response> => {
+      const url = new URL(String(input));
+      if (url.pathname === "/v0/management/auth-files") {
+        return jsonResponse(200, [{ id: "claude-1", name: emailName, provider: "claude" }]);
+      }
+      if (url.pathname === "/v0/management/auth-files/models") {
+        return new Response("boom", { status: 500 });
+      }
+      if (url.pathname.includes("/plugins/")) return jsonResponse(200, pluginQuotaBody());
+      return new Response("not found", { status: 404 });
+    });
+    const s = store();
+    const summary = await runSync(deps(s, fetchEmail as unknown as typeof fetch), { running: false });
+    expect(summary.skipped).toBe(false);
+    const blob = JSON.stringify([summary.errors, summary.drift, s.activity]);
+    expect(blob).not.toContain("user@example.com");
+    expect(blob).not.toContain(emailName);
+    expect(summary.errors.some((e) => e.includes("auth file"))).toBe(true);
+    assertNoKeyLeak(s);
+  });
+
   it("attaches the per-provider plugin quota to every enabled account of that provider", async () => {
     const s = store();
     await runSync(deps(s, mockFetch() as unknown as typeof fetch), { running: false });

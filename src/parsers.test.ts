@@ -8,6 +8,7 @@ import {
   parseHeaderSignals,
   parseLegacySignalList,
   parsePluginQuota,
+  sanitizeStatusMessage,
 } from "./parsers.js";
 import { DEFAULT_PROVIDER_WINDOWS } from "./config.js";
 
@@ -124,7 +125,9 @@ describe("provider normalization (parser keys only, never identity)", () => {
 
   it("gating matches allow-list substrings, case-insensitive", () => {
     expect(isGatingWindow("claude", "5h", ["5H"])).toBe(true);
-    expect(isGatingWindow("codex", "primary", DEFAULT_PROVIDER_WINDOWS.codex)).toBe(false);
+    // Stock `x-codex-primary-*` windows gate: without this, stock Codex
+    // quotas never constrain routing.
+    expect(isGatingWindow("codex", "primary", DEFAULT_PROVIDER_WINDOWS.codex)).toBe(true);
     expect(isGatingWindow("codex", "weekly-primary", DEFAULT_PROVIDER_WINDOWS.codex)).toBe(true);
   });
 });
@@ -204,6 +207,54 @@ describe("parseHeaderSignals (source-mirrored header maps)", () => {
       allowed: false,
       resetsAt: iso(NOW_MS + 120_000),
     });
+  });
+
+  it("a retry-after cooldown always gates, even under default windows", () => {
+    // The default allow-lists carry window substrings ("5h", …), never
+    // "retry-after": an explicit 429 watermark must still gate routing.
+    const { limits } = parseHeaderSignals(
+      "claude",
+      { "retry-after": "120" },
+      NOW,
+      DEFAULT_PROVIDER_WINDOWS.claude,
+    );
+    expect(limits).toHaveLength(1);
+    expect(limits[0]?.gating).toBe(true);
+  });
+
+  it("parses stock unnamespaced codex primary/secondary headers", () => {
+    const resetAt = String(Math.floor((NOW_MS + 3_600_000) / 1000));
+    const { limits, warnings } = parseHeaderSignals(
+      "codex",
+      {
+        "x-codex-primary-used-percent": "100",
+        "x-codex-primary-reset-at": resetAt,
+        "x-codex-primary-allowed": "false",
+      },
+      NOW,
+      DEFAULT_PROVIDER_WINDOWS.codex,
+    );
+    expect(warnings).toEqual([]);
+    expect(limits).toHaveLength(1);
+    expect(limits[0]).toMatchObject({
+      id: "codex:primary",
+      usedPercent: 100,
+      remainingPercent: 0,
+      allowed: false,
+      limitReached: true,
+      gating: true,
+    });
+  });
+
+  it("parses codex used-percent on the 0-100 scale (1% stays 1%)", () => {
+    const { limits } = parseHeaderSignals(
+      "codex",
+      { "x-codex-primary-used-percent": "1" },
+      NOW,
+      DEFAULT_PROVIDER_WINDOWS.codex,
+    );
+    expect(limits).toHaveLength(1);
+    expect(limits[0]).toMatchObject({ id: "codex:primary", usedPercent: 1, remainingPercent: 99 });
   });
 
   it("unknown signal keys are ignored with a summary warning, never headroom", () => {
@@ -329,6 +380,22 @@ describe("parseAuthFiles (redacted fixture)", () => {
     expect(accounts.find((a) => a.provider === "meta")?.status).toBe("disabled");
   });
 
+  it("keeps a past retry time so a lifted cooldown reads unknown, not exhausted", () => {
+    const { accounts } = parse([
+      {
+        id: "lifted-1",
+        provider: "claude",
+        disabled: false,
+        unavailable: true,
+        next_retry_after: iso(NOW_MS - 60_000),
+      },
+    ]);
+    expect(accounts).toHaveLength(1);
+    expect(accounts[0]?.coolingDown).toBe(true);
+    expect(accounts[0]?.cooldownUntil).toBe(iso(NOW_MS - 60_000));
+    expect(accounts[0]?.status).toBe("error");
+  });
+
   it("tags model_quotas windows with their model and keeps account-level windows model-free", () => {
     const { accounts } = parse();
     const claude = accounts.find((a) => a.accountHash && a.limits.some((l) => l.models !== null));
@@ -424,6 +491,22 @@ describe("parsePluginQuota", () => {
     const { limits, warnings } = parsePluginQuota("synthetic", "nope", ["weekly"]);
     expect(limits).toHaveLength(0);
     expect(warnings.length).toBeGreaterThan(0);
+  });
+});
+
+describe("sanitizeStatusMessage", () => {
+  it("keeps short operational notes unchanged", () => {
+    expect(sanitizeStatusMessage("ok")).toBe("ok");
+    expect(sanitizeStatusMessage("429 rate limited")).toBe("429 rate limited");
+    expect(sanitizeStatusMessage(null)).toBeNull();
+  });
+
+  it("redacts emails and long tokens instead of leaking them to the page", () => {
+    const scrubbed = sanitizeStatusMessage("quota exceeded for user@example.com, token abcdefghijklmnopqrstu") ?? "";
+    expect(scrubbed).not.toContain("user@example.com");
+    expect(scrubbed).not.toContain("abcdefghijklmnopqrstu");
+    expect(scrubbed).toContain("[redacted-email]");
+    expect(scrubbed).toContain("[redacted]");
   });
 });
 
