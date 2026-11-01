@@ -750,6 +750,15 @@ describe("sanitizeStatusMessage", () => {
     expect(scrubbed).not.toContain("sk.production.a1.b2");
     expect(scrubbed).toContain("[redacted]");
   });
+
+  it("redacts segmented credentials that end on a payload word", () => {
+    const scrubbed =
+      sanitizeStatusMessage("deploy v1.2.3rc1 on s3.us2.amazonaws.com, note a1.b2.production here") ?? "";
+    expect(scrubbed).not.toContain("a1.b2.production");
+    expect(scrubbed).toContain("[redacted]");
+    expect(scrubbed).toContain("v1.2.3rc1");
+    expect(scrubbed).toContain("s3.us2.amazonaws.com");
+  });
 });
 
 describe("hashIdentity redaction", () => {

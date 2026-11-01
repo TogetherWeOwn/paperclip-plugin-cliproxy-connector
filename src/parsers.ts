@@ -141,9 +141,11 @@ export function sanitizeStatusMessage(raw: string | null): string | null {
  * `s3.amazonaws.com` (one flat fragment) and `v1.2.3-beta1` (a hyphenated
  * prerelease part plus a bare version number) keep. Several flat mixed
  * labels deny the fallback unless every one is version/hostname structured
- * (`v1`, `us2`, `3rc1`) beside a clearly operational part, so `v1.2.3rc1`
- * and `s3.us2.amazonaws.com` keep while interleaved entropy (`a1b2.c3d4.99`)
- * still redacts. Timestamps are exempted
+ * (`v1`, `us2`, `3rc1`) beside a structural part — a bare number anywhere or
+ * a strong word with more hostname after it — so `v1.2.3rc1` and
+ * `s3.us2.amazonaws.com` keep while a trailing payload word
+ * (`a1.b2.production`) and interleaved entropy (`a1b2.c3d4.99`) still redact.
+ * Timestamps are exempted
  * only when the whole token is a date/time, fractional seconds and numeric
  * offsets included (`2026-11-01T12:00:00.000Z` and `...+00:00` keep), so a
  * date substring cannot launder attached secret material
@@ -178,7 +180,14 @@ function isOperationalToken(tok: string): boolean {
     const flatMixed = segs.filter(
       (seg) => !seg.includes("-") && /[a-zA-Z]/.test(seg) && /[0-9]/.test(seg),
     );
-    if (flatMixed.length >= 2 && !(segs.some(isStrongDotPart) && flatMixed.every(isVersionShapedPart)))
+    // The clearly operational part must be structural, not a trailing payload
+    // word: a bare number (a version component) anywhere, or a strong word
+    // with more hostname after it. `a1.b2.production` ends on its payload
+    // word and redacts; `s3.us2.amazonaws.com` continues past `amazonaws`
+    // and `v1.2.3rc1` carries the bare `2`, so both keep.
+    const justified =
+      segs.some((seg) => /^[0-9]+$/.test(seg)) || segs.slice(0, -1).some(isStrongDotPart);
+    if (flatMixed.length >= 2 && !(flatMixed.every(isVersionShapedPart) && justified))
       return false;
     return segs.some(isStrongDotPart);
   }
