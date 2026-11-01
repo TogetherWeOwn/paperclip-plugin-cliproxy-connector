@@ -355,6 +355,64 @@ describe("usage page data", () => {
     expect(usage.providers[0]?.blindReason).toBe("upstream exposes nothing");
   });
 
+  it("ignores spent window resets when selecting the next known reset", () => {
+    const config = parseConfig({
+      cliproxyBaseUrl: "http://127.0.0.1:8317",
+      managementKeyHeader: "X-Test-Key",
+      managementSecretRef: { uid: "secret-1" },
+      providers: [{ provider: "claude", connectionId: "conn-claude", completeInventory: true }],
+      audienceConfirmed: true,
+    }).config;
+    const stale: AccountUsageRow = {
+      ...row(),
+      key: "acct-stalestalestale1",
+      limits: [
+        {
+          id: "claude:5h",
+          label: "Claude unified 5h",
+          usedPercent: 100,
+          remainingPercent: 0,
+          resetsAt: "2026-11-01T11:00:00.000Z", // spent an hour ago
+          limitReached: true,
+          allowed: false,
+          gating: true,
+          observedAt: NOW,
+          models: null,
+        },
+      ],
+    };
+    const recovering: AccountUsageRow = {
+      ...row(),
+      key: "acct-recovrecovrecov2",
+      limits: [
+        {
+          id: "claude:7d",
+          label: "Claude unified 7d",
+          usedPercent: 50,
+          remainingPercent: 50,
+          resetsAt: "2026-11-01T14:00:00.000Z",
+          limitReached: false,
+          allowed: true,
+          gating: true,
+          observedAt: NOW,
+          models: null,
+        },
+      ],
+    };
+    const usage = buildUsageData({
+      now: NOW,
+      config,
+      rows: { "acct-stalestalestale1": stale, "acct-recovrecovrecov2": recovering },
+      lastSync: LAST_SYNC,
+    });
+    const claude = usage.providers[0];
+    // The spent 11:00 reset must not win over the upcoming 14:00 recovery.
+    expect(claude).toMatchObject({ nextReset: "2026-11-01T14:00:00.000Z", nextResetIn: "2h 0m" });
+    expect(usage).toMatchObject({ earliestReset: "2026-11-01T14:00:00.000Z" });
+    const staleDetail = claude.accounts.find((a) => a.key === "acct-stalestalestale1");
+    expect(staleDetail?.nextReset).toBeNull();
+  });
+
   function allKeys(usage: ReturnType<typeof buildUsageData>): string[] {
     return usage.providers.flatMap((p) => p.accounts.map((a) => a.key));
   }

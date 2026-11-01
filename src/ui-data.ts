@@ -284,9 +284,12 @@ function toAccountDetail(
   const remaining = row.limits
     .map((l) => l.remainingPercent)
     .filter((v): v is number => typeof v === "number" && Number.isFinite(v));
+  // Only future resets count as "next": a past reset is already spent, and
+  // selecting it would badge the card (and page summary) with a time that
+  // reads "now" while the real upcoming recovery hides behind it.
   const resetMs = row.limits
     .map((l) => (l.resetsAt ? Date.parse(l.resetsAt) : NaN))
-    .filter((t) => !Number.isNaN(t));
+    .filter((t) => !Number.isNaN(t) && t > nowMs);
   const nextReset = resetMs.length > 0 ? new Date(Math.min(...resetMs)).toISOString() : null;
   return {
     key: row.key,
