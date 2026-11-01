@@ -125,6 +125,8 @@ export async function runSync(deps: SyncDeps, inFlight: { running: boolean }): P
     });
     // `key` must not survive this function: the client is dropped on every
     // exit path below, and nothing persists it (redaction tests prove it).
+    // (`key = ""` in the finally below only clears this local binding; the
+    // client's copy is an immutable string left for GC — no copies are made.)
     try {
       const authFiles = await client.getAuthFiles().catch((err) => {
         throw err;

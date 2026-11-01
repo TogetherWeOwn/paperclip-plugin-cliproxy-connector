@@ -83,6 +83,12 @@ describe("parseConfig", () => {
     const { config } = parseConfig(valid({ providerWindows: { CLAUDE: ["5H", "Custom"] } }));
     expect(config.providerWindows.claude).toEqual(["5h", "custom"]);
   });
+
+  it("warns when an override empties a default allow-list (silent quota-blind)", () => {
+    const { validation } = parseConfig(valid({ providerWindows: { claude: [] } }));
+    expect(validation.ok).toBe(true);
+    expect(validation.warnings.some((w) => w.includes("quota-blind fail-open"))).toBe(true);
+  });
 });
 
 describe("effectiveReservePercent", () => {

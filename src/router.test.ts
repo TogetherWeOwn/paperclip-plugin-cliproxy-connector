@@ -191,6 +191,23 @@ describe("stale telemetry (bounded fail-open)", () => {
     expect(r.kind).toBe("exhausted");
   });
 
+  it("treats future-dated telemetry as missing (unknown), never fresh", () => {
+    const rows = new Map([
+      [
+        "acct-a",
+        row({
+          prefix: "acct-a",
+          checkedAt: "2026-11-01T12:05:00.000Z", // 5 min in the future, beyond the 30 s skew
+          limits: [limit({ id: "w", remainingPercent: 5, usedPercent: 95 })],
+        }),
+      ],
+    ]);
+    const candidates = [{ memberId: "m-a", model: "acct-a/x", connectionId: "conn-a" }];
+    // Unknown → fail-open eligible despite the low reported percent: the
+    // observation is untrustworthy, and unknown is never headroom.
+    expect(route(input({ candidates, rows })).kind).toBe("selected");
+  });
+
   it("excludes stale last-known-below-reserve members", () => {
     const rows = new Map([
       ["acct-a", row({ prefix: "acct-a", checkedAt: staleOk, limits: [limit({ id: "w", remainingPercent: 5, usedPercent: 95, resetsAt: RESET_1H })] })],

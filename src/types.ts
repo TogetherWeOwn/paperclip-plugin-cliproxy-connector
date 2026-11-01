@@ -88,8 +88,7 @@ export interface DriftFinding {
     | "unmapped-account"
     | "mapped-but-missing"
     | "duplicate-prefix"
-    | "unkeyed-observation"
-    | "identity-mismatch";
+    | "unkeyed-observation";
   prefix: string;
   detail: string;
 }

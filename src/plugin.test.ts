@@ -82,6 +82,14 @@ describe("sync job", () => {
     expect(fetch).not.toHaveBeenCalled();
   });
 
+  it("persists the skipped summary so the page surfaces the config error", async () => {
+    const harness = await setup({ cliproxyBaseUrl: "https://x.example" });
+    await harness.runJob(SYNC_JOB_KEY);
+    const summary = harness.getState(stateKey(LAST_SYNC_STATE_KEY)) as { skipped: boolean; errors: string[] };
+    expect(summary.skipped).toBe(true);
+    expect(summary.errors[0]).toMatch(/company config is invalid/);
+  });
+
   it("serves page and widget data from the cache", async () => {
     const harness = await setup();
     await harness.runJob(SYNC_JOB_KEY);

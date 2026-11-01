@@ -81,7 +81,12 @@ async function apiCall(method, url, body) {
 
 function connectionPayload(e) {
   if (!e.prefix || !/^[A-Za-z0-9][A-Za-z0-9_-]*$/.test(e.prefix)) throw new Error(`bad prefix: ${e.prefix}`);
-  const provider = e.provider === "openai" ? "openai" : "anthropic"; // forced by protocol for local/gateway
+  // Connection `provider` is forced by protocol for local/gateway connections
+  // (Paperclip only accepts `anthropic` for Messages and `openai` for
+  // Responses here) — it does NOT describe the upstream account. The real
+  // provider rides in the pool member profile (`codex`/`acpx` below). If the
+  // host ever accepts richer provider values, pass them through instead.
+  const provider = e.provider === "openai" ? "openai" : "anthropic";
   return {
     name: e.connectionName ?? `CLIProxy · ${e.prefix}`,
     method: "api_key",

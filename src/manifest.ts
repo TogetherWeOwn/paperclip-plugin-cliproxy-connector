@@ -48,7 +48,7 @@ const manifest: PaperclipPluginManifestV1 = {
       jobKey: SYNC_JOB_KEY,
       displayName: "Sync CLIProxy quota",
       description:
-        "Reads the CLIProxy account list and per-provider quota through the GET-only safe path and normalises it into the plugin cache. Runs every 5 minutes; shorter company intervals are handled by skipping.",
+        "Reads the CLIProxy account list and per-provider quota through the GET-only safe path and normalises it into the plugin cache. Runs every 5 minutes; syncIntervalMinutes above 5 widens the freshness math rather than slowing the cron.",
       schedule: "*/5 * * * *",
     },
   ],

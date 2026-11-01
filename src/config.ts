@@ -172,7 +172,13 @@ export function parseConfig(raw: unknown): { config: ConnectorConfig; validation
         errors.push(`providerWindows[${provider}] must be a list of non-empty window substrings.`);
         continue;
       }
-      providerWindows[provider.toLowerCase()] = (list as string[]).map((s) => s.toLowerCase());
+      const lowered = (list as string[]).map((s) => s.toLowerCase());
+      if (lowered.length === 0 && DEFAULT_PROVIDER_WINDOWS[provider.toLowerCase()] !== undefined) {
+        warnings.push(
+          `providerWindows[${provider}] is empty: this converts a gated provider to quota-blind fail-open (routes without quota knowledge). Restore the defaults if that was not intended.`,
+        );
+      }
+      providerWindows[provider.toLowerCase()] = lowered;
     }
   }
 

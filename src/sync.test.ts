@@ -52,7 +52,7 @@ function mockFetch(overrides?: { authFilesStatus?: number; pluginStatus?: number
   return vi.fn(async (input: string | URL | Request): Promise<Response> => {
     const url = new URL(String(input));
     if (url.pathname === "/v0/management/auth-files") {
-      if (overrides?.authFilesStatus === 401) return new Response("nope", { status: 401 });
+      if (overrides?.authFilesStatus) return new Response("nope", { status: overrides.authFilesStatus });
       return jsonResponse(200, authFilesBody());
     }
     if (url.pathname.includes("/plugins/")) {
@@ -178,6 +178,19 @@ describe("strike budget (TWO-378 lesson)", () => {
     expect(s.strike.disabled).toBe(false);
     expect(s.strike.failures).toHaveLength(1);
     expect(s.savedRows).toBeNull(); // nothing persisted on auth failure
+    assertNoKeyLeak(s);
+  });
+
+  it.each([401, 403])("HTTP %i stops the run and spends one strike", async (status) => {
+    const s = store();
+    const summary = await runSync(
+      deps(s, mockFetch({ authFilesStatus: status }) as unknown as typeof fetch),
+      { running: false },
+    );
+    expect(summary.skipped).toBe(true);
+    expect(s.strike.secretBad).toBe(true);
+    expect(s.strike.failures).toHaveLength(1);
+    expect(s.savedRows).toBeNull();
     assertNoKeyLeak(s);
   });
 

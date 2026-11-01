@@ -187,6 +187,10 @@ async function runCompanySync(
       skipped: true,
       skipReason: "company config is invalid; fix it on the plugin settings page.",
     };
+    // Persist the skipped summary (keeping existing rows) so the plugin page
+    // surfaces the config error instead of stale "no sync has run yet".
+    await ctx.state.set(key(companyId, ROWS_STATE_KEY), await loadRows(ctx, companyId));
+    await ctx.state.set(key(companyId, LAST_SYNC_STATE_KEY), result);
     return result;
   }
   return runSync(
