@@ -1062,3 +1062,228 @@ describe("hashIdentity redaction", () => {
     expect(a).not.toContain("id-1");
   });
 });
+
+describe("parseMetaQuota (panel metaQuota.ts shape)", () => {
+  const metaWindows = () => DEFAULT_PROVIDER_WINDOWS.meta as string[];
+  const body = () => ({
+    subs_usage: {
+      tier: "Pro",
+      window: { used_percent: 25, resets_at: Math.floor(NOW_MS / 1000) + 3600, window_duration_mins: 60 },
+      weekly: { used_percent: 10, resets_at: Math.floor(NOW_MS / 1000) + 86400 },
+    },
+    subs_tier_name: "Pro",
+    is_subs_active: true,
+  });
+
+  it("emits window + weekly windows with remaining % and resets, labelled via provider API", async () => {
+    const { parseMetaQuota } = await import("./parsers.js");
+    const parsed = parseMetaQuota(body(), NOW, metaWindows());
+    expect(parsed.warnings).toEqual([]);
+    expect(parsed.planType).toBe("Pro");
+    expect(parsed.limits.map((l) => l.id)).toEqual(["meta:window", "meta:weekly"]);
+    expect(parsed.limits[0]?.remainingPercent).toBe(75);
+    expect(parsed.limits[0]?.usedPercent).toBe(25);
+    expect(parsed.limits[0]?.resetsAt).toBe(iso(NOW_MS + 3600_000));
+    expect(parsed.limits[1]?.remainingPercent).toBe(90);
+    for (const l of parsed.limits) {
+      expect(l.viaProviderApi).toBe(true);
+      expect(l.gating).toBe(true);
+      expect(l.allowed).toBe(true);
+      expect(l.observedAt).toBe(NOW);
+    }
+  });
+
+  it("forces exhausted windows when the subscription is inactive", async () => {
+    const { parseMetaQuota } = await import("./parsers.js");
+    const parsed = parseMetaQuota({ ...body(), is_subs_active: false }, NOW, metaWindows());
+    expect(parsed.limits.length).toBe(2);
+    for (const l of parsed.limits) {
+      expect(l.limitReached).toBe(true);
+      expect(l.allowed).toBe(false);
+    }
+    expect(parsed.warnings.join(" ")).toMatch(/inactive/);
+  });
+
+  it("returns plan-only with zero windows when subs_usage is absent (unknown, not zero)", async () => {
+    const { parseMetaQuota } = await import("./parsers.js");
+    const parsed = parseMetaQuota({ subs_tier_name: "Pro", is_subs_active: true }, NOW, metaWindows());
+    expect(parsed.planType).toBe("Pro");
+    expect(parsed.limits).toEqual([]);
+    expect(parsed.warnings.length).toBeGreaterThan(0);
+  });
+
+  it("warns with zero windows on a non-object answer", async () => {
+    const { parseMetaQuota } = await import("./parsers.js");
+    for (const bad of [null, 42, "not-json{{{"]) {
+      const parsed = parseMetaQuota(bad, NOW, metaWindows());
+      expect(parsed.limits).toEqual([]);
+      expect(parsed.warnings.length).toBeGreaterThan(0);
+    }
+  });
+});
+
+describe("parseAntigravitySubscription (panel antigravitySubscription.ts shape)", () => {
+  const antigravityWindows = () => DEFAULT_PROVIDER_WINDOWS.antigravity as string[];
+
+  it("resolves the paid tier over the current tier through PLAN_BY_TIER_ID", async () => {
+    const { parseAntigravitySubscription } = await import("./parsers.js");
+    const parsed = parseAntigravitySubscription(
+      { currentTier: { id: "free-tier", name: "Free" }, paidTier: { id: "g1-pro-tier", name: "Pro" } },
+      NOW,
+      antigravityWindows(),
+    );
+    expect(parsed.planType).toBe("Pro");
+    // Subscription alone carries no quota windows: plan only, still blind.
+    expect(parsed.limits).toEqual([]);
+  });
+
+  it("parses opportunistic quota-summary groups into windows", async () => {
+    const { parseAntigravitySubscription } = await import("./parsers.js");
+    const parsed = parseAntigravitySubscription(
+      {
+        currentTier: { id: "g1-ultra-tier", name: "Ultra" },
+        groups: [
+          {
+            buckets: [
+              { window: "weekly", remainingFraction: 0.4, resetTime: "2026-11-08T12:00:00.000Z", description: "Ultra weekly" },
+            ],
+          },
+        ],
+      },
+      NOW,
+      antigravityWindows(),
+    );
+    expect(parsed.planType).toBe("Ultra");
+    expect(parsed.limits.length).toBe(1);
+    expect(parsed.limits[0]?.remainingPercent).toBe(40);
+    expect(parsed.limits[0]?.gating).toBe(true);
+    expect(parsed.limits[0]?.viaProviderApi).toBe(true);
+  });
+
+  it("warns with zero windows when no tier is named", async () => {
+    const { parseAntigravitySubscription } = await import("./parsers.js");
+    const parsed = parseAntigravitySubscription({ currentTier: {}, paidTier: {} }, NOW, antigravityWindows());
+    expect(parsed.limits).toEqual([]);
+    expect(parsed.warnings.length).toBeGreaterThan(0);
+  });
+});
+
+describe("parseDevinQuota (panel devinQuota.ts shape)", () => {
+  const devinWindows = () => DEFAULT_PROVIDER_WINDOWS.devin as string[];
+  const resetUnix = Math.floor(NOW_MS / 1000) + 7200;
+  const body = () => ({
+    userStatus: {
+      planStatus: {
+        dailyQuotaRemainingPercent: 75,
+        dailyQuotaResetAtUnix: resetUnix,
+        weeklyQuotaRemainingPercent: "50",
+        weeklyQuotaResetAtUnix: String(resetUnix),
+        planInfo: { planName: "Devin Pro" },
+      },
+    },
+  });
+
+  it("emits daily + weekly windows from the live RPC with resets and plan", async () => {
+    const { parseDevinQuota } = await import("./parsers.js");
+    const parsed = parseDevinQuota(body(), NOW, devinWindows());
+    expect(parsed.warnings).toEqual([]);
+    expect(parsed.planType).toBe("Devin Pro");
+    expect(parsed.limits.map((l) => l.id)).toEqual(["devin:daily", "devin:weekly"]);
+    expect(parsed.limits[0]?.remainingPercent).toBe(75);
+    expect(parsed.limits[0]?.usedPercent).toBe(25);
+    expect(parsed.limits[0]?.resetsAt).toBe(iso(resetUnix * 1000));
+    expect(parsed.limits[1]?.remainingPercent).toBe(50);
+    for (const l of parsed.limits) {
+      expect(l.viaProviderApi).toBe(true);
+      expect(l.gating).toBe(true);
+      expect(l.allowed).toBe(true);
+    }
+  });
+
+  it("rejects non-strict percents the way the panel does (trailing % is signals-only)", async () => {
+    const { parseDevinQuota } = await import("./parsers.js");
+    const payload = body();
+    (payload.userStatus.planStatus as Record<string, unknown>).dailyQuotaRemainingPercent = "75%";
+    const parsed = parseDevinQuota(payload, NOW, devinWindows());
+    expect(parsed.limits.map((l) => l.id)).toEqual(["devin:weekly"]);
+    expect(parsed.warnings.join(" ")).toMatch(/daily/);
+  });
+
+  it("warns with zero windows when the RPC carries no usable quota (empty_data)", async () => {
+    const { parseDevinQuota } = await import("./parsers.js");
+    const parsed = parseDevinQuota({ userStatus: { planStatus: { planInfo: {} } } }, NOW, devinWindows());
+    expect(parsed.limits).toEqual([]);
+    expect(parsed.warnings.length).toBeGreaterThan(0);
+  });
+});
+
+describe("parseAuthFiles with live provider-API payloads (TWO-801)", () => {
+  const filesFor = (provider: string, authIndex: string) => ({
+    files: [
+      {
+        id: `REDACTED-ID-${provider}`,
+        auth_index: authIndex,
+        name: "REDACTED-NAME",
+        type: "cli",
+        provider,
+        disabled: false,
+        unavailable: false,
+      },
+    ],
+  });
+  const allowLists = () => ({ ...DEFAULT_PROVIDER_WINDOWS });
+
+  it("attaches meta windows to their own account and clears quota-blind", async () => {
+    const { parseAuthFiles } = await import("./parsers.js");
+    const resetUnix = Math.floor(NOW_MS / 1000) + 3600;
+    const { accounts } = parseAuthFiles(filesFor("meta", "m1"), {
+      now: NOW,
+      allowLists: allowLists(),
+      apiCallPayloadByAuthIndex: new Map([
+        [
+          "m1",
+          {
+            statusCode: 200,
+            body: {
+              subs_usage: {
+                window: { used_percent: 20, resets_at: resetUnix },
+                weekly: { used_percent: 5, resets_at: resetUnix + 86400 },
+              },
+              subs_tier_name: "Pro",
+              is_subs_active: true,
+            },
+          },
+        ],
+      ]),
+      apiCallObservedAt: NOW,
+    });
+    expect(accounts).toHaveLength(1);
+    expect(accounts[0]?.quotaBlind).toBe(false);
+    expect(accounts[0]?.planType).toBe("Pro");
+    expect(accounts[0]?.limits.map((l) => l.id)).toEqual(["meta:window", "meta:weekly"]);
+    expect(accounts[0]?.limits.every((l) => l.viaProviderApi === true)).toBe(true);
+  });
+
+  it("an upstream 429 warns per file and stays quota-blind (fail open)", async () => {
+    const { parseAuthFiles } = await import("./parsers.js");
+    const { accounts } = parseAuthFiles(filesFor("devin", "d9"), {
+      now: NOW,
+      allowLists: allowLists(),
+      apiCallPayloadByAuthIndex: new Map([["d9", { statusCode: 429, body: { error: "slow down" } }]]),
+      apiCallObservedAt: NOW,
+    });
+    expect(accounts[0]?.quotaBlind).toBe(true);
+    expect(accounts[0]?.limits).toEqual([]);
+    expect(accounts[0]?.parseWarnings.join(" ")).toMatch(/429/);
+  });
+
+  it("meta without a live answer stays quota-blind with the upstream reason", async () => {
+    const { parseAuthFiles } = await import("./parsers.js");
+    const { accounts } = parseAuthFiles(filesFor("meta", "m2"), {
+      now: NOW,
+      allowLists: allowLists(),
+    });
+    expect(accounts[0]?.quotaBlind).toBe(true);
+    expect(accounts[0]?.quotaBlindReason).toBe("upstream exposes nothing");
+  });
+});

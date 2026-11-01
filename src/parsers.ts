@@ -419,6 +419,7 @@ function makeLimit(init: {
   observedAt?: string | null;
   models?: string[] | null;
   metrics?: string[] | null;
+  viaProviderApi?: boolean | null;
 }): UsageLimitRow {
   return {
     id: init.id,
@@ -432,6 +433,7 @@ function makeLimit(init: {
     observedAt: init.observedAt ?? null,
     models: init.models ?? null,
     metrics: init.metrics ?? null,
+    viaProviderApi: init.viaProviderApi ?? null,
   };
 }
 
@@ -699,6 +701,335 @@ export function parsePluginQuota(
 
 function capitalize(s: string): string {
   return s ? s[0]!.toUpperCase() + s.slice(1) : s;
+}
+
+/* ------------------------------------------------------------------ */
+/* live provider-API quota (pinned api-call templates, TWO-801)        */
+/* ------------------------------------------------------------------ */
+
+export interface ParsedApiQuota {
+  planType: string | null;
+  limits: UsageLimitRow[];
+  warnings: string[];
+}
+
+/** Template key serving one parser family (mirrors `ApiCallTemplateKey`). */
+export type ApiCallProvider = "meta" | "antigravity" | "devin";
+
+/**
+ * Parse a Meta `subs_usage` window (`{used_percent, resets_at,
+ * window_duration_mins}`), mirroring the panel's `parseWindow` (`panel
+ * src/features/quota/providers/metaQuota.ts`): `used_percent` clamps to
+ * 0–100, `resets_at` is epoch seconds (dropped when not positive), and the
+ * duration is display context only. Returns null when the window carries no
+ * usable percent — a percent-less window is skipped with a warning, never
+ * emitted as an `allowed:null` row (which would read as limiting for
+ * admission-signal providers and veto headroom everywhere else).
+ */
+function parseMetaWindow(
+  id: "window" | "weekly",
+  value: unknown,
+  observedAt: string | null,
+  allowList: string[],
+): UsageLimitRow | null {
+  const raw = asObj(value);
+  if (!raw) return null;
+  const usedRaw = getNum(raw, "used_percent", "usedPercent");
+  if (usedRaw === null) return null;
+  const usedPercent = Math.min(100, Math.max(0, usedRaw));
+  const remainingPercent = 100 - usedPercent;
+  const exhausted = remainingPercent <= 0;
+  return makeLimit({
+    id: `meta:${id}`,
+    label: `meta ${id}`,
+    usedPercent,
+    remainingPercent,
+    resetsAt: toIsoTimestamp(raw.resets_at ?? raw.resetsAt ?? null),
+    limitReached: exhausted,
+    allowed: exhausted ? false : true,
+    gating: isGatingWindow("meta", id, allowList),
+    observedAt,
+    viaProviderApi: true,
+  });
+}
+
+/**
+ * Parse the Meta Muse key endpoint answer (panel
+ * `src/features/quota/providers/meta/requests.ts` `META_MUSE_QUOTA_URL` via
+ * `parseMetaQuotaPayload` in `metaQuota.ts`): `subs_usage{window, weekly}`,
+ * `subs_tier_name` (falling back to `subs_usage.tier`), `is_subs_active`. A
+ * valid object without `subs_usage` is a successful observation with unknown
+ * quota (panel: not a zero, not a request error) — plan only, zero windows.
+ * An explicitly inactive subscription forces the emitted windows exhausted:
+ * there is no quota to route on. Anything unparseable warns with zero windows
+ * (unknown, never headroom).
+ */
+export function parseMetaQuota(
+  body: unknown,
+  observedAt: string | null,
+  allowList: string[],
+): ParsedApiQuota {
+  const warnings: string[] = [];
+  if (typeof body === "string") {
+    try {
+      body = JSON.parse(body) as unknown;
+    } catch {
+      warnings.push("meta: provider API answer is not JSON; treating this account as unknown.");
+      return { planType: null, limits: [], warnings };
+    }
+  }
+  const root = asObj(body);
+  if (!root) {
+    warnings.push("meta: provider API answer is not an object; treating this account as unknown.");
+    return { planType: null, limits: [], warnings };
+  }
+  const usage = asObj(root.subs_usage ?? root.subsUsage ?? null);
+  const explicitPlan = getStr(root, "subs_tier_name", "subsTierName");
+  const usagePlan = usage ? getStr(usage, "tier") : null;
+  const planType = (explicitPlan ?? usagePlan ?? null) || null;
+  const inactive = root.is_subs_active === false || root.isSubsActive === false;
+  if (!usage) {
+    warnings.push("meta: provider API answer carries no subs_usage; treating this account as unknown.");
+    return { planType, limits: [], warnings };
+  }
+  const limits: UsageLimitRow[] = [];
+  for (const id of ["window", "weekly"] as const) {
+    const parsed = parseMetaWindow(id, usage[id], observedAt, allowList);
+    if (!parsed) {
+      warnings.push(`meta: window ${JSON.stringify(id)} has no usable percent; skipping.`);
+      continue;
+    }
+    limits.push(
+      inactive ? { ...parsed, limitReached: true, allowed: false } : parsed,
+    );
+  }
+  if (inactive && limits.length > 0) {
+    warnings.push("meta: subscription is inactive; treating these windows as exhausted.");
+  }
+  return { planType, limits, warnings };
+}
+
+/**
+ * Tier id → plan word, copied from the panel's `PLAN_BY_TIER_ID` (panel
+ * `src/services/api/antigravitySubscription.ts`). Unknown ids stay `unknown`,
+ * never a guessed plan.
+ */
+const ANTIGRAVITY_PLAN_BY_TIER_ID: Record<string, string> = {
+  "free-tier": "free",
+  "g1-pro-tier": "pro",
+  "g1-ultra-tier": "ultra",
+  "g1-ultra-lite-tier": "ultra-lite",
+};
+
+function normalizeTier(value: unknown): { id: string | null; name: string | null } | null {
+  const o = asObj(value);
+  if (!o) return null;
+  const id = getStr(o, "id");
+  const name = getStr(o, "name");
+  if (!id && !name) return null;
+  return { id, name };
+}
+
+/**
+ * Parse the Antigravity Code Assist subscription answer (panel
+ * `src/services/api/antigravitySubscription.ts`
+ * `parseAntigravitySubscriptionSummary`): `currentTier` / `paidTier` (snake
+ * aliases tolerated) with the paid tier winning when it carries an id, mapped
+ * through `PLAN_BY_TIER_ID`. The subscription call carries no quota windows
+ * itself, so quota windows come only from an opportunistic `groups[].buckets[]`
+ * quota-summary shape when the answer carries one (same bucket fields the
+ * plugin parser reads: `window`, `remainingFraction`, `resetTime`,
+ * `description`; percent strings like `"42%"` tolerated). Plan-only answers
+ * yield zero windows — the account stays quota-blind on plan evidence alone,
+ * never headroom.
+ */
+export function parseAntigravitySubscription(
+  body: unknown,
+  observedAt: string | null,
+  allowList: string[],
+): ParsedApiQuota {
+  const warnings: string[] = [];
+  if (typeof body === "string") {
+    try {
+      body = JSON.parse(body) as unknown;
+    } catch {
+      warnings.push("antigravity: provider API answer is not JSON; treating this account as unknown.");
+      return { planType: null, limits: [], warnings };
+    }
+  }
+  const root = asObj(body);
+  if (!root) {
+    warnings.push("antigravity: provider API answer is not an object; treating this account as unknown.");
+    return { planType: null, limits: [], warnings };
+  }
+  const currentTier = normalizeTier(root.currentTier ?? root.current_tier ?? null);
+  const paidTier = normalizeTier(root.paidTier ?? root.paid_tier ?? null);
+  const effective = paidTier?.id ? paidTier : currentTier;
+  if (!effective?.id && !effective?.name) {
+    warnings.push("antigravity: provider API answer names no tier; treating this account as unknown.");
+    return { planType: null, limits: [], warnings };
+  }
+  const planWord =
+    (effective.id && ANTIGRAVITY_PLAN_BY_TIER_ID[effective.id]) || "unknown";
+  const planType = effective.name || planWord;
+
+  // Opportunistic quota-summary groups on the same answer (panel quota types
+  // `AntigravityQuotaSummaryGroupPayload.buckets[]`).
+  const limits: UsageLimitRow[] = [];
+  const groups = Array.isArray(root.groups) ? root.groups : null;
+  if (groups) {
+    for (const g of groups) {
+      const group = asObj(g);
+      if (!group) {
+        warnings.push("antigravity: skipping a malformed quota group.");
+        continue;
+      }
+      const buckets = Array.isArray(group.buckets) ? group.buckets : null;
+      if (!buckets || buckets.length === 0) {
+        warnings.push("antigravity: quota group has no buckets; treating this group as unknown.");
+        continue;
+      }
+      for (const b of buckets) {
+        const bucket = asObj(b);
+        if (!bucket) {
+          warnings.push("antigravity: skipping a malformed quota bucket.");
+          continue;
+        }
+        const windowName =
+          getStr(bucket, "window", "window_name", "name", "id", "displayName", "display_name") ?? "window";
+        // `remainingFraction` 0–1 (panel `AntigravityQuotaSummaryBucketPayload`
+        // also allows a percent string such as `"42%"`).
+        const fracRaw: unknown =
+          bucket.remainingFraction ?? bucket.remaining_fraction ?? null;
+        let remaining: number | null = null;
+        if (typeof fracRaw === "number" && Number.isFinite(fracRaw)) {
+          remaining = fracRaw;
+        } else if (typeof fracRaw === "string" && fracRaw.trim()) {
+          const stripped = fracRaw.trim().replace(/%$/, "").trim();
+          if (stripped && Number.isFinite(Number(stripped))) remaining = Number(stripped);
+        }
+        let usedPercent: number | null = null;
+        let remainingPercent: number | null = null;
+        if (remaining !== null && remaining >= 0 && remaining <= 1.5) {
+          const frac = remaining > 1 ? remaining / 100 : remaining;
+          remainingPercent = Math.max(0, Math.min(100, frac * 100));
+          usedPercent = 100 - remainingPercent;
+        }
+        if (usedPercent === null || remainingPercent === null) {
+          warnings.push(`antigravity: bucket ${JSON.stringify(windowName)} has no usable percent; skipping.`);
+          continue;
+        }
+        const exhausted = remainingPercent <= 0;
+        limits.push(
+          makeLimit({
+            id: `antigravity:${windowName}`,
+            label: getStr(bucket, "description", "displayName", "display_name") ?? `antigravity ${windowName}`,
+            usedPercent,
+            remainingPercent,
+            resetsAt: toIsoTimestamp(bucket.resetTime ?? bucket.reset_time ?? null),
+            limitReached: exhausted,
+            allowed: exhausted ? false : true,
+            gating: isGatingWindow("antigravity", windowName, allowList),
+            observedAt,
+            viaProviderApi: true,
+          }),
+        );
+      }
+    }
+  }
+  return { planType, limits, warnings };
+}
+
+/**
+ * Strict panel-style percent (panel `devinQuota.ts` `parsePercent`): a finite
+ * 0–100 number, or a digits-only string (`"75"`, never `"75%"`). Anything
+ * else is unknown, never headroom.
+ */
+function parseDevinPercent(value: unknown): number | null {
+  if (typeof value === "number") {
+    return Number.isFinite(value) && value >= 0 && value <= 100 ? value : null;
+  }
+  if (typeof value !== "string" || !/^\d+(?:\.\d+)?$/.test(value.trim())) return null;
+  const percent = Number(value);
+  return Number.isFinite(percent) && percent >= 0 && percent <= 100 ? percent : null;
+}
+
+/**
+ * Strict panel-style unix-seconds instant (panel `devinQuota.ts`
+ * `parseUnixSeconds`): a safe-integer seconds count (digits-only strings
+ * accepted) to ISO. Anything else is null (no reset known).
+ */
+function parseDevinUnixSeconds(value: unknown): string | null {
+  if (typeof value !== "number" && typeof value !== "string") return null;
+  if (typeof value === "string" && !/^\d+$/.test(value.trim())) return null;
+  const seconds = Number(value);
+  if (!Number.isSafeInteger(seconds) || seconds <= 0) return null;
+  const iso = toIsoTimestamp(seconds);
+  return iso;
+}
+
+/**
+ * Parse the live Devin Connect-RPC `GetUserStatus` answer (panel
+ * `src/features/quota/providers/devin/requests.ts`
+ * `createDevinQuotaFetcher` via `readDevinQuotaResponse` in `devinQuota.ts`):
+ * `userStatus.planStatus.{daily,weekly}QuotaRemainingPercent` (strict
+ * digits-only) and `{daily,weekly}QuotaResetAtUnix` (unix seconds), plus
+ * `planInfo.planName`. This reads the live RPC — never auth-file metadata or
+ * `quota.signals` — which is why the connector saw nothing for Devin before
+ * TWO-801. Windows without a usable percent are skipped with a warning (an
+ * `allowed:null` row would read as limiting for Devin); zero usable windows
+ * is `empty_data`-equivalent: plan only, account stays unknown.
+ */
+export function parseDevinQuota(
+  body: unknown,
+  observedAt: string | null,
+  allowList: string[],
+): ParsedApiQuota {
+  const warnings: string[] = [];
+  if (typeof body === "string") {
+    try {
+      body = JSON.parse(body) as unknown;
+    } catch {
+      warnings.push("devin: provider API answer is not JSON; treating this account as unknown.");
+      return { planType: null, limits: [], warnings };
+    }
+  }
+  const status = asObj(asObj(asObj(body)?.userStatus)?.planStatus);
+  if (!status) {
+    warnings.push("devin: provider API answer carries no userStatus.planStatus; treating this account as unknown.");
+    return { planType: null, limits: [], warnings };
+  }
+  const planInfo = asObj(status.planInfo ?? null);
+  const planName = planInfo ? getStr(planInfo, "planName", "plan_name") : null;
+  const planType = (planName?.trim() || null) as string | null;
+  const limits: UsageLimitRow[] = [];
+  for (const window of ["daily", "weekly"] as const) {
+    const remainingPercent = parseDevinPercent(status[`${window}QuotaRemainingPercent`]);
+    if (remainingPercent === null) {
+      warnings.push(`devin: ${window} quota percent is unusable; skipping.`);
+      continue;
+    }
+    const usedPercent = 100 - remainingPercent;
+    const exhausted = remainingPercent <= 0;
+    limits.push(
+      makeLimit({
+        id: `devin:${window}`,
+        label: `devin ${window}`,
+        usedPercent,
+        remainingPercent,
+        resetsAt: parseDevinUnixSeconds(status[`${window}QuotaResetAtUnix`]),
+        limitReached: exhausted,
+        allowed: exhausted ? false : true,
+        gating: isGatingWindow("devin", window, allowList),
+        observedAt,
+        viaProviderApi: true,
+      }),
+    );
+  }
+  if (limits.length === 0) {
+    warnings.push("devin: provider API answer carries no usable quota windows; treating this account as unknown.");
+  }
+  return { planType, limits, warnings };
 }
 
 /* ------------------------------------------------------------------ */
@@ -1123,6 +1454,20 @@ export function parseAuthFiles(
      * legacy provider-level payload above, when present.
      */
     pluginPayloadByAuthIndex?: Map<string, unknown>;
+    /**
+     * Live provider-API answers by credential `auth_index` (TWO-801 pinned
+     * `POST /v0/management/api-call` templates, one call per account per
+     * sync). The parser selects the parser by the account's own family
+     * (`meta`, `antigravity`, `devin`) — never by a caller-supplied key — and
+     * only field-whitelisted quota shapes are kept. Non-2xx upstream answers
+     * warn per file and stay quota-blind (fail open).
+     */
+    apiCallPayloadByAuthIndex?: Map<string, { statusCode: number; body: unknown }>;
+    /**
+     * Observation time stamped on live provider-API windows: the sync's fetch
+     * time (one call per account per sync), never the passive `observed_at`.
+     */
+    apiCallObservedAt?: string | null;
   },
 ): {
   accounts: ParsedAccount[];
@@ -1359,20 +1704,58 @@ export function parseAuthFiles(
     const pluginLimits: UsageLimitRow[] = pluginQuota?.limits ?? [];
     if (pluginQuota?.planType) planType = pluginQuota.planType;
 
-    const stamped = softGating
-      ? [...limits.map((l) => ({ ...l, gating: false })), ...pluginLimits]
-      : [...limits, ...pluginLimits];
+    // Live provider-API windows (TWO-801): the account's own api-call answer,
+    // parsed by its own family's parser. A non-2xx upstream answer warns per
+    // file and attaches nothing — fail open, never headroom.
+    let apiLimits: UsageLimitRow[] = [];
+    const apiPayload =
+      authIndex !== null ? opts.apiCallPayloadByAuthIndex?.get(authIndex) : undefined;
+    if (apiPayload !== undefined && !disabled) {
+      const apiObservedAt = opts.apiCallObservedAt ?? opts.now;
+      if (apiPayload.statusCode < 200 || apiPayload.statusCode >= 300) {
+        parseWarnings.push(
+          `${provider}: provider API returned upstream HTTP ${apiPayload.statusCode}; treating this account as unknown for live quota.`,
+        );
+      } else {
+        const parsedApi: ParsedApiQuota | null =
+          parserKey === "meta"
+            ? parseMetaQuota(apiPayload.body, apiObservedAt, allowList)
+            : parserKey === "antigravity"
+              ? parseAntigravitySubscription(apiPayload.body, apiObservedAt, allowList)
+              : parserKey === "devin"
+                ? parseDevinQuota(apiPayload.body, apiObservedAt, allowList)
+                : null;
+        if (!parsedApi) {
+          parseWarnings.push(
+            `${provider}: provider API answer has no parser for this family; ignoring it.`,
+          );
+        } else {
+          parseWarnings.push(...parsedApi.warnings);
+          apiLimits = parsedApi.limits;
+          // The live RPC is the freshest plan evidence: it wins when present.
+          if (parsedApi.planType) planType = parsedApi.planType;
+        }
+      }
+    }
 
+    const stamped = softGating
+      ? [...limits.map((l) => ({ ...l, gating: false })), ...pluginLimits, ...apiLimits]
+      : [...limits, ...pluginLimits, ...apiLimits];
+
+    // Meta and Antigravity publish no passive signals: without live provider-API
+    // windows they stay quota-blind. With at least one gating live window they
+    // route quota-aware like every other gated provider.
+    const hasLiveGatingWindows = apiLimits.some((l) => l.gating);
     const quotaBlind =
-      parserKey === "meta" ||
-      parserKey === "antigravity" ||
       parserKey === "xai" ||
       parserKey === "kimi" ||
       parserKey === "compat" ||
       parserKey === "openrouter" ||
       parserKey === "unknown-provider" ||
       parserKey === "nvidia-nim" ||
-      (stamped.length === 0 && pluginLimits.length === 0);
+      (parserKey === "meta" || parserKey === "antigravity"
+        ? !hasLiveGatingWindows
+        : stamped.length === 0 && pluginLimits.length === 0);
 
     if (quota && !observedAt) {
       parseWarnings.push(`${provider}: observation has no usable observed_at; using fetch time.`);

@@ -2,9 +2,11 @@
  * Sync job (cron 2–5 min + on-demand): CLIProxy → plugin cache.
  *
  * Reads the CLIProxy account list + per-provider quota through the proposal
- * §4 safe path (GET-only allow-list, `api-call` excluded), groups accounts by
- * provider, and normalises into `AiConnectionUsage`-shaped rows in the
- * plugin's own namespace. No core changes, no fork.
+ * §4 safe path (pinned GET allow-list plus the three pinned TWO-801
+ * `api-call` POST templates for Meta/Antigravity/Devin, one call per account
+ * per sync), groups accounts by provider, and normalises into
+ * `AiConnectionUsage`-shaped rows in the plugin's own namespace. No core
+ * changes, no fork.
  *
  * Security properties (all tested):
  * - the management key is resolved per run and kept in memory only;
@@ -31,7 +33,7 @@ import {
   parseModelsPayload,
   type ServedModel,
 } from "./models.js";
-import { hashIdentity, parseAuthFiles, type ParsedAccount } from "./parsers.js";
+import { hashIdentity, normalizeProvider, parseAuthFiles, type ParsedAccount } from "./parsers.js";
 import type {
   AccountUsageRow,
   DriftFinding,
@@ -303,11 +305,49 @@ export async function runSync(deps: SyncDeps, inFlight: { running: boolean }): P
         }
       }
 
+      // Live provider-API quota (TWO-801): one pinned
+      // `POST /v0/management/api-call` per distinct credential index among the
+      // enabled, configured meta/antigravity/devin accounts — the families the
+      // three frozen templates serve. Disabled accounts are never called;
+      // cooling accounts keep their cooldown (no probe while the provider says
+      // wait); one call per index per sync bounds the rate to the sync cadence
+      // (every 5 min). Raw envelopes ride along by `auth_index` and attach to
+      // their own account row at parse time. Failed calls warn per file and
+      // stay quota-blind; only a rejected key (401/403) stops the run.
+      const apiCallPayloadByAuthIndex = new Map<string, { statusCode: number; body: unknown }>();
+      const fetchedApiCallIndexes = new Set<string>();
+      const configuredProviders = new Set(deps.config.providers.map((p) => p.provider));
+      for (const a of discovered.accounts) {
+        if (a.status === "disabled" || a.status === "cooling") continue;
+        if (!a.authIndex || !configuredProviders.has(a.provider)) continue;
+        const family = normalizeProvider(a.provider);
+        if (family !== "meta" && family !== "antigravity" && family !== "devin") continue;
+        if (fetchedApiCallIndexes.has(a.authIndex)) continue;
+        fetchedApiCallIndexes.add(a.authIndex);
+        try {
+          const result = await client.postApiCall(family, a.authIndex);
+          apiCallPayloadByAuthIndex.set(a.authIndex, {
+            statusCode: result.statusCode,
+            body: result.body,
+          });
+        } catch (err) {
+          if (err instanceof CliproxyAuthError) throw err; // stop after first rejected key
+          // Auth indexes are opaque tokens, but never persist one raw in a
+          // warning: the short hash distinguishes files for debugging.
+          const fileRef = `auth ${hashIdentity([a.authIndex])?.slice(0, 8) ?? "unknown"}`;
+          const rawMessage = err instanceof Error ? err.message : "fetch failed";
+          const safeMessage = rawMessage.split(a.authIndex).join(fileRef);
+          pluginErrors.push(`${a.provider} (provider API, ${fileRef}): ${safeMessage}`);
+        }
+      }
+
       const { accounts, unkeyed, warnings } = parseAuthFiles(authFiles, {
         now: deps.now,
         allowLists: deps.config.providerWindows,
         pluginPayloadByProvider,
         pluginPayloadByAuthIndex,
+        apiCallPayloadByAuthIndex,
+        apiCallObservedAt: deps.now,
       });
 
       // Group by stable row key: duplicates defeat keying (spike G-K1) and

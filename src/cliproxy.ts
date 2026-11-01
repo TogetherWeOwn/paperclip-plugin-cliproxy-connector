@@ -4,9 +4,11 @@
  * Defence in depth, all enforced here rather than at call sites:
  * - loopback-only base URL, validated at construction and re-validated per call
  * - key header attached only after origin validation
- * - GET-only allow-list; `api-call` is excluded and can never be admitted
- *   through this client (it executes upstream requests with stored upstream
- *   credentials, so "GET-only" would be a lie)
+ * - GET-only allow-list; `api-call` is excluded from the GET path and can never
+ *   be admitted through it (it executes upstream requests with stored upstream
+ *   credentials, so "GET-only" would be a lie). The only `api-call` use is the
+ *   pinned POST below: three hard-coded request templates whose only variable
+ *   is the credential `authIndex` — no caller can supply a URL, headers or body
  * - `redirect: "manual"` with re-validation of every hop (max 2, same-origin
  *   loopback only)
  * - 15 s timeouts, size-capped bodies, JSON schema-checked before storage
@@ -36,6 +38,119 @@ export const MANAGEMENT_MAX_REDIRECTS = 2;
  */
 export const AUTH_FILES_PATH = "/v0/management/auth-files";
 const PLUGIN_QUOTA_SHAPE = /^\/v0\/management\/plugins\/[A-Za-z0-9][A-Za-z0-9_-]*\/quota$/;
+
+/**
+ * Pinned `api-call` management path (TWO-801). POST-only, and only reachable
+ * through `postApiCall` with one of the three frozen templates below — the
+ * GET allow-list (`assertAllowListed`) still refuses this path outright.
+ *
+ * `POST /v0/management/api-call` proxies one request to the provider using the
+ * stored credential selected by `auth_index` (CLIProxyAPI
+ * `internal/api/handlers/management/api_tools.go`: `APICall`). The request
+ * carries the `$TOKEN$` placeholder where the panel sends a credential; the
+ * backend substitutes the stored credential server-side (`resolveTokenForAuth`
+ * — per-provider refresh/mint, including the JSON-escaped substitution inside
+ * `data`), so the plugin never handles, logs or persists credential material.
+ */
+export const API_CALL_PATH = "/v0/management/api-call";
+
+/**
+ * One pinned upstream request behind `POST /v0/management/api-call`. Every
+ * field is a frozen literal copied from the Management Center panel source
+ * (cited per template); the only per-account variable is `authIndex`, supplied
+ * separately at call time and validated by `isSafeAuthIndex` before any
+ * network happens.
+ */
+export interface ApiCallTemplate {
+  /** Provider family this template serves (`meta`, `antigravity`, `devin`). */
+  provider: string;
+  method: "POST";
+  /** Exact upstream URL — never built from input. */
+  url: string;
+  /** Exact upstream headers. `$TOKEN$` is substituted server-side by CLIProxy. */
+  headers: Record<string, string>;
+  /** Exact upstream body. `$TOKEN$` is substituted server-side by CLIProxy. */
+  data: string;
+}
+
+/**
+ * The three pinned `api-call` templates (TWO-801). Frozen: callers select by
+ * key (`ApiCallTemplateKey`) and can never supply their own URL, headers or
+ * body, so the guarded POST below cannot send an arbitrary upstream request.
+ *
+ * - Meta: the Muse key endpoint the panel polls for quota (panel
+ *   `src/features/quota/providers/meta/requests.ts`: `META_MUSE_QUOTA_URL` and
+ *   the `request()` call — method, URL, `Accept`/`Content-Type`/`x-api-version`
+ *   headers and `'{}'` body). The panel authorizes with the `dca_token` it
+ *   reads from the downloaded auth file; the connector cannot download auth
+ *   files (credential-bearing), so the template carries `Bearer $TOKEN$` and
+ *   CLIProxy substitutes the stored meta credential server-side (backend
+ *   `resolveTokenForAuth` → `resolveMetaToken`).
+ * - Antigravity: the Code Assist subscription call (panel
+ *   `src/services/api/antigravitySubscription.ts` `antigravitySubscriptionApi.get`
+ *   with `ANTIGRAVITY_CODE_ASSIST_URL`, `ANTIGRAVITY_REQUEST_HEADERS` and
+ *   `CODE_ASSIST_REQUEST_BODY`; header constants in
+ *   `src/utils/quota/constants.ts`, including the pinned
+ *   `antigravity/hub/2.23.0 darwin/arm64` user agent). The backend refreshes
+ *   the OAuth access token server-side for antigravity credentials.
+ * - Devin: the live seat-management RPC (panel
+ *   `src/features/quota/providers/devin/requests.ts`
+ *   `createDevinQuotaFetcher` — method, `GetUserStatus` URL, `Content-Type` /
+ *   `Connect-Protocol-Version` headers and the chisel metadata body whose
+ *   `apiKey` is `$TOKEN$`). It reads the live RPC, not auth-file
+ *   `quota.signals` — which is why the connector saw nothing for Devin.
+ */
+const API_CALL_TEMPLATES = {
+  meta: {
+    provider: "meta",
+    method: "POST",
+    url: "https://api.meta.ai/muse-code/key",
+    headers: {
+      Accept: "application/json",
+      "Content-Type": "application/json",
+      Authorization: "Bearer $TOKEN$",
+      "x-api-version": "1.0.0",
+    },
+    data: "{}",
+  },
+  antigravity: {
+    provider: "antigravity",
+    method: "POST",
+    url: "https://daily-cloudcode-pa.googleapis.com/v1internal:loadCodeAssist",
+    headers: {
+      Authorization: "Bearer $TOKEN$",
+      "Content-Type": "application/json",
+      "User-Agent": "antigravity/hub/2.23.0 darwin/arm64",
+    },
+    data: '{"metadata":{"ideType":"ANTIGRAVITY"}}',
+  },
+  devin: {
+    provider: "devin",
+    method: "POST",
+    url: "https://server.codeium.com/exa.seat_management_pb.SeatManagementService/GetUserStatus",
+    headers: {
+      "Content-Type": "application/json",
+      "Connect-Protocol-Version": "1",
+    },
+    data: '{"metadata":{"ideName":"chisel","ideVersion":"3000.10.21","apiKey":"$TOKEN$","locale":"en","os":"darwin","extensionVersion":"3000.10.21","clientName":"chisel"}}',
+  },
+} as const satisfies Record<string, ApiCallTemplate>;
+
+export type ApiCallTemplateKey = keyof typeof API_CALL_TEMPLATES;
+
+/** Select a frozen template by key. Unknown keys reject before any network happens. */
+export function apiCallTemplate(key: string): ApiCallTemplate {
+  const template = (API_CALL_TEMPLATES as Record<string, ApiCallTemplate>)[key];
+  if (!template) {
+    throw new CliproxyConfigError(`refusing an api-call request for an unknown provider: ${key}`);
+  }
+  return template;
+}
+
+/** All pinned template keys (one per provider family served through `api-call`). */
+export function apiCallTemplateKeys(): ApiCallTemplateKey[] {
+  return Object.keys(API_CALL_TEMPLATES) as ApiCallTemplateKey[];
+}
 
 /**
  * Pinned per-credential served-set path (TWO-679 round 2, approved 09:24Z
@@ -234,6 +349,24 @@ function assertModelsAllowListed(url: URL, what: string): void {
   }
 }
 
+/**
+ * Pinned `api-call` POST allow-list (TWO-801). The ONLY path the guarded POST
+ * below may address: exactly `/v0/management/api-call` with no query string.
+ * Template contents (upstream URL, headers, body) are never part of the URL —
+ * they travel in the POST body built internally from a frozen template — so a
+ * redirect target either matches this shape (same pinned path, same body
+ * re-sent) or the hop is refused.
+ */
+function assertApiCallAllowListed(url: URL, what: string): void {
+  const pathname = decodedPathname(url, what);
+  if (pathname !== API_CALL_PATH) {
+    throw new CliproxyConfigError(`path is outside the pinned api-call POST allow-list: ${pathname}`);
+  }
+  if ([...url.searchParams.keys()].length > 0) {
+    throw new CliproxyConfigError(`api-call request carries no query string (${what})`);
+  }
+}
+
 function assertNoKeyLeak(text: string, key: string, where: string): void {
   if (key && text.includes(key)) {
     throw new CliproxyBodyError(`refusing to propagate a value containing key material (${where})`);
@@ -256,13 +389,17 @@ async function releaseBody(res: Response): Promise<void> {
 }
 
 /**
- * Shared guarded GET: the loopback/method/allow-list/redirect/timeout/cap/
+ * Shared guarded fetch: the loopback/method/allow-list/redirect/timeout/cap/
  * no-leak rules both clients enforce. `headersFor` builds the auth headers
  * after origin + allow-list validation; `assertAllowed` is the client's own
  * pinned allow-list (management vs. client paths stay separated so neither
- * key can travel to the other's paths).
+ * key can travel to the other's paths). `method` is `"GET"` for the pinned
+ * reads or `"POST"` for the pinned `api-call` template POST (with `bodyText`
+ * built internally from a frozen template — never from caller input); a
+ * redirect hop re-sends the same method and body, and any hop whose target
+ * leaves the pinned shape is refused.
  */
-async function guardedGetJson(args: {
+async function guardedJson(args: {
   startUrl: URL;
   baseOrigin: string;
   headersFor: () => Record<string, string>;
@@ -271,6 +408,8 @@ async function guardedGetJson(args: {
   timeoutMs: number;
   maxBytes: number;
   assertAllowed: (url: URL, what: string) => void;
+  method: "GET" | "POST";
+  bodyText?: string;
 }): Promise<unknown> {
   let url = args.startUrl;
   for (let hop = 0; hop <= MANAGEMENT_MAX_REDIRECTS; hop++) {
@@ -278,8 +417,9 @@ async function guardedGetJson(args: {
     let res: Response;
     try {
       res = await args.fetchImpl(url.toString(), {
-        method: "GET",
+        method: args.method,
         headers,
+        body: args.method === "POST" ? (args.bodyText ?? "") : undefined,
         redirect: "manual",
         signal: AbortSignal.timeout(args.timeoutMs),
       });
@@ -287,7 +427,7 @@ async function guardedGetJson(args: {
       // The transport reports only `err.name`, so keep the root cause visible
       // (e.g. `TimeoutError`, not `Error`); `instanceof` still matches.
       const label = err instanceof Error && err.name ? err.name : "fetch failed";
-      const wrapped = new CliproxyNetworkError(`management GET ${url.pathname} failed: ${label}`);
+      const wrapped = new CliproxyNetworkError(`management ${args.method} ${url.pathname} failed: ${label}`);
       wrapped.name = label;
       throw wrapped;
     }
@@ -321,7 +461,7 @@ async function guardedGetJson(args: {
       } catch (err) {
         await releaseBody(res);
         throw new CliproxyRedirectError(
-          `redirect target is outside the pinned GET allow-list; refusing to follow: ${err instanceof Error ? err.message : "blocked"}`,
+          `redirect target is outside the pinned allow-list; refusing to follow: ${err instanceof Error ? err.message : "blocked"}`,
         );
       }
       await releaseBody(res);
@@ -330,25 +470,25 @@ async function guardedGetJson(args: {
     }
     if (res.status < 200 || res.status >= 300) {
       await releaseBody(res);
-      throw new CliproxyNetworkError(`management GET ${url.pathname} returned HTTP ${res.status}`);
+      throw new CliproxyNetworkError(`management ${args.method} ${url.pathname} returned HTTP ${res.status}`);
     }
-    const text = await readCapped(res, url.pathname, args.maxBytes);
+    const text = await readCapped(res, url.pathname, args.maxBytes, args.method);
     assertNoKeyLeak(text, args.keyForLeakCheck, url.pathname);
     try {
       return JSON.parse(text) as unknown;
     } catch {
-      throw new CliproxyBodyError(`management GET ${url.pathname} returned non-JSON`);
+      throw new CliproxyBodyError(`management ${args.method} ${url.pathname} returned non-JSON`);
     }
   }
   throw new CliproxyRedirectError("too many redirects; refusing to follow");
 }
 
-async function readCapped(res: Response, path: string, maxBytes: number): Promise<string> {
+async function readCapped(res: Response, path: string, maxBytes: number, method: string): Promise<string> {
   const reader = res.body?.getReader();
   if (!reader) {
     const text = await res.text();
     if (text.length > maxBytes) {
-      throw new CliproxyBodyError(`management GET ${path} exceeded the ${maxBytes} byte cap`);
+      throw new CliproxyBodyError(`management ${method} ${path} exceeded the ${maxBytes} byte cap`);
     }
     return text;
   }
@@ -365,7 +505,7 @@ async function readCapped(res: Response, path: string, maxBytes: number): Promis
         } catch {
           /* ignore */
         }
-        throw new CliproxyBodyError(`management GET ${path} exceeded the ${maxBytes} byte cap`);
+        throw new CliproxyBodyError(`management ${method} ${path} exceeded the ${maxBytes} byte cap`);
       }
       chunks.push(value);
     }
@@ -417,7 +557,7 @@ export class CliproxyManagementClient {
     const url = this.resolveTarget(path);
     const keyHeader = this.keyHeader;
     const key = this.key;
-    return guardedGetJson({
+    return guardedJson({
       startUrl: url,
       baseOrigin: new URL(this.baseUrl).origin,
       // Attach the key header only after origin validation above.
@@ -427,6 +567,7 @@ export class CliproxyManagementClient {
       timeoutMs: this.timeoutMs,
       maxBytes: this.maxBytes,
       assertAllowed: assertAllowListed,
+      method: "GET",
     });
   }
 
@@ -460,6 +601,113 @@ export class CliproxyManagementClient {
     // network happens. (`async` so the validation throw surfaces as a rejection.)
     return this.getJson(pluginQuotaPath(pluginId, authIndex));
   }
+
+  /**
+   * POST one pinned `api-call` template for one credential (TWO-801).
+   *
+   * The caller names a template KEY only (`meta`, `antigravity`, `devin`); the
+   * upstream method, URL, headers and body come from the frozen template, so
+   * this method structurally cannot send an arbitrary upstream request. The
+   * only per-account variable is `authIndex`, validated before any network
+   * happens. The template's `$TOKEN$` placeholders are substituted with the
+   * stored credential server-side by CLIProxy — the plugin never sees them.
+   *
+   * Transport errors keep the GET semantics: 401/403 spends the strike budget
+   * (the key itself was rejected), 404/5xx/network failures are the caller's
+   * cue to warn per file and stay quota-blind. The UPSTREAM status travels
+   * inside the returned envelope (`statusCode`) and never throws here: a
+   * provider-side 4xx/5xx is a per-file warning, not a sync failure.
+   */
+  async postApiCall(templateKey: string, authIndex: string): Promise<ApiCallResult> {
+    const template = apiCallTemplate(templateKey);
+    if (!isSafeAuthIndex(authIndex)) {
+      throw new CliproxyConfigError(`refusing an api-call request with an untrusted auth index`);
+    }
+    const url = this.resolveApiCallTarget();
+    const requestBody = JSON.stringify({
+      auth_index: authIndex,
+      method: template.method,
+      url: template.url,
+      header: template.headers,
+      data: template.data,
+    });
+    const keyHeader = this.keyHeader;
+    const key = this.key;
+    const raw = await guardedJson({
+      startUrl: url,
+      baseOrigin: new URL(this.baseUrl).origin,
+      // Attach the key header only after origin validation above.
+      headersFor: () => ({ [keyHeader]: key, "Content-Type": "application/json" }),
+      keyForLeakCheck: key,
+      fetchImpl: this.fetchImpl,
+      timeoutMs: this.timeoutMs,
+      maxBytes: this.maxBytes,
+      assertAllowed: assertApiCallAllowListed,
+      method: "POST",
+      bodyText: requestBody,
+    });
+    return parseApiCallEnvelope(raw);
+  }
+
+  private resolveApiCallTarget(): URL {
+    let url: URL;
+    try {
+      url = new URL(API_CALL_PATH, this.baseUrl);
+    } catch {
+      throw new CliproxyConfigError(`unparseable management path: ${API_CALL_PATH}`);
+    }
+    const origin = new URL(this.baseUrl).origin;
+    if (url.origin !== origin || !isLoopbackUrl(url.toString())) {
+      throw new CliproxyConfigError(`management target failed origin validation: ${API_CALL_PATH}`);
+    }
+    // Pinned POST allow-list: exactly the api-call path, no query string.
+    assertApiCallAllowListed(url, API_CALL_PATH);
+    return url;
+  }
+}
+
+/**
+ * One upstream answer behind `POST /v0/management/api-call`: the upstream
+ * HTTP status plus the parsed upstream body (JSON when the body parses,
+ * otherwise the raw string, otherwise null for an empty body). Response
+ * headers are deliberately dropped — they carry no quota signal the parsers
+ * need.
+ */
+export interface ApiCallResult {
+  statusCode: number;
+  body: unknown;
+}
+
+/**
+ * Validate the management `api-call` envelope (`{status_code, header, body}`
+ * per `api_tools.go: apiCallResponse`). Anything else is a body error — never
+ * quota data. Upstream bodies may carry account identifiers, so this returns
+ * the body for field-whitelisted parsers only; nothing here logs or persists.
+ */
+function parseApiCallEnvelope(raw: unknown): ApiCallResult {
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
+    throw new CliproxyBodyError("management POST /v0/management/api-call returned a non-object envelope");
+  }
+  const record = raw as Record<string, unknown>;
+  const statusCode = record.status_code ?? record.statusCode;
+  if (typeof statusCode !== "number" || !Number.isFinite(statusCode)) {
+    throw new CliproxyBodyError("management POST /v0/management/api-call returned no upstream status");
+  }
+  const bodyRaw = record.body ?? record.bodyText ?? null;
+  let body: unknown = null;
+  if (typeof bodyRaw === "string") {
+    const trimmed = bodyRaw.trim();
+    if (trimmed) {
+      try {
+        body = JSON.parse(trimmed) as unknown;
+      } catch {
+        body = bodyRaw;
+      }
+    }
+  } else if (bodyRaw !== null && bodyRaw !== undefined) {
+    body = bodyRaw;
+  }
+  return { statusCode, body };
 }
 
 export interface CliproxyClientApiOptions {
@@ -520,7 +768,7 @@ export class CliproxyClientApiClient {
   async getModels(): Promise<unknown> {
     const url = this.resolveTarget(MODELS_PATH);
     const key = this.key;
-    return guardedGetJson({
+    return guardedJson({
       startUrl: url,
       baseOrigin: new URL(this.baseUrl).origin,
       // OpenAI-compatible Bearer auth, attached only after origin validation.
@@ -530,6 +778,7 @@ export class CliproxyClientApiClient {
       timeoutMs: this.timeoutMs,
       maxBytes: this.maxBytes,
       assertAllowed: assertModelsAllowListed,
+      method: "GET",
     });
   }
 }

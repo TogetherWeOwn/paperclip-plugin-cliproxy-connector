@@ -450,3 +450,58 @@ describe("widget data", () => {
     expect(widget.status).toMatch(/disabled/);
   });
 });
+
+describe("via provider API provenance (TWO-801)", () => {
+  it("passes the live-quota flag through to usage page windows", async () => {
+    const { buildUsageData } = await import("./ui-data.js");
+    const { parseConfig } = await import("./config.js");
+    const { config } = parseConfig({
+      cliproxyBaseUrl: "http://127.0.0.1:8317",
+      managementKeyHeader: "X-Test-Key",
+      managementSecretRef: { uid: "s" },
+      providers: [{ provider: "meta", connectionId: "conn-meta", completeInventory: false }],
+      audienceConfirmed: true,
+    });
+    const usage = buildUsageData({
+      now: NOW,
+      config,
+      rows: {
+        "acct-meta1": {
+          key: "acct-meta1",
+          provider: "meta",
+          channel: "meta",
+          status: "active",
+          statusMessage: null,
+          priority: null,
+          limits: [
+            {
+              id: "meta:window",
+              label: "meta window",
+              usedPercent: 20,
+              remainingPercent: 80,
+              resetsAt: null,
+              limitReached: false,
+              allowed: true,
+              gating: true,
+              observedAt: NOW,
+              models: null,
+              metrics: null,
+              viaProviderApi: true,
+            },
+          ],
+          planType: "Pro",
+          checkedAt: NOW,
+          source: "plugin:cliproxy-connector",
+          quotaBlind: false,
+          quotaBlindReason: null,
+          accountHash: null,
+          lastError: null,
+          coolingDown: false,
+          cooldownUntil: null,
+        },
+      },
+      lastSync: null,
+    });
+    expect(usage.providers[0]?.accounts[0]?.limits[0]?.viaProviderApi).toBe(true);
+  });
+});

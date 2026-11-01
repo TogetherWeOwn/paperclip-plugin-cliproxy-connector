@@ -160,7 +160,17 @@ or no query on older builds) — there are deliberately no config knobs for
 them, and the management key is never sent to `/v1` paths. The served-model list has its
 own pinned path (`/v1/models`, `MODELS_PATH`) fetched with the separate client API key
 (Bearer auth) under the same guarded-fetch rules (loopback, manual redirects, timeouts,
-caps, no key leaks); neither key can travel to the other's paths. If your CLIProxy build
+caps, no key leaks); neither key can travel to the other's paths. Meta, Antigravity and
+Devin publish no passive quota signals, so one pinned `POST /v0/management/api-call`
+per credential per sync (TWO-801) reads the same live quota the Management Center panel
+shows: three frozen request templates (exact upstream method, URL, headers and body
+copied from the panel source, `apiCallTemplate()` in `src/cliproxy.ts`) whose only
+variable is the credential `auth_index` — callers cannot supply their own URL, headers
+or body. Upstream `$TOKEN$` placeholders are substituted server-side by CLIProxy; the
+plugin never handles credential material. Transport 401/403 spends the strike budget
+like every management GET; an upstream provider-side error travels inside the returned
+envelope and only warns per file (fail open). Live windows are labelled "via provider
+API" on the Usage & quota page. If your CLIProxy build
 differs, change the pinned constants in `src/cliproxy.ts` — everything else follows.
 The quota-fetch wire shape is the lowercase CLIProxyAPI `sdk/pluginapi`
 `QuotaFetchResponse`: `groups[]` → `buckets[]`, with per-bucket `window`,
@@ -179,8 +189,10 @@ tests mirrors the public CLIProxyAPI source shapes.
 - Management key and client API key: each resolved per sync run from its own `secret_ref`,
   in memory only, never persisted, never in UI/agent/log surfaces (redaction tests prove
   it). Client-key 401/403s never spend the management strike budget.
-- Safe path only: loopback base URL, key header attached after origin validation, GET-only
-  allow-list, `api-call` excluded and un-admittable, manual redirects with revalidation
+- Safe path only: loopback base URL, key header attached after origin validation, pinned
+  GET allow-list (`api-call` excluded from it and un-admittable through it) plus the
+  three pinned TWO-801 `api-call` POST templates (exact upstream requests, credential
+  `auth_index` the only variable), manual redirects with revalidation
   (max 2, same-origin loopback), 15 s timeouts, 2 MB caps, schema-checked JSON. The worker
   fetches through its own guarded loopback transport (Node fetch, never the host client —
   the host SSRF guard refuses loopback); the transport re-checks loopback-only, canonical

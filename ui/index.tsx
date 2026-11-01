@@ -403,6 +403,7 @@ export function CliProxyUsagePage({ context }: PluginPageProps) {
               <div key={l.id}>
                 <WindowBar label={l.label} remaining={l.remainingPercent} resetIn={l.resetIn} />
                 {!l.gating && <span style={{ fontSize: 12 }}>(informational, not gating)</span>}
+                {l.viaProviderApi && <span style={{ fontSize: 12 }}> · via provider API</span>}
                 {l.allowed === false && <span style={{ fontSize: 12 }}> · not admitted</span>}
                 {l.models && l.models.length > 0 && <span style={{ fontSize: 12 }}> · models {l.models.join(", ")}</span>}
                 {l.metrics && l.metrics.length > 0 && (

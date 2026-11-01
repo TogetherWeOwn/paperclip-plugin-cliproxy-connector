@@ -49,6 +49,14 @@ export interface UsageLimitRow {
    */
   models?: string[] | null;
   /**
+   * True when this window came from a live provider API call through the
+   * pinned `POST /v0/management/api-call` templates (TWO-801: Meta,
+   * Antigravity, Devin) rather than passive `auth-files` signals or a plugin
+   * quota route. Display only — the router gates on `gating` either way; the
+   * "Usage & quota" page labels these windows "via provider API".
+   */
+  viaProviderApi?: boolean | null;
+  /**
    * Display-only quota `summary[]` entries from the plugin payload (and/or
    * bucket), e.g. human-readable plan or window notes. Never gates routing;
    * the router ignores this field.
