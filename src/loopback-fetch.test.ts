@@ -41,6 +41,20 @@ describe("construction", () => {
     }
     expect(fetch).not.toHaveBeenCalled();
   });
+
+  it("refuses https://localhost: the rewrite would mismatch a localhost certificate (TWO-749 Devin round 2)", () => {
+    const fetch = vi.fn(async () => json(200, {}));
+    expect(() => createLoopbackFetch("https://localhost:8317", { fetchImpl: fetch })).toThrow(
+      /IP SAN|http:\/\/127/,
+    );
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it("still accepts https://127.0.0.1 (operator certificate with an IP SAN)", () => {
+    const fetch = vi.fn(async () => json(200, {}));
+    expect(() => createLoopbackFetch("https://127.0.0.1:8317", { fetchImpl: fetch })).not.toThrow();
+    expect(fetch).not.toHaveBeenCalled();
+  });
 });
 
 describe("per-request guards", () => {
@@ -153,6 +167,25 @@ describe("per-request guards", () => {
       headers: { "X-Test-Key": KEY },
     }).catch((e: unknown) => e);
     expect(err).toBeInstanceOf(CliproxyNetworkError);
+    expect((err as Error).message).not.toContain(KEY);
+  });
+
+  it("keeps the underlying error name on the wrapper (TWO-749 CodeRabbit)", async () => {
+    const fetch = vi.fn(async () => {
+      throw new TypeError("fetch failed");
+    });
+    const guarded = createLoopbackFetch(BASE, { fetchImpl: fetch });
+    // A query string rides along: the failure message must still carry the
+    // pathname only — never the query, headers or key material.
+    const err = await guarded(`${BASE}/v0/management/auth-files?name=sentinel-q`).catch(
+      (e: unknown) => e,
+    );
+    expect(err).toBeInstanceOf(CliproxyNetworkError);
+    // The management client reports only `err.name`: it must read
+    // `TypeError`, not the collapsed `Error`.
+    expect((err as Error).name).toBe("TypeError");
+    expect((err as Error).message).toContain("/v0/management/auth-files");
+    expect((err as Error).message).not.toContain("sentinel-q");
     expect((err as Error).message).not.toContain(KEY);
   });
 });

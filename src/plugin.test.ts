@@ -164,6 +164,31 @@ describe("sync job", () => {
     expect(strike?.failures).toHaveLength(1);
     expect(strike?.secretBad).toBe(true);
   });
+
+  it("resolves the documented secret_ref shape with secretId (TWO-749 Devin round 2)", async () => {
+    const { harness } = await setup({
+      ...COMPANY_CONFIG,
+      managementSecretRef: { type: "secret_ref", secretId: "secret-1", version: "latest" },
+      clientApiKeySecretRef: { type: "secret_ref", secretId: "secret-client-1", version: "latest" },
+    });
+    const seenRefs: unknown[] = [];
+    const inner = harness.ctx.secrets.resolve as (ref: unknown, opts?: unknown) => Promise<string>;
+    harness.ctx.secrets.resolve = (async (ref: unknown, opts?: unknown) => {
+      seenRefs.push(ref);
+      return inner(ref, opts);
+    }) as never;
+    await harness.runJob(SYNC_JOB_KEY);
+    // Both refs travel to the host resolver in the documented shape …
+    expect(seenRefs).toContainEqual({ type: "secret_ref", secretId: "secret-1", version: "latest" });
+    expect(seenRefs).toContainEqual({
+      type: "secret_ref",
+      secretId: "secret-client-1",
+      version: "latest",
+    });
+    // … and the sync completes against the stubbed loopback transport.
+    const summary = harness.getState(stateKey(LAST_SYNC_STATE_KEY)) as { skipped: boolean };
+    expect(summary.skipped).toBe(false);
+  });
 });
 
 describe("config validation and health", () => {

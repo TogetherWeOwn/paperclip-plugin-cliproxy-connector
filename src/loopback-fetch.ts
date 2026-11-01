@@ -12,6 +12,8 @@
  *   port or a non-loopback host is refused without touching the network
  * - `localhost` is rewritten to `127.0.0.1` before validation and before the
  *   request leaves, so the OS resolver can never steer a key-bearing request
+ *   (`https://localhost` is refused outright: the rewrite would mismatch a
+ *   localhost certificate at TLS verification time)
  * - GET only; `redirect: "manual"` is forced so a redirect is never followed
  *   automatically (the management client re-validates every hop itself)
  * - caller timeout via `AbortSignal` (default 15 s)
@@ -54,6 +56,18 @@ function canonicalLoopbackUrl(raw: string): URL {
     throw new CliproxyConfigError("loopback transport refuses an unparseable URL.");
   }
   if (url.hostname.toLowerCase() === "localhost") {
+    if (url.protocol === "https:") {
+      // Rewriting the host to 127.0.0.1 would make Node verify the
+      // certificate against that IP, so a certificate issued for the DNS
+      // name `localhost` (normally without an IP SAN) would always fail TLS
+      // verification. Refuse loudly instead of failing closed at handshake
+      // time: the operator either drops TLS on loopback
+      // (`http://127.0.0.1:<port>`) or mints a certificate with an IP SAN
+      // for 127.0.0.1 and configures that literal.
+      throw new CliproxyConfigError(
+        "loopback transport refuses https://localhost (the localhost → 127.0.0.1 rewrite would mismatch a localhost certificate): use http://127.0.0.1:<port>, or https://127.0.0.1:<port> with a certificate carrying an IP SAN for 127.0.0.1.",
+      );
+    }
     url.hostname = "127.0.0.1";
   }
   return url;
@@ -93,9 +107,13 @@ export function createLoopbackFetch(baseUrl: string, opts: LoopbackFetchOptions 
         signal: init?.signal ?? AbortSignal.timeout(timeoutMs),
       });
     } catch (err) {
-      throw new CliproxyNetworkError(
-        `loopback GET ${url.pathname} failed: ${err instanceof Error ? err.name : "fetch failed"}`,
-      );
+      // The management client reports only `err.name`; keep the root cause
+      // visible (e.g. `TimeoutError`, not `Error`). The message carries the
+      // pathname only — never the query, headers or key material.
+      const label = err instanceof Error && err.name ? err.name : "fetch failed";
+      const wrapped = new CliproxyNetworkError(`loopback GET ${url.pathname} failed: ${label}`);
+      wrapped.name = label;
+      throw wrapped;
     }
   };
 }

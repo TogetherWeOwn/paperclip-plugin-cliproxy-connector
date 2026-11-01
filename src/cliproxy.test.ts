@@ -107,6 +107,41 @@ describe("auth and error mapping", () => {
     expect((err as Error).message).not.toContain(KEY);
   });
 
+  it("cancels the unread body on every non-success branch (TWO-749 Devin round 2)", async () => {
+    function stubResponse(status: number, headers?: Record<string, string>) {
+      const cancel = vi.fn(async () => {});
+      const res = { status, headers: new Headers(headers), body: { cancel } } as unknown as Response;
+      return { res, cancel };
+    }
+    // 401/403/404/5xx: the body is cancelled before the typed error leaves,
+    // so loopback sockets return to the pool instead of lingering for GC.
+    for (const status of [401, 403, 404, 500]) {
+      const { res, cancel } = stubResponse(status);
+      const fetch = vi.fn(async () => res);
+      await expect(client(fetch).getAuthFiles()).rejects.toThrow();
+      expect(cancel).toHaveBeenCalledTimes(1);
+      expect(fetch).toHaveBeenCalledTimes(1);
+    }
+    // Redirect refusal: the 3xx body is cancelled too, after exactly one hop.
+    const { res, cancel } = stubResponse(302, { location: "https://evil.example/x" });
+    const fetch = vi.fn(async () => res);
+    await expect(client(fetch).getAuthFiles()).rejects.toThrow(CliproxyRedirectError);
+    expect(cancel).toHaveBeenCalledTimes(1);
+    expect(fetch).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps the underlying error name on transport failures (TWO-749 CodeRabbit)", async () => {
+    const fetch = vi.fn(async () => {
+      throw new TypeError("fetch failed");
+    });
+    const err = await client(fetch)
+      .getAuthFiles()
+      .catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(CliproxyNetworkError);
+    expect((err as Error).name).toBe("TypeError");
+    expect((err as Error).message).not.toContain(KEY);
+  });
+
   it("rejects non-JSON bodies", async () => {
     const fetch = vi.fn(async () => new Response("<html>nope</html>", { status: 200 }));
     await expect(client(fetch).getAuthFiles()).rejects.toThrow(CliproxyBodyError);
