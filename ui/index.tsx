@@ -330,7 +330,8 @@ export function CliProxyUsagePage({ context }: PluginPageProps) {
           <div>
             {p.headroomAccounts} of {p.enabledAccounts} enabled account{p.enabledAccounts === 1 ? "" : "s"} with
             headroom
-            {p.retryAt ? ` · earliest reset ${p.retryAt} (${p.retryIn})` : ""}
+            {p.nextReset ? ` · earliest known reset ${p.nextReset} (${p.nextResetIn})` : ""}
+            {p.retryAt && p.retryAt !== p.nextReset ? ` · retry ${p.retryAt} (${p.retryIn})` : ""}
             {` · sync ${p.freshness}`}
           </div>
           <div>{p.reason}</div>

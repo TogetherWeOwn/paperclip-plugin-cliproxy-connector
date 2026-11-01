@@ -239,6 +239,14 @@ describe("usage page data", () => {
       retryIn: null,
     });
     expect(claude.freshness).toBe("fresh");
+    expect(claude).toMatchObject({
+      nextReset: "2026-11-01T13:00:00.000Z",
+      nextResetIn: "1h 0m",
+    });
+    // The page summary shows known resets even though no provider is
+    // exhausted (retryAt is null for allowed providers).
+    expect(usage.earliestReset).toBe("2026-11-01T13:00:00.000Z");
+    expect(usage.earliestResetIn).toBe("1h 0m");
     const [detail] = claude.accounts;
     expect(detail).toMatchObject({
       maskedLabel: "acct-aaaaaaaa…",
@@ -284,6 +292,47 @@ describe("usage page data", () => {
       quotaBlindReason: "upstream exposes nothing",
     });
     expect(detail.key).toBe("acct-bbb"); // full key retained for React keys
+    // The exhausted card's retry doubles as the page summary here.
+    expect(usage.earliestReset).toBe("2026-11-01T12:30:00.000Z");
+  });
+
+  it("excludes disabled rows from the blind badge", () => {
+    const config = parseConfig({
+      cliproxyBaseUrl: "http://127.0.0.1:8317",
+      managementKeyHeader: "X-Test-Key",
+      managementSecretRef: { uid: "secret-1" },
+      providers: [{ provider: "claude", connectionId: "conn-claude", completeInventory: true }],
+      audienceConfirmed: true,
+    }).config;
+    const healthy = {
+      ...usageRows()["acct-aaaaaaaaaaaaaaaa"],
+      key: "acct-aaaaaaaaaaaaaaaa",
+    } as AccountUsageRow;
+    // Disabled rows get no plugin quota and usually read blind; they must
+    // not badge a provider whose enabled accounts are healthy.
+    const disabledBlind: AccountUsageRow = {
+      ...row(),
+      key: "acct-cccccccccccccccc",
+      provider: "claude",
+      channel: "claude",
+      status: "disabled",
+      limits: [],
+      quotaBlind: true,
+      quotaBlindReason: "no usable quota windows",
+    };
+    const usage = buildUsageData({
+      now: NOW,
+      config,
+      rows: { "acct-aaaaaaaaaaaaaaaa": healthy, "acct-cccccccccccccccc": disabledBlind },
+      lastSync: LAST_SYNC,
+    });
+    const claude = usage.providers[0];
+    expect(claude).toMatchObject({ blindAccounts: 0, blindReason: null });
+    // The disabled row is still listed in the table with its status.
+    expect(claude.accounts.map((a) => a.key).sort()).toEqual([
+      "acct-aaaaaaaaaaaaaaaa",
+      "acct-cccccccccccccccc",
+    ]);
   });
 
   it("derives the blind reason for rows cached before the field existed", () => {

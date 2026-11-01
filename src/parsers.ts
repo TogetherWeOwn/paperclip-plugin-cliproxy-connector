@@ -448,19 +448,26 @@ export interface ParsedPluginQuota {
 /**
  * Display-only quota `summary[]` entries, normalized to short strings.
  * Payload- and bucket-level summaries merge onto every emitted window row
- * (`metrics`, never gating). Non-string entries stringify defensively;
- * bounded (32 entries, 240 chars) so a chatty plugin cannot bloat the cache.
+ * (`metrics`, never gating). Upstream text can carry account identifiers, so
+ * every entry is scrubbed like status notes (emails and credential-like
+ * tokens redacted) before it reaches the page. Non-string entries stringify
+ * defensively; bounded (32 entries, 240 chars) so a chatty plugin cannot
+ * bloat the cache.
  */
 function summarizeMetrics(value: unknown): string[] | null {
   if (!Array.isArray(value)) return null;
   const out: string[] = [];
   for (const item of value.slice(0, 32)) {
-    if (typeof item === "string" && item.trim()) out.push(item.trim().slice(0, 240));
-    else if (typeof item === "number" && Number.isFinite(item)) out.push(String(item));
+    const push = (raw: string) => {
+      const clean = sanitizeStatusMessage(raw.slice(0, 240));
+      if (clean) out.push(clean);
+    };
+    if (typeof item === "string" && item.trim()) push(item.trim());
+    else if (typeof item === "number" && Number.isFinite(item)) push(String(item));
     else if (item !== null && typeof item === "object") {
       try {
         const s = JSON.stringify(item);
-        if (s && s !== "{}" && s !== "[]") out.push(s.slice(0, 240));
+        if (s && s !== "{}" && s !== "[]") push(s);
       } catch {
         /* unstringifiable entry: dropped, never headroom */
       }
@@ -1016,6 +1023,14 @@ export interface ParsedAccount {
    * validated as a single safe value before any network happens.
    */
   authIndex: string | null;
+  /**
+   * This entry's advertised plugin quota route (`quota_plugin_id`), or null
+   * when it advertises none, opts out (`supports_quota: false`), or the id
+   * is unusable. Lets same-provider accounts on different plugins each fetch
+   * their own quota; the provider-level hint is only the fallback for rows
+   * that advertise nothing.
+   */
+  quotaPluginId: string | null;
   /** Reconciled lifecycle state. */
   status: AccountStatus;
   /** CLIProxy `status_message`, when present (operational note). */
@@ -1136,11 +1151,16 @@ export function parseAuthFiles(
     // plugin route (`quota_plugin_id`), unless it opts out with
     // `supports_quota: false`. Only keyed, enabled entries contribute —
     // unkeyed repeats and disabled credentials never drive fetches.
+    // The validated per-entry id rides on the parsed row (see quotaPluginId):
+    // same-provider accounts on different plugins each fetch their own quota
+    // instead of all sharing the first-wins provider hint.
+    let advertisedPluginId: string | null = null;
     if (!disabled) {
       const supportsQuota = entry.supports_quota ?? entry.supportsQuota ?? null;
       const hintedId = getStr(entry, "quota_plugin_id", "quotaPluginId");
       if (hintedId !== null && supportsQuota !== false) {
         if (SINGLE_SEGMENT.test(hintedId)) {
+          advertisedPluginId = hintedId;
           const prior = pluginQuotaHints.get(provider);
           if (prior === undefined) pluginQuotaHints.set(provider, hintedId);
           else if (prior !== hintedId) {
@@ -1319,6 +1339,7 @@ export function parseAuthFiles(
       channel,
       fileName,
       authIndex,
+      quotaPluginId: advertisedPluginId,
       status,
       statusMessage,
       priority,

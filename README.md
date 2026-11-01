@@ -93,9 +93,12 @@ the operator. You read redacted output only.
    plugin ids from the `auth-files` list itself: entries carrying `quota_plugin_id`
    (unless `supports_quota: false`) supply the fetch id, so a new quota plugin needs no
    config change — an explicit `pluginQuotaIds` entry always wins over discovery.
-   Each fetch sends the credential's `auth_index` from the `auth-files` list
-   (`?auth_index=…`, required since CLIProxy v8.0.49), so every account attaches its
-   own file's quota; failed fetches are best-effort and never spend strikes.
+   Same-provider accounts advertising different plugins each fetch against their own
+   route (the first-wins provider id is only the fallback for rows that advertise
+   nothing; conflicts warn visibly). Each fetch sends the credential's `auth_index`
+   from the `auth-files` list (`?auth_index=…`, required since CLIProxy v8.0.49), so
+   every account attaches its own file's quota; failed fetches are best-effort and
+   never spend strikes.
 6. Confirm the sync ran (plugin page shows one card per provider with its proven models),
    then run traffic — an all-cooling provider shows `exhausted` with the earliest reset as
    `retryAt`, and core wait/resume fires automatically.
@@ -117,15 +120,18 @@ The plugin ships two pages over the same sync cache:
   connection, inventory confirmation, proven models, drift and the informational
   per-account detail.
 - The **Usage & Quota** page (`cliproxy-usage`): per-provider verdict, headroom
-  (`<n> of <m> enabled accounts with headroom`), earliest reset with countdown,
-  freshness and quota-blind badges with their reason; plus a filterable (provider,
-  status, blind-only) and sortable (remaining %, reset — unknowns last) per-account
-  table showing the masked account label (`acct-<13 shown>…`, full key never
-  rendered), plan, priority, status, cooldown countdown, per-window bars and the
-  display-only `metrics`. Request/token counters are intentionally absent: CLIProxy
-  exposes no read-only per-account counters. Both pages are read-only over already
-  synced state; the connector never calls the destructive `/v0/management/usage-queue`
-  endpoint (asserted in tests).
+  (`<n> of <m> enabled accounts with headroom`), earliest known reset with countdown
+  (informational — shown for allowed providers too, unlike the exhaustion-only
+  retry time), freshness and quota-blind badges with their reason (disabled rows
+  never count toward the badge); plus a filterable (provider, status, blind-only)
+  and sortable (remaining %, reset — unknowns last) per-account table showing the
+  masked account label (`acct-<13 shown>…`, full key never rendered), plan, priority,
+  status, cooldown countdown, per-window bars and the display-only `metrics`.
+  `summary[]` text is scrubbed like status notes (emails and credential-like tokens
+  redacted) before it reaches the page. Request/token counters are intentionally
+  absent: CLIProxy exposes no read-only per-account counters. Both pages are
+  read-only over already synced state; the connector never calls the destructive
+  `/v0/management/usage-queue` endpoint (asserted in tests).
 
 ## Config reference
 

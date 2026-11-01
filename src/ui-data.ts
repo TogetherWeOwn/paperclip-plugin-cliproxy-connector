@@ -96,8 +96,15 @@ export interface ProviderCard {
   waitResumeOff: boolean;
   enabledAccounts: number;
   headroomAccounts: number;
-  /** Blind enabled accounts under this provider. */
+  /** Blind enabled accounts under this provider (disabled rows never count). */
   blindAccounts: number;
+  /**
+   * Earliest known future window reset across the provider's accounts, or
+   * null when none is known. Informational: unlike `retryAt` (set only behind
+   * an exhausted verdict) this is present for allowed providers too.
+   */
+  nextReset: string | null;
+  nextResetIn: string | null;
   /**
    * Most common blind reason among the provider's blind accounts (null when
    * none are blind). Displayed as the blind badge's reason on the usage page.
@@ -345,6 +352,10 @@ function buildProviderCards(args: {
       const accounts = providerRows.map((row) =>
         toAccountDetail(row, nowMs, maxAgeMs(config), graceMs(config)),
       );
+      // Disabled rows never count toward the blind badge: they get no plugin
+      // quota, so they usually read blind while the enabled accounts are fine.
+      const countable = accounts.filter((a) => a.status !== "disabled");
+      const nextReset = earliestTime(countable.map((a) => a.nextReset));
       return {
         provider: entry.provider,
         connectionId: entry.connectionId,
@@ -356,8 +367,10 @@ function buildProviderCards(args: {
         waitResumeOff: verdict.waitResumeOff,
         enabledAccounts: verdict.enabledAccounts,
         headroomAccounts: verdict.headroomAccounts,
-        blindAccounts: accounts.filter((a) => a.quotaBlind).length,
-        blindReason: commonBlindReason(accounts),
+        blindAccounts: countable.filter((a) => a.quotaBlind).length,
+        blindReason: commonBlindReason(countable),
+        nextReset,
+        nextResetIn: resetIn(nextReset, nowMs),
         reason: verdict.waitResumeOff
           ? `${verdict.reason} Wait/resume is off for this provider: inventory is not confirmed complete.`
           : verdict.reason,
@@ -385,11 +398,25 @@ function commonBlindReason(accounts: ProviderAccountDetail[]): string | null {
   return best;
 }
 
+/** Earliest parseable time in the list, or null when there is none. */
+function earliestTime(times: Array<string | null>): string | null {
+  const parsed = times
+    .filter((t): t is string => t !== null && !Number.isNaN(Date.parse(t)))
+    .map((t) => Date.parse(t));
+  return parsed.length > 0 ? new Date(Math.min(...parsed)).toISOString() : null;
+}
+
 function earliestRetryAt(providers: ProviderCard[]): string | null {
-  const resets = providers
-    .map((p) => p.retryAt)
-    .filter((r): r is string => r !== null && !Number.isNaN(Date.parse(r)));
-  return resets.length > 0 ? new Date(Math.min(...resets.map((r) => Date.parse(r)))).toISOString() : null;
+  return earliestTime(providers.map((p) => p.retryAt));
+}
+
+/**
+ * Page-level earliest known recovery for the usage page: the retry times
+ * behind exhausted verdicts plus every card's informational next reset, so
+ * the summary still shows known resets when no provider is exhausted.
+ */
+function earliestKnownReset(providers: ProviderCard[]): string | null {
+  return earliestTime(providers.flatMap((p) => [p.retryAt, p.nextReset]));
 }
 
 function isFailureNewer(lastSync: SyncSummary | null, lastFailure?: SyncFailure | null): boolean {
@@ -428,7 +455,7 @@ export function buildUsageData(args: {
   const { now, config, rows, lastSync, lastFailure } = args;
   const nowMs = Date.parse(now);
   const providers = buildProviderCards({ config, rows, now, nowMs, providerModels: {} });
-  const earliestReset = earliestRetryAt(providers);
+  const earliestReset = earliestKnownReset(providers);
   return {
     audienceNotice: AUDIENCE_NOTICE,
     audienceConfirmed: config.audienceConfirmed,

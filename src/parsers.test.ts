@@ -677,7 +677,7 @@ describe("parseAuthFiles (redacted fixture)", () => {
   });
 
   it("collects advertised quota plugin ids for discovery, skipping opt-outs and junk", () => {
-    const { pluginQuotaHints, warnings } = parse([
+    const { accounts, pluginQuotaHints, warnings } = parse([
       { id: "s-1", provider: "synthetic", quota_plugin_id: "synthetic-quota" },
       { id: "s-2", provider: "synthetic", quota_plugin_id: "other-quota" },
       { id: "x-1", provider: "xai", quota_plugin_id: "../evil" },
@@ -690,6 +690,11 @@ describe("parseAuthFiles (redacted fixture)", () => {
     expect(pluginQuotaHints.get("meta")).toBeUndefined(); // disabled entries never contribute
     expect(warnings.some((w) => w.includes("conflicting quota plugin ids"))).toBe(true);
     expect(warnings.some((w) => w.includes("unusable advertised quota plugin id"))).toBe(true);
+    // Same-provider accounts on different plugins keep their own route, so
+    // the sync can fetch each credential against the plugin that serves it.
+    expect(accounts.find((a) => a.quotaPluginId === "synthetic-quota")).toBeDefined();
+    expect(accounts.find((a) => a.quotaPluginId === "other-quota")).toBeDefined();
+    expect(accounts.find((a) => a.provider === "devin")?.quotaPluginId).toBeNull();
   });
 });
 
@@ -807,6 +812,22 @@ describe("parsePluginQuota (lowercase wire shape)", () => {
     expect(limits).toHaveLength(1);
     expect(limits[0]?.metrics).toEqual(["team plan, resets weekly", "burst allowance included"]);
     expect(limits[0]?.gating).toBe(true);
+  });
+
+  it("scrubs account identifiers from summary[] before surfacing metrics", () => {
+    const { limits } = parsePluginQuota(
+      "synthetic",
+      {
+        summary: ["team plan, resets weekly", "owner ops@example.com", "refresh ab12cd34ef"],
+        groups: [{ buckets: [{ window: "weekly", remainingFraction: 0.8 }] }],
+      },
+      ["weekly"],
+    );
+    expect(limits[0]?.metrics).toEqual([
+      "team plan, resets weekly",
+      "owner [redacted-email]",
+      "refresh [redacted]",
+    ]);
   });
 
   it("parses Devin daily/weekly remaining-percent fields, stripping %", () => {
