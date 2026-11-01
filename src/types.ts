@@ -133,7 +133,8 @@ export interface DriftFinding {
     | "unconfigured-provider"
     | "missing-connection"
     | "no-enabled-accounts"
-    | "model-overlap";
+    | "model-overlap"
+    | "untrusted-auth-file";
   /** Provider the finding is about (normalized lowercase). */
   provider: string;
   detail: string;

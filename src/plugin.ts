@@ -335,7 +335,14 @@ async function runCompanySync(
         await ctx.state.set(key(companyId, LAST_SYNC_STATE_KEY), result);
       },
       recordFailure: async (failure) => {
-        await ctx.state.set(key(companyId, LAST_ERROR_STATE_KEY), failure);
+        // The host's `plugin_state` insert rejects a null `value_json`, so a
+        // cleared failure must delete the key — never `set` null (a clean
+        // sync would otherwise report "sync failed" on the page).
+        if (failure === null) {
+          await ctx.state.delete(key(companyId, LAST_ERROR_STATE_KEY));
+        } else {
+          await ctx.state.set(key(companyId, LAST_ERROR_STATE_KEY), failure);
+        }
       },
       logActivity: (message, metadata) => ctx.activity.log({ companyId, message, metadata }),
     },

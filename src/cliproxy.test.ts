@@ -387,3 +387,72 @@ describe("pinned allow-list and plugin id validation (S1)", () => {
     await expect(client(fetch).getAuthFiles()).rejects.toThrow(CliproxyRedirectError);
   });
 });
+
+describe("plugin quota auth_index (v8.0.49, per-file quota)", () => {
+  it("builds the per-file quota path with exactly one auth_index parameter", () => {
+    expect(pluginQuotaPath("claude-quota", "abc123")).toBe(
+      "/v0/management/plugins/claude-quota/quota?auth_index=abc123",
+    );
+    // Legacy provider-level shape (older builds without auth_index).
+    expect(pluginQuotaPath("claude-quota")).toBe("/v0/management/plugins/claude-quota/quota");
+  });
+
+  it("rejects hostile auth indexes before any network happens", async () => {
+    for (const bad of [
+      "",
+      "  ",
+      "../config",
+      "..%2Fconfig",
+      "a/b",
+      "x y",
+      "api-call",
+      "evil-api-call-x",
+      "a".repeat(200),
+    ]) {
+      const fetch = vi.fn(async () => json(200, {}));
+      await expect(client(fetch).getPluginQuota("claude-quota", bad)).rejects.toThrow(
+        CliproxyConfigError,
+      );
+      expect(fetch).not.toHaveBeenCalled();
+    }
+  });
+
+  it("GETs the per-file quota with the management key header", async () => {
+    let seen: { url?: string; headers?: Headers } = {};
+    const fetch = vi.fn(async (url: string, init?: RequestInit) => {
+      seen = { url, headers: new Headers(init?.headers) };
+      return json(200, { Groups: [] });
+    });
+    const body = await client(fetch).getPluginQuota("claude-quota", "abc123");
+    expect(body).toEqual({ Groups: [] });
+    expect(seen.url).toBe(
+      "http://127.0.0.1:8317/v0/management/plugins/claude-quota/quota?auth_index=abc123",
+    );
+    expect(seen.headers?.get("X-Test-Key")).toBe(KEY);
+  });
+
+  it("allow-lists exactly one auth_index parameter and validates its value", async () => {
+    const ok = vi.fn(async () => json(200, {}));
+    await client(ok).getJson("/v0/management/plugins/claude-quota/quota?auth_index=abc123");
+    expect(ok).toHaveBeenCalledTimes(1);
+    for (const bad of [
+      "/v0/management/plugins/claude-quota/quota?auth_index=",
+      "/v0/management/plugins/claude-quota/quota?auth_index=a%2Fb",
+      "/v0/management/plugins/claude-quota/quota?auth_index=abc&other=1",
+      "/v0/management/plugins/claude-quota/quota?other=1",
+      "/v0/management/plugins/claude-quota/quota?auth_index=a&auth_index=b",
+      "/v0/management/plugins/claude-quota/quota?auth_index=api-call",
+    ]) {
+      const fetch = vi.fn(async () => json(200, {}));
+      await expect(client(fetch).getJson(bad)).rejects.toThrow(CliproxyConfigError);
+      expect(fetch).not.toHaveBeenCalled();
+    }
+  });
+
+  it("refuses a redirect to a quota path with an unsafe query", async () => {
+    const fetch = vi.fn(
+      async () => new Response(null, { status: 302, headers: { location: "/v0/management/plugins/claude-quota/quota?auth_index=..%2Fconfig" } }),
+    );
+    await expect(client(fetch).getAuthFiles()).rejects.toThrow(CliproxyRedirectError);
+  });
+});

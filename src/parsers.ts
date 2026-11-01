@@ -845,6 +845,13 @@ export interface ParsedAccount {
    * check; files without a usable name keep the `model_quotas` heuristic.
    */
   fileName: string | null;
+  /**
+   * Credential `auth_index` from the `auth-files` list, or null when the
+   * build does not report one. Sent as the single `?auth_index=` query value
+   * on the per-file plugin-quota fetch (required since CLIProxy v8.0.49);
+   * validated as a single safe value before any network happens.
+   */
+  authIndex: string | null;
   /** Reconciled lifecycle state. */
   status: AccountStatus;
   /** CLIProxy `status_message`, when present (operational note). */
@@ -880,8 +887,16 @@ export function parseAuthFiles(
      * Raw plugin-quota payloads by provider. Each is parsed with the owning
      * provider's own allow-list and attached to every enabled account row of
      * that provider (fetched at sync time, so as fresh as the cache row).
+     * Legacy shape for builds whose entries carry no `auth_index`.
      */
     pluginPayloadByProvider?: Map<string, unknown>;
+    /**
+     * Raw plugin-quota payloads by credential `auth_index` (CLIProxy ≥ v8.0.49
+     * per-file quota fetch). An account carrying an `auth_index` attaches
+     * only its own file's payload; accounts without one fall back to the
+     * legacy provider-level payload above, when present.
+     */
+    pluginPayloadByAuthIndex?: Map<string, unknown>;
   },
 ): { accounts: ParsedAccount[]; unkeyed: number; warnings: string[] } {
   const warnings: string[] = [];
@@ -919,6 +934,7 @@ export function parseAuthFiles(
     // class; unknown providers fall back to the generic (quota-blind) parser.
     const parserKey = normalizeProvider(provider);
     const fileName = getStr(entry, "name", "Name") ?? null;
+    const authIndex = getStr(entry, "auth_index", "authIndex", "AuthIndex")?.trim() || null;
 
     // Stable identity: CLIProxy `id` first, then the auth-file `path`.
     const stableId = getStr(entry, "id", "ID", "auth_id") ?? getStr(entry, "path", "Path") ?? null;
@@ -1050,7 +1066,15 @@ export function parseAuthFiles(
       if (!planType && parsed.planType) planType = parsed.planType;
     }
 
-    const pluginPayload = opts.pluginPayloadByProvider?.get(provider);
+    // Per-file payloads win: an account carrying an `auth_index` attaches
+    // only its own file's quota. Accounts without one (older builds) keep
+    // the legacy provider-level payload. A failed per-file fetch attaches
+    // nothing — it never falls back to a provider-wide fetch that would 400
+    // on current builds.
+    const pluginPayload =
+      authIndex !== null
+        ? opts.pluginPayloadByAuthIndex?.get(authIndex)
+        : opts.pluginPayloadByProvider?.get(provider);
     let pluginQuota: ParsedPluginQuota | null = null;
     if (pluginPayload !== undefined && !disabled) {
       pluginQuota = parsePluginQuota(parserKey, pluginPayload, allowList, {
@@ -1086,6 +1110,7 @@ export function parseAuthFiles(
       provider,
       channel,
       fileName,
+      authIndex,
       status,
       statusMessage,
       priority,

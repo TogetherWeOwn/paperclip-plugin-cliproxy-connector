@@ -202,15 +202,49 @@ describe("happy path", () => {
     assertNoKeyLeak(s);
   });
 
-  it("scrubs invalid auth-file names out of client validation errors", async () => {
-    // A name that fails client validation throws CliproxyConfigError with
-    // the raw name embedded; the persisted warning must carry only the
+  it("scrubs the auth-file name when a redirect target echoes it back", async () => {
+    // A redirect target is server-chosen: its pathname can echo an
+    // email-style auth-file name, and the client's redirect refusal embeds
+    // that pathname in its error. The persisted warning must carry only the
     // hashed file reference, never the name itself.
-    const evilName = "bad/name-evil";
+    const emailName = "user@example.com.json";
+    const fetchRedirectEcho = vi.fn(async (input: string | URL | Request): Promise<Response> => {
+      const url = new URL(String(input));
+      if (url.pathname === "/v0/management/auth-files") {
+        return jsonResponse(200, [{ id: "claude-1", name: emailName, provider: "claude" }]);
+      }
+      if (url.pathname === "/v0/management/auth-files/models") {
+        return new Response(null, {
+          status: 302,
+          headers: { location: `/v0/management/auth-files/models/${emailName}` },
+        });
+      }
+      if (url.pathname.includes("/plugins/")) return jsonResponse(200, pluginQuotaBody());
+      return new Response("not found", { status: 404 });
+    });
+    const s = store();
+    const summary = await runSync(deps(s, fetchRedirectEcho as unknown as typeof fetch), {
+      running: false,
+    });
+    expect(summary.skipped).toBe(false);
+    const blob = JSON.stringify([summary.errors, summary.drift, s.activity]);
+    expect(blob).not.toContain("user@example.com");
+    expect(blob).not.toContain(emailName);
+    expect(summary.errors.some((e) => e.includes("auth file"))).toBe(true);
+    assertNoKeyLeak(s);
+  });
+
+  it("refused auth-file names become quiet drift, never sync errors, with the raw name scrubbed", async () => {
+    // A name that fails client validation (path-like leftover state from a
+    // retired plugin) throws CliproxyConfigError with the raw name embedded.
+    // The refusal is correct and stays — it is reported as drift, not as a
+    // per-run sync error — and the persisted finding must carry only the
+    // hashed file reference, never the name itself.
+    const evilName = "auths/subscription-pool/manifest.json";
     const fetchInvalid = vi.fn(async (input: string | URL | Request): Promise<Response> => {
       const url = new URL(String(input));
       if (url.pathname === "/v0/management/auth-files") {
-        return jsonResponse(200, [{ id: "claude-1", name: evilName, provider: "claude" }]);
+        return jsonResponse(200, [{ id: "stale-1", name: evilName }]);
       }
       if (url.pathname.includes("/plugins/")) return jsonResponse(200, pluginQuotaBody());
       return new Response("not found", { status: 404 });
@@ -220,7 +254,11 @@ describe("happy path", () => {
     expect(summary.skipped).toBe(false);
     const blob = JSON.stringify([summary.errors, summary.drift, s.activity]);
     expect(blob).not.toContain(evilName);
-    expect(summary.errors.some((e) => e.includes("auth file"))).toBe(true);
+    expect(summary.errors.some((e) => e.includes("auth file"))).toBe(false);
+    const refused = (summary.drift ?? []).filter((d) => d.kind === "untrusted-auth-file");
+    expect(refused).toHaveLength(1);
+    expect(refused[0]?.provider).toBe("unknown");
+    expect(s.strike.failures).toHaveLength(0);
     assertNoKeyLeak(s);
   });
 
@@ -233,6 +271,112 @@ describe("happy path", () => {
     for (const r of claudeRows) {
       expect(r.limits.some((l) => l.id === "claude:weekly")).toBe(true);
     }
+  });
+
+  it("fetches plugin quota per auth file with auth_index and attaches each payload to its own account", async () => {
+    const quotaUrls: string[] = [];
+    const fetchPerFile = vi.fn(async (input: string | URL | Request): Promise<Response> => {
+      const url = new URL(String(input));
+      if (url.pathname === "/v0/management/auth-files") {
+        return jsonResponse(200, [
+          { id: "claude-1", provider: "claude", auth_index: "aaaabbbbccccdddd" },
+          { id: "claude-2", provider: "claude", auth_index: "1111222233334444" },
+        ]);
+      }
+      if (url.pathname === "/v0/management/plugins/claude-quota/quota") {
+        quotaUrls.push(url.toString());
+        const idx = url.searchParams.get("auth_index");
+        if (idx === "aaaabbbbccccdddd") {
+          return jsonResponse(200, { Groups: [{ Buckets: [{ Window: "weekly", RemainingFraction: 0.8 }] }] });
+        }
+        if (idx === "1111222233334444") {
+          return jsonResponse(200, { Groups: [{ Buckets: [{ Window: "weekly", RemainingFraction: 0.1 }] }] });
+        }
+        return new Response("auth_index is required", { status: 400 });
+      }
+      if (url.pathname === "/v1/models") return jsonResponse(200, modelsBody());
+      return new Response("not found", { status: 404 });
+    });
+    const s = store();
+    const summary = await runSync(deps(s, fetchPerFile as unknown as typeof fetch), { running: false });
+    expect(summary.skipped).toBe(false);
+    // One fetch per distinct credential index, each carrying auth_index.
+    expect(quotaUrls).toHaveLength(2);
+    expect(quotaUrls.every((u) => new URL(u).searchParams.get("auth_index"))).toBe(true);
+    expect(summary.errors.some((e) => e.includes("plugin"))).toBe(false);
+    const rows = s.savedRows as Record<string, AccountUsageRow>;
+    expect(Object.keys(rows)).toHaveLength(2);
+    const remaining = Object.values(rows)
+      .map((r) => r.limits.find((l) => l.id === "claude:weekly")?.remainingPercent)
+      .sort();
+    expect(remaining).toEqual([10, 80]);
+    expect(s.strike.failures).toHaveLength(0);
+    assertNoKeyLeak(s);
+  });
+
+  it("a failing per-file quota fetch is best-effort: the sync succeeds and spends no strike", async () => {
+    const fetchOneBad = vi.fn(async (input: string | URL | Request): Promise<Response> => {
+      const url = new URL(String(input));
+      if (url.pathname === "/v0/management/auth-files") {
+        return jsonResponse(200, [
+          { id: "claude-1", provider: "claude", auth_index: "aaaabbbbccccdddd" },
+          { id: "claude-2", provider: "claude", auth_index: "deadbeefdeadbeef" },
+        ]);
+      }
+      if (url.pathname === "/v0/management/plugins/claude-quota/quota") {
+        if (url.searchParams.get("auth_index") === "aaaabbbbccccdddd") {
+          return jsonResponse(200, { Groups: [{ Buckets: [{ Window: "weekly", RemainingFraction: 0.8 }] }] });
+        }
+        return new Response("auth_index is required", { status: 400 });
+      }
+      if (url.pathname === "/v1/models") return jsonResponse(200, modelsBody());
+      return new Response("not found", { status: 404 });
+    });
+    const s = store();
+    const summary = await runSync(deps(s, fetchOneBad as unknown as typeof fetch), { running: false });
+    expect(summary.skipped).toBe(false);
+    // The 400 warns per file (never the raw index) and spends no strike…
+    expect(summary.errors.some((e) => e.includes("claude (plugin claude-quota,"))).toBe(true);
+    const blob = JSON.stringify([summary.errors, summary.drift, s.activity]);
+    expect(blob).not.toContain("deadbeefdeadbeef");
+    expect(s.strike.failures).toHaveLength(0);
+    expect(s.strike.secretBad).toBe(false);
+    // …while the healthy file's payload still attaches to its own account.
+    const rows = s.savedRows as Record<string, AccountUsageRow>;
+    const withWeekly = Object.values(rows).filter((r) =>
+      r.limits.some((l) => l.id === "claude:weekly"),
+    );
+    expect(withWeekly).toHaveLength(1);
+    assertNoKeyLeak(s);
+  });
+
+  it("falls back to one provider-level quota fetch when entries carry no auth_index", async () => {
+    const quotaUrls: string[] = [];
+    const fetchLegacy = vi.fn(async (input: string | URL | Request): Promise<Response> => {
+      const url = new URL(String(input));
+      if (url.pathname === "/v0/management/auth-files") {
+        return jsonResponse(200, [
+          { id: "claude-1", provider: "claude" },
+          { id: "claude-2", provider: "claude" },
+        ]);
+      }
+      if (url.pathname === "/v0/management/plugins/claude-quota/quota") {
+        quotaUrls.push(url.toString());
+        return jsonResponse(200, pluginQuotaBody());
+      }
+      if (url.pathname === "/v1/models") return jsonResponse(200, modelsBody());
+      return new Response("not found", { status: 404 });
+    });
+    const s = store();
+    const summary = await runSync(deps(s, fetchLegacy as unknown as typeof fetch), { running: false });
+    expect(summary.skipped).toBe(false);
+    expect(quotaUrls).toHaveLength(1);
+    expect(new URL(quotaUrls[0] as string).search).toBe("");
+    const rows = s.savedRows as Record<string, AccountUsageRow>;
+    for (const r of Object.values(rows)) {
+      expect(r.limits.some((l) => l.id === "claude:weekly")).toBe(true);
+    }
+    assertNoKeyLeak(s);
   });
 
   it("treats a failing plugin route as best-effort: passive signals survive", async () => {

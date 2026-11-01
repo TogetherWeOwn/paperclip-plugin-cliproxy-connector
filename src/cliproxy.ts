@@ -48,6 +48,24 @@ const PLUGIN_QUOTA_SHAPE = /^\/v0\/management\/plugins\/[A-Za-z0-9][A-Za-z0-9_-]
 export const AUTH_FILE_MODELS_PATH = "/v0/management/auth-files/models";
 
 /**
+ * Single safe plugin-quota `auth_index` value: the credential index from the
+ * `auth-files` list (`GET /v0/management/plugins/<id>/quota?auth_index=…`,
+ * required since CLIProxy v8.0.49). Stored indexes are hex, but an operator
+ * seed may widen the alphabet — so this admits a conservative token (bounded,
+ * no separators, no traversal) rather than hex-only. `..` is rejected
+ * separately, and `api-call` can never appear anywhere in the request.
+ */
+export const AUTH_INDEX_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_.:+-]{0,127}$/;
+
+export function isSafeAuthIndex(value: string): boolean {
+  return (
+    AUTH_INDEX_PATTERN.test(value) &&
+    !value.includes("..") &&
+    !value.toLowerCase().includes("api-call")
+  );
+}
+
+/**
  * Single safe auth-file name: starts alphanumeric, then alphanumerics, dots,
  * underscores, hyphens, `@` or `+` (CLIProxy OAuth flows generate email-style
  * file names such as `antigravity-user@example.com.json`; rejecting them would
@@ -80,11 +98,19 @@ export function authFileModelsPath(name: string): string {
  */
 export const MODELS_PATH = "/v1/models";
 
-export function pluginQuotaPath(pluginId: string): string {
+export function pluginQuotaPath(pluginId: string, authIndex?: string | null): string {
   if (!SINGLE_SEGMENT.test(pluginId)) {
     throw new CliproxyConfigError(`refusing to build a quota path from an untrusted plugin id: ${pluginId}`);
   }
-  return `/v0/management/plugins/${pluginId}/quota`;
+  if (authIndex === undefined || authIndex === null) {
+    // Legacy provider-level shape (older CLIProxy builds that predate the
+    // required `auth_index` query parameter). Current builds always send one.
+    return `/v0/management/plugins/${pluginId}/quota`;
+  }
+  if (!isSafeAuthIndex(authIndex)) {
+    throw new CliproxyConfigError(`refusing to build a quota path from an untrusted auth index`);
+  }
+  return `/v0/management/plugins/${pluginId}/quota?auth_index=${encodeURIComponent(authIndex)}`;
 }
 
 export class CliproxyConfigError extends Error {}
@@ -174,7 +200,26 @@ function assertAllowListed(url: URL, what: string): void {
     }
     return;
   }
-  if (pathname !== AUTH_FILES_PATH && !PLUGIN_QUOTA_SHAPE.test(pathname)) {
+  if (PLUGIN_QUOTA_SHAPE.test(pathname)) {
+    // Pinned plugin-quota shape: no query (legacy provider-level fetch on
+    // older builds), or exactly one `auth_index` with a single safe value.
+    // Any other parameter — or an unsafe value, including one smuggled in via
+    // percent-encoding (searchParams decodes before this check) — rejects
+    // before any network happens, on initial and redirect-target URLs alike.
+    const keys = [...url.searchParams.keys()];
+    if (keys.length === 0) return;
+    const indexes = url.searchParams.getAll("auth_index");
+    if (
+      keys.length !== 1 ||
+      keys[0] !== "auth_index" ||
+      indexes.length !== 1 ||
+      !isSafeAuthIndex(indexes[0] as string)
+    ) {
+      throw new CliproxyConfigError(`plugin quota request has an unsafe query (${what})`);
+    }
+    return;
+  }
+  if (pathname !== AUTH_FILES_PATH) {
     throw new CliproxyConfigError(`path is outside the pinned GET allow-list: ${pathname}`);
   }
 }
@@ -402,11 +447,18 @@ export class CliproxyManagementClient {
     return this.getJson(authFileModelsPath(name));
   }
 
-  async getPluginQuota(pluginId: string): Promise<unknown> {
-    // Validated single segment: the substituted path always matches the
-    // pinned shape. Anything else rejects before any network happens.
-    // (`async` so the validation throw surfaces as a rejection.)
-    return this.getJson(pluginQuotaPath(pluginId));
+  /**
+   * GET one plugin's quota for one credential (`?auth_index=…`, required
+   * since CLIProxy v8.0.49). Omit `authIndex` only for the legacy
+   * provider-level shape on older builds. Best-effort like every quota read:
+   * 404/5xx/network failures warn per provider or per file and never spend
+   * strikes; 401/403 still stops the run (the key itself was rejected).
+   */
+  async getPluginQuota(pluginId: string, authIndex?: string | null): Promise<unknown> {
+    // Validated single segment + single safe query value: the substituted
+    // path always matches the pinned shape. Anything else rejects before any
+    // network happens. (`async` so the validation throw surfaces as a rejection.)
+    return this.getJson(pluginQuotaPath(pluginId, authIndex));
   }
 }
 

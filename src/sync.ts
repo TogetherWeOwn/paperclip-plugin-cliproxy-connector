@@ -19,6 +19,7 @@
 import {
   CliproxyAuthError,
   CliproxyClientApiClient,
+  CliproxyConfigError,
   CliproxyManagementClient,
   CliproxyNotFoundError,
   type ManagementFetch,
@@ -206,30 +207,78 @@ export async function runSync(deps: SyncDeps, inFlight: { running: boolean }): P
         throw err;
       });
 
-      // Per-provider plugin quota fetch is best-effort: a failing plugin
-      // route leaves the provider's accounts on their passive signals (or
-      // unknown), never headroom. One fetch per configured provider; raw
-      // payloads ride along by provider and are attached to every enabled
-      // account row of that provider at parse time.
+      // Per-file plugin quota fetch is best-effort: a failing plugin route
+      // leaves the account on its passive signals (or unknown), never
+      // headroom. CLIProxy v8.0.49 requires `?auth_index=<auth index>`
+      // (`GetPluginQuota` 400s without it), so one fetch runs per distinct
+      // credential index among the provider's enabled accounts; raw payloads
+      // ride along by `auth_index` and attach to their own account row at
+      // parse time. Entries without an index (older builds) keep the legacy
+      // provider-level fetch. Failed fetches warn per file or provider and
+      // never spend strikes; only a rejected key (401/403) stops the run.
       const pluginPayloadByProvider = new Map<string, unknown>();
+      const pluginPayloadByAuthIndex = new Map<string, unknown>();
       const pluginErrors: string[] = [];
       const fetchedPluginIds = new Map<string, string>();
+      const fetchedPluginKeys = new Set<string>();
+      // Discovery parse (no payloads): find each enabled account's provider +
+      // credential index. The real parse below re-runs with payloads
+      // attached; this pass's warnings are discarded.
+      const discovered = parseAuthFiles(authFiles, {
+        now: deps.now,
+        allowLists: deps.config.providerWindows,
+      });
+      const enabledIndexesByProvider = new Map<string, Set<string>>();
+      for (const a of discovered.accounts) {
+        if (a.status === "disabled" || !a.authIndex) continue;
+        let set = enabledIndexesByProvider.get(a.provider);
+        if (!set) {
+          set = new Set<string>();
+          enabledIndexesByProvider.set(a.provider, set);
+        }
+        set.add(a.authIndex);
+      }
       for (const entry of deps.config.providers) {
         const pluginId = deps.config.pluginQuotaIds[entry.provider];
         if (!pluginId) continue;
-        if (fetchedPluginIds.has(pluginId)) {
-          const first = fetchedPluginIds.get(pluginId) as string;
-          const prior = pluginPayloadByProvider.get(first);
-          if (prior !== undefined) pluginPayloadByProvider.set(entry.provider, prior);
+        const indexes = [...(enabledIndexesByProvider.get(entry.provider) ?? [])].sort();
+        if (indexes.length === 0) {
+          // No indexed credential for this provider: legacy provider-level
+          // fetch (older builds), shared across providers on one plugin id.
+          if (fetchedPluginIds.has(pluginId)) {
+            const first = fetchedPluginIds.get(pluginId) as string;
+            const prior = pluginPayloadByProvider.get(first);
+            if (prior !== undefined) pluginPayloadByProvider.set(entry.provider, prior);
+            continue;
+          }
+          try {
+            const payload = await client.getPluginQuota(pluginId);
+            fetchedPluginIds.set(pluginId, entry.provider);
+            pluginPayloadByProvider.set(entry.provider, payload);
+          } catch (err) {
+            if (err instanceof CliproxyAuthError) throw err; // stop after first rejected key
+            pluginErrors.push(`${entry.provider} (plugin ${pluginId}): ${err instanceof Error ? err.message : "fetch failed"}`);
+          }
           continue;
         }
-        try {
-          const payload = await client.getPluginQuota(pluginId);
-          fetchedPluginIds.set(pluginId, entry.provider);
-          pluginPayloadByProvider.set(entry.provider, payload);
-        } catch (err) {
-          if (err instanceof CliproxyAuthError) throw err; // stop after first rejected key
-          pluginErrors.push(`${entry.provider} (plugin ${pluginId}): ${err instanceof Error ? err.message : "fetch failed"}`);
+        for (const authIndex of indexes) {
+          const fetchKey = `${pluginId} ${authIndex}`;
+          if (fetchedPluginKeys.has(fetchKey)) continue;
+          try {
+            const payload = await client.getPluginQuota(pluginId, authIndex);
+            fetchedPluginKeys.add(fetchKey);
+            pluginPayloadByAuthIndex.set(authIndex, payload);
+          } catch (err) {
+            if (err instanceof CliproxyAuthError) throw err; // stop after first rejected key
+            // Auth indexes are opaque tokens, but never persist one raw in a
+            // warning: the short hash distinguishes files for debugging.
+            // Client messages are pathname-only and the path builder omits
+            // the value, so the scrub below is defense-in-depth.
+            const fileRef = `auth ${hashIdentity([authIndex])?.slice(0, 8) ?? "unknown"}`;
+            const rawMessage = err instanceof Error ? err.message : "fetch failed";
+            const safeMessage = rawMessage.split(authIndex).join(fileRef);
+            pluginErrors.push(`${entry.provider} (plugin ${pluginId}, ${fileRef}): ${safeMessage}`);
+          }
         }
       }
 
@@ -237,6 +286,7 @@ export async function runSync(deps: SyncDeps, inFlight: { running: boolean }): P
         now: deps.now,
         allowLists: deps.config.providerWindows,
         pluginPayloadByProvider,
+        pluginPayloadByAuthIndex,
       });
 
       // Group by stable row key: duplicates defeat keying (spike G-K1) and
@@ -256,6 +306,21 @@ export async function runSync(deps: SyncDeps, inFlight: { running: boolean }): P
       // warning; auth failures propagate to the strike budget like every
       // other management GET.
       const servedSets = await fetchServedSets(client, accounts);
+      // Refused served-set names are leftover non-account state (retired
+      // plugins), not a fetch failure: one quiet drift finding per file and
+      // provider, never a per-run sync error. The name check stays as-is.
+      for (const r of servedSets.refused) {
+        for (const provider of r.providers) {
+          drift.push({
+            kind: "untrusted-auth-file",
+            provider,
+            detail:
+              `${r.fileRef} is not a servable account credential, so its live served set was skipped ` +
+              `(refused name stays refused; the file's model_quotas heuristic still counts). ` +
+              `If this file belongs to a retired plugin, removing it from CLIProxy clears this finding.`,
+          });
+        }
+      }
 
       // Served-model catalog (best-effort): live `/v1/models` with the
       // *client* key, intersected with the auth-file list. A failed or
@@ -388,11 +453,19 @@ async function fetchServedSets(
   /** Providers with at least one successfully fetched file. */
   okProviders: Set<string>;
   warnings: string[];
+  /**
+   * Files refused for served-set before any network happened (untrusted
+   * name): the refusal is correct and stays — the caller reports these as
+   * quiet drift, not per-run sync errors. Raw names never leave this
+   * function; only hashed file references.
+   */
+  refused: Array<{ fileRef: string; providers: string[] }>;
 }> {
   const warnings: string[] = [];
   const byProvider = new Map<string, Set<string>>();
   const okFiles = new Set<string>();
   const okProviders = new Set<string>();
+  const refused: Array<{ fileRef: string; providers: string[] }> = [];
   // Enabled files only; group names so one GET serves every entry sharing it.
   const providersByName = new Map<string, Set<string>>();
   for (const a of accounts) {
@@ -414,7 +487,7 @@ async function fetchServedSets(
     warnings.push(
       "no enabled auth file exposes a name; skipping the served-set fetch this run (model_quotas heuristic still applies).",
     );
-    return { byProvider, okFiles, okProviders, warnings };
+    return { byProvider, okFiles, okProviders, warnings, refused };
   }
   let ok = 0;
   let notFound = 0;
@@ -434,9 +507,22 @@ async function fetchServedSets(
         );
         continue;
       }
-      // The client embeds the raw auth-file name in validation errors
-      // (CliproxyConfigError): scrub it before persisting, the same way the
-      // file reference above masks the name. Auth-file names can be emails.
+      if (err instanceof CliproxyConfigError) {
+        // Untrusted auth-file name (path-like leftover state from retired
+        // plugins, e.g. `auths/…/manifest.json`): refusing to build the
+        // served-set path is correct — the name check stays as-is. It is
+        // persistent state, not a transient fetch failure, so the caller
+        // reports it as quiet drift rather than a per-run sync error. The
+        // file's `model_quotas` heuristic still counts.
+        refused.push({ fileRef, providers: [...providers].sort() });
+        continue;
+      }
+      // Other per-file failures (network, 5xx, oversized body, rejected
+      // redirects) stay sync warnings: they may clear on the next run. The
+      // client embeds the rejected redirect-target pathname in its error, and
+      // that server-chosen path can echo the auth-file name — so scrub the
+      // raw name before persisting, the same way the file reference above
+      // masks it. Auth-file names can be emails.
       const rawMessage = err instanceof Error ? err.message : "fetch failed";
       const safeMessage = name ? rawMessage.split(name).join(fileRef) : rawMessage;
       warnings.push(
@@ -470,7 +556,7 @@ async function fetchServedSets(
       "the served-set endpoint returned 404 for every enabled auth file (older CLIProxy builds lack it); overlap detection falls back to the model_quotas + owned_by heuristic this run.",
     );
   }
-  return { byProvider, okFiles, okProviders, warnings };
+  return { byProvider, okFiles, okProviders, warnings, refused };
 }
 
 /**
