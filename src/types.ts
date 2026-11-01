@@ -28,6 +28,16 @@ export interface UsageLimitRow {
   allowed: boolean | null;
   /** True when this window gates routing decisions for its provider. */
   gating: boolean;
+  /**
+   * ISO time the observation behind this window was taken. Passive
+   * `auth-files` signals carry their own `observed_at` (which only refreshes
+   * when the account serves traffic); plugin-quota limits fetched at sync time
+   * carry the sync's fetch time. Null/undefined (e.g. rows cached before this
+   * field existed) falls back to the row's `checkedAt`. The router treats a
+   * window whose observation is older than the grace window as `unknown`
+   * (fail-open candidate), never as proof of health or exhaustion.
+   */
+  observedAt?: string | null;
 }
 
 /**
@@ -50,7 +60,12 @@ export interface AccountUsageRow {
   limits: UsageLimitRow[];
   /** Plan label from the provider payload, when present (display only). */
   planType: string | null;
-  /** ISO time the observation was taken (quota `observed_at` or fetch time). */
+  /**
+   * ISO time the sync fetched this row (cache age). Drives the bounded
+   * fail-open / fail-closed when sync dies. Per-window observation age lives
+   * on each limit's `observedAt` — an idle account's passive observation can
+   * be hours old while its cache row is minutes old.
+   */
   checkedAt: string;
   /** Freshness as classified at read time (not stored; computed by router). */
   freshness?: Freshness;
@@ -91,6 +106,19 @@ export interface DriftFinding {
     | "unkeyed-observation";
   prefix: string;
   detail: string;
+}
+
+/**
+ * A sync failure that never became a `SyncSummary`: non-auth fetch/parse
+ * errors and unresolvable secrets. Persisted under its own state key WITHOUT
+ * touching `last-sync.finishedAt` (which drives the min-interval check), so
+ * the page can show the failure instead of a stale "last successful run".
+ */
+export interface SyncFailure {
+  /** ISO time the failed attempt started. */
+  attemptedAt: string;
+  /** Human reason; never holds key material. */
+  message: string;
 }
 
 /** Result of one sync run (persisted summary + returned to the on-demand route). */

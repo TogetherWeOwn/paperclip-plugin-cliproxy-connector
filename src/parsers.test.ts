@@ -255,4 +255,25 @@ describe("parseAuthFiles", () => {
     );
     expect(accounts).toHaveLength(1);
   });
+
+  it("keeps cache age (fetch time) separate from per-window observation age", () => {
+    const { accounts } = parseAuthFiles(
+      [
+        {
+          prefix: "a-1",
+          channel: "claude",
+          quota: {
+            observed_at: "2026-11-01T09:00:00Z", // 3 h old passive observation
+            signals: [{ window: "5h", usedPercent: 10 }],
+          },
+        },
+      ],
+      { now: NOW, allowLists },
+    );
+    // Cache age is the fetch: sync is alive. The window keeps its own old
+    // observation time so the router can fail open (unknown) instead of
+    // failing closed on an idle account.
+    expect(accounts[0].checkedAt).toBe(NOW);
+    expect(accounts[0].limits[0].observedAt).toBe("2026-11-01T09:00:00.000Z");
+  });
 });

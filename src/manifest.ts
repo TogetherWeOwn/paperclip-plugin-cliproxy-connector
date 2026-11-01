@@ -11,6 +11,8 @@ export const STATE_NAMESPACE = "cliproxy-connector";
 export const ROWS_STATE_KEY = "usage-rows";
 export const LAST_SYNC_STATE_KEY = "last-sync";
 export const STRIKE_STATE_KEY = "strike-budget";
+/** Latest sync failure (non-auth errors, unresolvable secrets). Never touches `last-sync`. */
+export const LAST_ERROR_STATE_KEY = "last-error";
 
 const manifest: PaperclipPluginManifestV1 = {
   id: PLUGIN_ID,

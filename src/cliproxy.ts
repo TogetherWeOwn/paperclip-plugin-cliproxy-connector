@@ -17,11 +17,27 @@
  * key is resolved per run from a `secret_ref` and kept in memory only.
  */
 
-import { isLoopbackUrl } from "./config.js";
+import { SINGLE_SEGMENT, isLoopbackUrl } from "./config.js";
 
 export const MANAGEMENT_TIMEOUT_MS = 15_000;
 export const MANAGEMENT_MAX_BYTES = 2 * 1024 * 1024;
 export const MANAGEMENT_MAX_REDIRECTS = 2;
+
+/**
+ * Pinned management paths (fixed shapes, never config strings). The key is
+ * only ever attached to these two shapes; `api-call` can never be admitted
+ * because no pinned shape contains it. `pluginId` is validated to a single
+ * path segment before substitution.
+ */
+export const AUTH_FILES_PATH = "/v0/management/auth-files";
+const PLUGIN_QUOTA_SHAPE = /^\/v0\/management\/plugins\/[A-Za-z0-9][A-Za-z0-9_-]*\/quota$/;
+
+export function pluginQuotaPath(pluginId: string): string {
+  if (!SINGLE_SEGMENT.test(pluginId)) {
+    throw new CliproxyConfigError(`refusing to build a quota path from an untrusted plugin id: ${pluginId}`);
+  }
+  return `/v0/management/plugins/${pluginId}/quota`;
+}
 
 export class CliproxyConfigError extends Error {}
 export class CliproxyAuthError extends Error {
@@ -36,12 +52,6 @@ export class CliproxyRedirectError extends Error {}
 export class CliproxyBodyError extends Error {}
 export class CliproxyNetworkError extends Error {}
 
-export interface ManagementPaths {
-  authFilesPath: string;
-  pluginQuotaPathTemplate: string;
-  modelsPath: string;
-}
-
 /** The client only ever GETs string URLs; keep the type structural. */
 export type ManagementFetch = (input: string, init?: RequestInit) => Promise<Response>;
 
@@ -50,10 +60,38 @@ export interface CliproxyClientOptions {
   keyHeader: string;
   /** Resolved management key. In memory only; never logged or persisted. */
   key: string;
-  paths: ManagementPaths;
   fetchImpl?: ManagementFetch;
   timeoutMs?: number;
   maxBytes?: number;
+}
+
+/**
+ * Decode a pathname for allow-list comparison. Percent-encoding must not
+ * smuggle a blocked path past the check (`api%2Dcall`, `..%2F…`), so the
+ * allow-list and the `api-call` ban both run on the decoded form.
+ */
+function decodedPathname(url: URL, what: string): string {
+  let pathname: string;
+  try {
+    pathname = decodeURIComponent(url.pathname);
+  } catch {
+    throw new CliproxyConfigError(`undecodable management path (${what})`);
+  }
+  // Decoded traversal or embedded separators mean the raw path was hostile.
+  if (pathname.includes("..") || pathname.includes("\\")) {
+    throw new CliproxyConfigError(`refusing a management path that decodes hostile (${what})`);
+  }
+  return pathname;
+}
+
+function assertAllowListed(url: URL, what: string): void {
+  const pathname = decodedPathname(url, what);
+  if (pathname.toLowerCase().includes("api-call")) {
+    throw new CliproxyConfigError("`api-call` is excluded from the allow-list and can never be called.");
+  }
+  if (pathname !== AUTH_FILES_PATH && !PLUGIN_QUOTA_SHAPE.test(pathname)) {
+    throw new CliproxyConfigError(`path is outside the pinned GET allow-list: ${pathname}`);
+  }
 }
 
 function assertNoKeyLeak(text: string, key: string, where: string): void {
@@ -66,7 +104,6 @@ export class CliproxyManagementClient {
   private readonly baseUrl: string;
   private readonly keyHeader: string;
   private readonly key: string;
-  private readonly paths: ManagementPaths;
   private readonly fetchImpl: ManagementFetch;
   private readonly timeoutMs: number;
   private readonly maxBytes: number;
@@ -80,29 +117,12 @@ export class CliproxyManagementClient {
     this.baseUrl = opts.baseUrl.replace(/\/+$/, "");
     this.keyHeader = opts.keyHeader;
     this.key = opts.key;
-    this.paths = opts.paths;
     this.fetchImpl = opts.fetchImpl ?? fetch;
     this.timeoutMs = opts.timeoutMs ?? MANAGEMENT_TIMEOUT_MS;
     this.maxBytes = opts.maxBytes ?? MANAGEMENT_MAX_BYTES;
   }
 
-  /** Expanded allow-list. Every entry is GET-only. */
-  private allowedPaths(extraPluginIds: string[] = []): string[] {
-    const paths = [this.paths.authFilesPath, this.paths.modelsPath];
-    for (const id of extraPluginIds) {
-      paths.push(this.paths.pluginQuotaPathTemplate.replace("{pluginId}", id));
-    }
-    return paths;
-  }
-
-  private resolveTarget(path: string, extraPluginIds: string[] = []): URL {
-    const allow = this.allowedPaths(extraPluginIds);
-    if (!allow.includes(path)) {
-      throw new CliproxyConfigError(`path is outside the GET allow-list: ${path}`);
-    }
-    if (path.includes("api-call")) {
-      throw new CliproxyConfigError("`api-call` is excluded from the allow-list and can never be called.");
-    }
+  private resolveTarget(path: string): URL {
     let url: URL;
     try {
       url = new URL(path, this.baseUrl);
@@ -113,12 +133,15 @@ export class CliproxyManagementClient {
     if (url.origin !== origin || !isLoopbackUrl(url.toString())) {
       throw new CliproxyConfigError(`management target failed origin validation: ${path}`);
     }
+    // Pinned allow-list + `api-call` ban, both on the decoded pathname so
+    // percent-encoding cannot smuggle a blocked path past the check.
+    assertAllowListed(url, path);
     return url;
   }
 
-  /** GET one allow-listed path. Returns parsed JSON (object or array). */
-  async getJson(path: string, extraPluginIds: string[] = []): Promise<unknown> {
-    let url = this.resolveTarget(path, extraPluginIds);
+  /** GET one pinned path. Returns parsed JSON (object or array). */
+  async getJson(path: string): Promise<unknown> {
+    let url = this.resolveTarget(path);
     for (let hop = 0; hop <= MANAGEMENT_MAX_REDIRECTS; hop++) {
       // Attach the key header only after origin validation above.
       const headers: Record<string, string> = { Accept: "application/json" };
@@ -152,8 +175,12 @@ export class CliproxyManagementClient {
         if (next.origin !== origin || !isLoopbackUrl(next.toString())) {
           throw new CliproxyRedirectError(`redirect escapes the loopback origin; refusing to follow`);
         }
-        if (!this.allowedPaths(extraPluginIds).includes(next.pathname)) {
-          throw new CliproxyRedirectError(`redirect target is outside the GET allow-list; refusing to follow`);
+        try {
+          assertAllowListed(next, `redirect target ${next.pathname}`);
+        } catch (err) {
+          throw new CliproxyRedirectError(
+            `redirect target is outside the pinned GET allow-list; refusing to follow: ${err instanceof Error ? err.message : "blocked"}`,
+          );
         }
         url = next;
         continue;
@@ -203,15 +230,13 @@ export class CliproxyManagementClient {
   }
 
   getAuthFiles(): Promise<unknown> {
-    return this.getJson(this.paths.authFilesPath);
+    return this.getJson(AUTH_FILES_PATH);
   }
 
-  getPluginQuota(pluginId: string): Promise<unknown> {
-    const path = this.paths.pluginQuotaPathTemplate.replace("{pluginId}", pluginId);
-    return this.getJson(path, [pluginId]);
-  }
-
-  getModels(): Promise<unknown> {
-    return this.getJson(this.paths.modelsPath);
+  async getPluginQuota(pluginId: string): Promise<unknown> {
+    // Validated single segment: the substituted path always matches the
+    // pinned shape. Anything else rejects before any network happens.
+    // (`async` so the validation throw surfaces as a rejection.)
+    return this.getJson(pluginQuotaPath(pluginId));
   }
 }

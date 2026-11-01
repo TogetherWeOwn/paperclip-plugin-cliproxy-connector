@@ -11,7 +11,7 @@ import manifest, {
   SYNC_JOB_KEY,
   WIDGET_DATA_KEY,
 } from "./manifest.js";
-import plugin, { routeWithCache, toRouterCandidates } from "./plugin.js";
+import plugin, { normaliseStrikeOrigin, routeWithCache, toRouterCandidates } from "./plugin.js";
 import type { AccountUsageRow } from "./types.js";
 
 const COMPANY = "co-1";
@@ -27,6 +27,12 @@ const COMPANY_CONFIG = {
 
 function stateKey(stateKey: string) {
   return { scopeKind: "company" as const, scopeId: COMPANY, namespace: STATE_NAMESPACE, stateKey };
+}
+
+const ORIGIN = "http://127.0.0.1:8317";
+
+function instanceStrikeKey() {
+  return { scopeKind: "instance" as const, namespace: STATE_NAMESPACE, stateKey: `${STRIKE_STATE_KEY}:${ORIGIN}` };
 }
 
 function jsonResponse(status: number, body: unknown): Response {
@@ -112,9 +118,34 @@ describe("sync job", () => {
     const strike = await harness.performAction<{ disabled: boolean }>(
       REENABLE_ACTION_KEY,
       {},
-      { companyId: COMPANY },
+      { companyId: COMPANY, actor: { type: "user", userId: "u-1" } },
     );
     expect(strike.disabled).toBe(false);
+  });
+
+  it("re-enable action rejects non-board actors (M3)", async () => {
+    const harness = await setup();
+    for (const actor of [
+      { type: "agent", agentId: "a-1" },
+      { type: "system" },
+      undefined, // harness default: system
+    ] as const) {
+      await expect(
+        harness.performAction(REENABLE_ACTION_KEY, {}, { companyId: COMPANY, actor: actor as never }),
+      ).rejects.toThrow(/board-user/);
+    }
+    // No strike state was written for the rejected calls.
+    expect(harness.getState(instanceStrikeKey())).toBeUndefined();
+  });
+
+  it("a 401 during the job writes the budget to the instance-scoped origin key (M1)", async () => {
+    const harness = await setup();
+    harness.ctx.http.fetch = (async () => new Response("nope", { status: 401 })) as never;
+    await harness.runJob(SYNC_JOB_KEY);
+    const strike = harness.getState(instanceStrikeKey()) as { failures: string[]; secretBad: boolean } | null;
+    expect(strike).not.toBeNull();
+    expect(strike?.failures).toHaveLength(1);
+    expect(strike?.secretBad).toBe(true);
   });
 });
 
@@ -140,11 +171,13 @@ describe("config validation and health", () => {
 describe("board re-enable API route", () => {
   it("clears a spent strike budget and rejects unknown routes", async () => {
     const harness = await setup();
+    // Legacy company-scoped key: the route adopts it into the instance-scoped
+    // origin bucket once, then deletes the legacy key.
     const strikeKey = { ...stateKey(STRIKE_STATE_KEY), namespace: "cliproxy-connector" };
     harness.ctx.state.set(strikeKey as never, {
-      failures: ["2026-11-01T12:00:00.000Z"],
+      failures: ["2026-01-01T00:00:00.000Z"],
       disabled: true,
-      disabledAt: "2026-11-01T12:00:00.000Z",
+      disabledAt: "2026-01-01T00:00:00.000Z",
       disabledReason: "spent",
       secretBad: true,
     } as never);
@@ -161,6 +194,10 @@ describe("board re-enable API route", () => {
     });
     expect(res.status).toBe(200);
     expect((res.body as { strike: { disabled: boolean } }).strike.disabled).toBe(false);
+    // Adopted into the instance-scoped origin bucket; the legacy key is gone.
+    const adopted = harness.getState(instanceStrikeKey()) as { disabled: boolean } | null;
+    expect(adopted?.disabled).toBe(false);
+    expect(harness.getState(strikeKey)).toBeUndefined();
 
     const unknown = await plugin.definition.onApiRequest!({
       routeKey: "nope",
@@ -174,6 +211,14 @@ describe("board re-enable API route", () => {
       headers: {},
     });
     expect(unknown.status).toBe(404);
+  });
+});
+
+describe("strike origin keying (M1)", () => {
+  it("normalises base URLs to their origin for the shared budget", () => {
+    expect(normaliseStrikeOrigin("http://127.0.0.1:8317")).toBe("http://127.0.0.1:8317");
+    expect(normaliseStrikeOrigin("http://127.0.0.1:8317/")).toBe("http://127.0.0.1:8317");
+    expect(normaliseStrikeOrigin("http://localhost:8317/api")).toBe("http://localhost:8317");
   });
 });
 

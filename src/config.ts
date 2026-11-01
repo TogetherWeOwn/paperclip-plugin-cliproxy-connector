@@ -14,12 +14,6 @@ export interface ConnectorConfig {
   managementKeyHeader: string;
   /** Paperclip `secret_ref` object for the management key. Never persisted. */
   managementSecretRef: unknown;
-  /** Management path listing auth files / account quota observations. */
-  authFilesPath: string;
-  /** Template for per-plugin quota fetch; `{pluginId}` is substituted. */
-  pluginQuotaPathTemplate: string;
-  /** Path for the model catalog (used to confirm prefixed ids exist). */
-  modelsPath: string;
   /** Sync cadence in minutes. The cron job runs every 5; larger values skip. */
   syncIntervalMinutes: number;
   /** Default reserve: members at or below this remaining % are skipped. */
@@ -45,9 +39,6 @@ export interface ConnectorConfig {
 }
 
 export const DEFAULTS = {
-  authFilesPath: "/v0/management/auth-files",
-  pluginQuotaPathTemplate: "/v0/management/plugins/{pluginId}/quota",
-  modelsPath: "/v1/models",
   syncIntervalMinutes: 5,
   reservePercent: 10,
   recheckSeconds: 60,
@@ -73,7 +64,8 @@ export const DEFAULT_PROVIDER_WINDOWS: Record<string, string[]> = {
   "opencode-go": ["rolling", "weekly", "monthly", "5h"],
 };
 
-const SINGLE_SEGMENT = /^[A-Za-z0-9][A-Za-z0-9_-]*$/;
+/** Single path segment: no slashes, no dots, no encoding tricks. Shared with the management client. */
+export const SINGLE_SEGMENT = /^[A-Za-z0-9][A-Za-z0-9_-]*$/;
 
 export function isLoopbackUrl(raw: string): boolean {
   let url: URL;
@@ -212,13 +204,14 @@ export function parseConfig(raw: unknown): { config: ConnectorConfig; validation
     );
   }
 
+  // NOTE: the management client uses pinned paths (see cliproxy.ts
+  // AUTH_FILES_PATH / pluginQuotaPath) — there are deliberately no config
+  // knobs for them. Unknown keys (including the removed authFilesPath /
+  // pluginQuotaPathTemplate / modelsPath) are ignored, never honoured.
   const config: ConnectorConfig = {
     cliproxyBaseUrl,
     managementKeyHeader,
     managementSecretRef: r.managementSecretRef,
-    authFilesPath: str(r.authFilesPath) || DEFAULTS.authFilesPath,
-    pluginQuotaPathTemplate: str(r.pluginQuotaPathTemplate) || DEFAULTS.pluginQuotaPathTemplate,
-    modelsPath: str(r.modelsPath) || DEFAULTS.modelsPath,
     syncIntervalMinutes,
     reservePercent,
     perPoolReservePercent,
