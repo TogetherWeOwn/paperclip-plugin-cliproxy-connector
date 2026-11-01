@@ -64,20 +64,41 @@ function asObj(v: unknown): Json | null {
  * (`{data: [...]}`), a `{models: [...]}` wrapper, or a bare array. Entries
  * accept `{id, owned_by|ownedBy|owner}` objects or plain id strings. Entries
  * without a usable id are skipped with a warning — never trusted.
+ *
+ * Pass `{ emptyIsValid: true }` for per-file served-set fetches
+ * (`GET auth-files/models?name=<file>`): a successful empty answer is valid
+ * evidence that the credential serves nothing, not the catalog-wide "no
+ * provider has proven models" signal.
  */
-export function parseModelsPayload(payload: unknown): { models: ServedModel[]; warnings: string[] } {
+export function parseModelsPayload(
+  payload: unknown,
+  opts?: { emptyIsValid?: boolean },
+): { models: ServedModel[]; warnings: string[] } {
   const warnings: string[] = [];
   const models: ServedModel[] = [];
   const root = asObj(payload);
-  const entries: unknown[] = Array.isArray(payload)
+  const list: unknown[] | undefined = Array.isArray(payload)
     ? payload
     : root
-      ? (["data", "models", "items", "results"]
+      ? ((["data", "models", "items", "results"]
           .map((k) => (root as Json)[k])
-          .find((v) => Array.isArray(v)) as unknown[]) ?? []
-      : [];
+          .find((v) => Array.isArray(v)) as unknown[] | undefined) ?? undefined)
+      : undefined;
+  const entries: unknown[] = list ?? [];
   if (entries.length === 0) {
-    warnings.push("models payload holds no entries; no provider has proven models this run.");
+    // Suppress the warning only when a list was actually found and is empty.
+    // An unrecognised shape (no list under data/models/items/results, or a
+    // non-object payload) still warns — with per-file wording when the caller
+    // opted into empty-is-valid — so a changed endpoint shape or a 200 with
+    // `{"error":...}` never counts silently as evidence.
+    if (list !== undefined && opts?.emptyIsValid) {
+      return { models, warnings };
+    }
+    if (opts?.emptyIsValid) {
+      warnings.push("served-set payload has no recognisable model list; no served evidence from this file this run.");
+    } else {
+      warnings.push("models payload holds no entries; no provider has proven models this run.");
+    }
     return { models, warnings };
   }
   const seen = new Set<string>();

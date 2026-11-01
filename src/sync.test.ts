@@ -542,6 +542,36 @@ describe("served-model catalog (/v1/models + auth-files)", () => {
     expect(s.strike.failures).toHaveLength(0);
     assertNoKeyLeak(s);
   });
+
+  it("an empty served set is valid evidence and warns nothing", async () => {
+    // A credential that legitimately serves nothing answers successfully with
+    // an empty list. That must not emit the /v1/models empty-payload
+    // wording, and live membership (even empty) still supersedes the
+    // `owned_by` fallback, so the id is proven for nobody.
+    const fetchEmptyServedSet = vi.fn(async (input: string | URL | Request): Promise<Response> => {
+      const url = new URL(String(input));
+      if (url.pathname === "/v0/management/auth-files") {
+        return jsonResponse(200, [{ id: "claude-1", name: "claude-file", provider: "claude" }]);
+      }
+      if (url.pathname === "/v0/management/auth-files/models") {
+        return jsonResponse(200, { data: [] });
+      }
+      if (url.pathname === "/v1/models") {
+        return jsonResponse(200, { data: [{ id: "claude-opus-4-5", owned_by: "anthropic" }] });
+      }
+      return new Response("not found", { status: 404 });
+    });
+    const s = store();
+    const summary = await runSync(deps(s, fetchEmptyServedSet as unknown as typeof fetch), {
+      running: false,
+    });
+    expect(summary.skipped).toBe(false);
+    expect(summary.errors.some((e) => e.includes("holds no entries"))).toBe(false);
+    expect(summary.providerModels?.claude ?? []).toEqual([]);
+    expect(summary.modelOverlaps).toEqual([]);
+    expect(s.strike.failures).toHaveLength(0);
+    assertNoKeyLeak(s);
+  });
 });
 
 describe("strike budget (TWO-378 lesson)", () => {
