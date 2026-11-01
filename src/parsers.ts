@@ -1,5 +1,5 @@
 /**
- * Per-provider quota parsers (TWO-578 spike matrix §2 + §3.3 + §6).
+ * Per-provider quota parsers (TWO-578 spike matrix §2 + §3.3 + §6, TWO-679 v2).
  *
  * Every parser normalizes into `UsageLimitRow[]` with the same field names as
  * `shared/ai-connection-usage.d.ts`, so the later core hook is a format no-op.
@@ -8,17 +8,22 @@
  * instead of guessing.
  *
  * Two payload shapes are consumed (proposal §4 GET allow-list):
- * 1. `auth-files` entries: passive per-credential observations for Claude,
- *    Codex and Devin (`quota{observed_at, signals}`, `model_quotas`), plus
- *    cooldown state. Exact JSON is operator-captured (spike §8 item 8), so
- *    extraction is defensive: unknown shapes become warnings + quota-blind.
+ * 1. `auth-files` entries: reconciled per-credential state (`disabled`,
+ *    `unavailable`, `next_retry_after`, `status`, `status_message`,
+ *    `priority`) plus passive quota observations for Claude, Codex and Devin
+ *    (`quota{observed_at, signals}`, `model_quotas` keyed by model). Signal
+ *    maps carry raw upstream header names to string values
+ *    (`anthropic-ratelimit-unified-*-utilization`, `x-codex-*-used-percent`,
+ *    `retry-after`, …) — see `quota_signals.go` in CLIProxyAPI. Exact live
+ *    management JSON is still operator-captured when available; until then
+ *    the fixture in `sync.test.ts` mirrors the source shapes above.
  * 2. Plugin quota routes: the normalized `QuotaFetchResponse` shape
  *    (`Subscription`, `Summary`, `Groups[].Buckets[]` with `Window`,
  *    `RemainingFraction`, `ResetTime`) our five provider plugins return.
  */
 
 import { createHash } from "node:crypto";
-import type { UsageLimitRow } from "./types.js";
+import type { AccountStatus, UsageLimitRow } from "./types.js";
 
 /* ------------------------------------------------------------------ */
 /* small defensive accessors                                           */
@@ -114,7 +119,7 @@ export type ProviderKey =
   | "opencode-go"
   | "unknown-provider";
 
-/** Normalize a CLIProxy channel / provider word into a parser key. */
+/** Normalize a CLIProxy provider word into a parser key. */
 export function normalizeProvider(channel: unknown): ProviderKey {
   const c = String(channel ?? "").toLowerCase().replace(/[_-]/g, "-");
   if (!c) return "unknown-provider";
@@ -169,7 +174,7 @@ export function isGatingWindow(
   if (opts?.spendControl) return true;
   if (opts?.scope !== undefined && opts?.scope !== null) return false;
   const id = windowId.toLowerCase();
-  return allowList.some((sub) => sub !== "" && id.includes(sub.toLowerCase()));
+  return allowList.some((sub) => sub !== "" && id.toLowerCase().includes(sub.toLowerCase()));
 }
 
 function makeLimit(init: {
@@ -182,6 +187,7 @@ function makeLimit(init: {
   allowed?: boolean | null;
   gating?: boolean;
   observedAt?: string | null;
+  models?: string[] | null;
 }): UsageLimitRow {
   return {
     id: init.id,
@@ -193,6 +199,7 @@ function makeLimit(init: {
     allowed: init.allowed ?? null,
     gating: init.gating ?? false,
     observedAt: init.observedAt ?? null,
+    models: init.models ?? null,
   };
 }
 
@@ -319,65 +326,246 @@ export interface ParsedSignals {
   limits: UsageLimitRow[];
   /** `observed_at` coerced to ISO, or null when absent/unparseable. */
   observedAt: string | null;
+  /** Plan label carried by the signals (Codex `x-codex-plan-type`), if any. */
+  planType: string | null;
   warnings: string[];
 }
 
+interface WindowAccum {
+  window: string;
+  used: number | null;
+  allowed: boolean | null;
+  limitReached: boolean;
+  resetsAt: string | null;
+  extraResetMs: number[];
+  labelExtra: string | null;
+  spendBlocked: boolean;
+}
+
+function newWindowAccum(window: string): WindowAccum {
+  return {
+    window,
+    used: null,
+    allowed: null,
+    limitReached: false,
+    resetsAt: null,
+    extraResetMs: [],
+    labelExtra: null,
+    spendBlocked: false,
+  };
+}
+
+/** Utilization-like value → used percent. Fractions (0–1.x) scale to 0–100. */
+function toUsedPercent(v: number): number | null {
+  if (!Number.isFinite(v) || v < 0) return null;
+  if (v <= 1.5) return v * 100;
+  if (v <= 150) return v;
+  return null;
+}
+
 /**
- * Parse passive per-credential quota signals from an `auth-files` entry.
- * Claude: `Anthropic-Ratelimit-Unified-*` (5h / 7d / Fable windows,
- * utilization + reset). Codex: `X-Codex-*` (per-window used-percent,
- * window-minutes, reset-at, credits, plan-type). Devin: Devin-shaped windows
- * mapped conservatively (window id kept verbatim, percents as reported).
+ * Parse one passive quota observation (`{observed_at, signals}`) where
+ * `signals` is the raw upstream header map CLIProxy snapshots
+ * (`sdk/cliproxy/auth/quota_signals.go`): keys are header names, values are
+ * strings. Unknown keys are ignored with a single summary warning — never
+ * headroom.
  *
- * Signals exist only after traffic and go stale — the freshness bound is the
- * router's job. Here `observed_at` becomes the observation time; when it is
- * missing the caller substitutes the fetch time and the observation is
- * already one step less trustworthy (recorded as a warning).
+ * Claude windows come from `anthropic-ratelimit-unified-<window>-<metric>`
+ * (`utilization` fraction, `reset` timestamp, `status` allowed/rejected).
+ * Codex windows come from `x-codex-[<ns>-]<primary|secondary>-<metric>`
+ * (`used-percent` 0–100, `reset-at` unix, `reset-after-seconds`,
+ * `allowed`, `limit-reached`). A bare `retry-after` (seconds) is an explicit
+ * 429 watermark for any provider and always limits.
  */
-export function parsePassiveSignals(
+export function parseHeaderSignals(
   provider: ProviderKey,
-  quota: Json | null,
+  signals: Record<string, unknown>,
+  observedAt: string | null,
   allowList: string[],
+  opts?: { models?: string[] | null; labelPrefix?: string },
+): ParsedSignals {
+  const warnings: string[] = [];
+  const byWindow = new Map<string, WindowAccum>();
+  const acc = (window: string): WindowAccum => {
+    let a = byWindow.get(window);
+    if (!a) {
+      a = newWindowAccum(window);
+      byWindow.set(window, a);
+    }
+    return a;
+  };
+  let ignored = 0;
+  let retryAfterSeconds: number | null = null;
+  let planType: string | null = null;
+
+  for (const [rawKey, rawValue] of Object.entries(signals)) {
+    const key = rawKey.toLowerCase().replace(/_/g, "-");
+    const value = typeof rawValue === "string" ? rawValue.trim() : String(rawValue ?? "").trim();
+    if (!value) {
+      ignored += 1;
+      continue;
+    }
+    if (key === "retry-after") {
+      const secs = Number(value);
+      if (Number.isFinite(secs) && secs >= 0 && secs < 31_536_000) retryAfterSeconds = secs;
+      else ignored += 1;
+      continue;
+    }
+    if (provider === "codex" && (key === "x-codex-plan-type" || key === "x-codex-active-limit")) {
+      if (key === "x-codex-plan-type") planType = value;
+      continue;
+    }
+    if (provider === "codex" && key === "x-codex-credits-has-credits") {
+      if (value.toLowerCase() === "false") acc("credits").limitReached = true;
+      continue;
+    }
+    if (provider === "codex" && key === "x-codex-credits-balance") continue; // informational only
+    if (provider === "codex" && key.endsWith("-limit-name")) {
+      const m = /^x-codex-(.*?)-(?:primary|secondary)-limit-name$/.exec(key);
+      if (m) acc(m[1] === "" ? "primary" : m[1]).labelExtra = value;
+      continue;
+    }
+
+    // Claude unified: anthropic-ratelimit-unified-<window>-<metric>.
+    let m = /^anthropic-ratelimit-unified-(.+?)-(utilization|reset|status)$/.exec(key);
+    if (m && (provider === "claude" || provider === "unknown-provider")) {
+      const a = acc(m[1]);
+      if (m[2] === "utilization") {
+        const used = toUsedPercent(Number(value));
+        if (used !== null) a.used = Math.max(a.used ?? -Infinity, used);
+        else ignored += 1;
+      } else if (m[2] === "reset") {
+        const iso = toIsoTimestamp(value);
+        if (iso) a.extraResetMs.push(Date.parse(iso));
+        else ignored += 1;
+      } else {
+        const v = value.toLowerCase();
+        if (v === "allowed") a.allowed = a.allowed === false ? false : true;
+        else if (v === "rejected") a.allowed = false;
+        else ignored += 1;
+      }
+      continue;
+    }
+    // Codex namespaced: x-codex-[<ns>-]<primary|secondary>-<metric>.
+    m = /^x-codex-(.*?)-(primary|secondary)-(used-percent|window-minutes|reset-at|reset-after-seconds|allowed|limit-reached|over-secondary-limit-percent)$/.exec(key);
+    if (m && (provider === "codex" || provider === "unknown-provider")) {
+      const window = m[1] ? `${m[1]}-${m[2]}` : m[2];
+      const a = acc(window);
+      const metric = m[3];
+      if (metric === "used-percent") {
+        const used = toUsedPercent(Number(value));
+        if (used !== null) a.used = Math.max(a.used ?? -Infinity, used);
+        else ignored += 1;
+      } else if (metric === "reset-at") {
+        const iso = toIsoTimestamp(Number(value));
+        if (iso) a.extraResetMs.push(Date.parse(iso));
+        else ignored += 1;
+      } else if (metric === "reset-after-seconds") {
+        const secs = Number(value);
+        if (Number.isFinite(secs) && secs >= 0 && secs < 31_536_000) {
+          const base = observedAt ? Date.parse(observedAt) : NaN;
+          a.extraResetMs.push((Number.isNaN(base) ? Date.now() : base) + secs * 1000);
+        } else ignored += 1;
+      } else if (metric === "allowed") {
+        const v = value.toLowerCase();
+        if (v === "true") a.allowed = a.allowed === false ? false : true;
+        else if (v === "false") a.allowed = false;
+        else ignored += 1;
+      } else if (metric === "limit-reached") {
+        const v = value.toLowerCase();
+        if (v === "true") a.limitReached = true;
+        else if (v !== "false") ignored += 1;
+      } else {
+        // window-minutes / over-secondary-limit-percent: window length metadata.
+        ignored += 1;
+      }
+      continue;
+    }
+    ignored += 1;
+  }
+
+  const limits: UsageLimitRow[] = [];
+  for (const a of byWindow.values()) {
+    let usedPercent: number | null = a.used;
+    let remainingPercent: number | null =
+      usedPercent !== null ? Math.max(0, 100 - Math.min(100, usedPercent)) : null;
+    const exhausted = a.limitReached || a.allowed === false || (remainingPercent ?? 100) <= 0;
+    const resets = a.extraResetMs.filter((t) => Number.isFinite(t));
+    const resetsAt = resets.length > 0 ? new Date(Math.max(...resets)).toISOString() : null;
+    const gating = isGatingWindow(provider, a.window, allowList);
+    limits.push(
+      makeLimit({
+        id: `${provider}:${a.window}`,
+        label: `${opts?.labelPrefix ?? provider} ${a.window}${a.labelExtra ? ` (${a.labelExtra})` : ""}`,
+        usedPercent,
+        remainingPercent,
+        resetsAt,
+        limitReached: exhausted,
+        allowed: exhausted ? false : a.allowed ?? (remainingPercent !== null ? true : null),
+        gating,
+        observedAt,
+        models: opts?.models ?? null,
+      }),
+    );
+  }
+  if (retryAfterSeconds !== null) {
+    const base = observedAt ? Date.parse(observedAt) : NaN;
+    const resetMs = (Number.isNaN(base) ? Date.now() : base) + retryAfterSeconds * 1000;
+    limits.push(
+      makeLimit({
+        id: `${provider}:retry-after`,
+        label: `${opts?.labelPrefix ?? provider} retry-after`,
+        usedPercent: 100,
+        remainingPercent: 0,
+        resetsAt: new Date(resetMs).toISOString(),
+        limitReached: true,
+        allowed: false,
+        gating: isGatingWindow(provider, "retry-after", allowList),
+        observedAt,
+        models: opts?.models ?? null,
+      }),
+    );
+  }
+  if (Object.keys(signals).length > 0 && limits.length === 0 && retryAfterSeconds === null) {
+    warnings.push(
+      `${provider}: ${ignored} quota signal${ignored === 1 ? "" : "s"} carried no usable window; treating this observation as unknown.`,
+    );
+  }
+  return { limits, observedAt, planType, warnings };
+}
+
+/**
+ * Defensive fallback for window-object signal lists (older/guessed shapes):
+ * `[{window|name, usedPercent|remainingPercent, resetAt, allowed,
+ * limitReached}]`. Unknown shapes become warnings + zero windows.
+ */
+export function parseLegacySignalList(
+  provider: ProviderKey,
+  signals: unknown,
+  observedAt: string | null,
+  allowList: string[],
+  opts?: { models?: string[] | null; labelPrefix?: string },
 ): ParsedSignals {
   const warnings: string[] = [];
   const limits: UsageLimitRow[] = [];
-  if (!quota) {
-    warnings.push(`${provider}: no quota observation on this account.`);
-    return { limits, observedAt: null, warnings };
+  if (!Array.isArray(signals)) {
+    warnings.push(`${provider}: quota signals are not a header map or window list; treating as unknown.`);
+    return { limits, observedAt, planType: null, warnings };
   }
-  const observedAt =
-    toIsoTimestamp(quota.observed_at ?? quota.observedAt ?? quota.observedAtMs ?? null) ?? null;
-  if (!observedAt) warnings.push(`${provider}: observation has no usable observed_at; using fetch time.`);
-
-  const signals = quota.signals;
-  const signalList: Json[] = Array.isArray(signals)
-    ? signals.filter((s): s is Json => asObj(s) !== null)
-    : asObj(signals)
-      ? Object.entries(signals as Json).map(([name, value]) => ({ name, ...(asObj(value) ?? { value }) }))
-      : [];
-  const modelQuotas = Array.isArray(quota.model_quotas) ? quota.model_quotas : [];
-
-  const push = (windowId: string, fields: Json, labelPrefix: string) => {
-    const used =
-      getNum(fields, "usedPercent", "used_percent", "UsedPercent", "utilization", "Utilization", "used") ??
-      null;
-    const remaining =
-      getNum(fields, "remainingPercent", "remaining_percent", "RemainingPercent", "remaining") ?? null;
+  for (const s of signals) {
+    const o = asObj(s);
+    if (!o) {
+      warnings.push(`${provider}: skipping a malformed quota signal.`);
+      continue;
+    }
+    const window = getStr(o, "window", "Window", "name", "Name", "id") ?? "signal";
+    const used = getNum(o, "usedPercent", "used_percent", "UsedPercent", "utilization", "Utilization", "used");
+    const remaining = getNum(o, "remainingPercent", "remaining_percent", "RemainingPercent", "remaining");
     const resetsAt = toIsoTimestamp(
-      fields.resetAt ??
-        fields.reset_at ??
-        fields.ResetAt ??
-        fields.reset ??
-        fields.Reset ??
-        fields.resetsAt ??
-        fields.nextReset ??
-        null,
+      o.resetAt ?? o.reset_at ?? o.ResetAt ?? o.reset ?? o.Reset ?? o.resetsAt ?? o.nextReset ?? null,
     );
-    const scope = fields.scope ?? null;
-    const spendBlocked =
-      fields.spend_control_blocked === true ||
-      fields.spendControlBlocked === true ||
-      getStr(fields, "spend_control", "spendControl") === "blocked";
+    const scope = o.scope ?? null;
+    const spendBlocked = o.spend_control_blocked === true || o.spendControlBlocked === true;
     let usedPercent = used;
     let remainingPercent = remaining;
     if (usedPercent === null && remainingPercent !== null && remainingPercent >= 0 && remainingPercent <= 100) {
@@ -386,38 +574,26 @@ export function parsePassiveSignals(
       remainingPercent = Math.max(0, 100 - Math.min(100, usedPercent));
     }
     if (usedPercent === null && remainingPercent === null && !spendBlocked) {
-      warnings.push(`${provider}: window ${JSON.stringify(windowId)} carries no usable percent; ignored.`);
-      return;
+      warnings.push(`${provider}: window ${JSON.stringify(window)} carries no usable percent; ignored.`);
+      continue;
     }
     const exhausted = spendBlocked || (remainingPercent ?? 100) <= 0;
     limits.push(
       makeLimit({
-        id: `${provider}:${windowId}`,
-        label: `${labelPrefix} ${windowId}${spendBlocked ? " (spend control blocked)" : ""}`,
+        id: `${provider}:${window}`,
+        label: `${opts?.labelPrefix ?? provider} ${window}${spendBlocked ? " (spend control blocked)" : ""}`,
         usedPercent,
         remainingPercent,
         resetsAt,
         limitReached: exhausted,
         allowed: exhausted ? false : true,
-        gating: isGatingWindow(provider, windowId, allowList, { scope, spendControl: spendBlocked }),
-        // Passive signals refresh only when the account serves traffic; null
-        // (no usable observed_at) falls back to the sync fetch time upstream.
+        gating: isGatingWindow(provider, window, allowList, { scope, spendControl: spendBlocked }),
         observedAt,
+        models: opts?.models ?? null,
       }),
     );
-  };
-
-  for (const s of signalList) {
-    const name = getStr(s, "window", "Window", "name", "Name", "id") ?? getStr(s, "name") ?? "signal";
-    push(name, s, provider === "claude" ? "Claude unified" : provider === "codex" ? "Codex" : "Devin");
   }
-  for (const m of modelQuotas) {
-    const mq = asObj(m);
-    if (!mq) continue;
-    const name = getStr(mq, "window", "Window", "name", "model") ?? "model-quota";
-    push(name, mq, provider === "claude" ? "Claude model" : provider === "codex" ? "Codex model" : "Devin model");
-  }
-  return { limits, observedAt, warnings };
+  return { limits, observedAt, planType: null, warnings };
 }
 
 /* ------------------------------------------------------------------ */
@@ -425,10 +601,17 @@ export function parsePassiveSignals(
 /* ------------------------------------------------------------------ */
 
 export interface ParsedAccount {
-  prefix: string;
+  /** Stable row key (`acct-<sha256[0..16]>`; never a raw identifier). */
+  key: string;
   provider: ProviderKey;
-  /** Raw channel word from the entry, for UI labels. */
+  /** Raw provider word from the entry, for UI labels. */
   channel: string;
+  /** Reconciled lifecycle state. */
+  status: AccountStatus;
+  /** CLIProxy `status_message`, when present (operational note). */
+  statusMessage: string | null;
+  /** Entry `priority` (burn order), when exposed. */
+  priority: number | null;
   limits: UsageLimitRow[];
   planType: string | null;
   checkedAt: string;
@@ -443,10 +626,11 @@ export interface ParsedAccount {
  * Extract per-account observations from an `auth-files` payload.
  *
  * Shape-tolerant: accepts an array of entries or `{files:[...]}` /
- * `{auth_files:[...]}` / `{accounts:[...]}` wrappers. Every entry needs a
- * single-segment `prefix` — entries without one cannot be keyed to the
- * operator map and are reported as `unkeyed-observation` drift, never
- * trusted (TWO-579 identity rule).
+ * `{auth_files:[...]}` / `{authFiles:[...]}` / `{accounts:[...]}` /
+ * `{entries:[...]}` / `{data:[...]}` wrappers. Every entry needs a stable
+ * identity (`id`, else `path`); entries without one are counted, warned
+ * about, and ignored — never trusted (TWO-579 identity rule). `disabled`
+ * entries are stored (informational) but excluded from aggregation.
  */
 export function parseAuthFiles(
   payload: unknown,
@@ -454,10 +638,11 @@ export function parseAuthFiles(
     now: string;
     allowLists: Record<string, string[]>;
     /**
-     * Raw plugin-quota payloads by prefix. Each is parsed with the owning
-     * account's own provider + allow-list (per-provider gating stays exact).
+     * Raw plugin-quota payloads by provider. Each is parsed with the owning
+     * provider's own allow-list and attached to every enabled account row of
+     * that provider (fetched at sync time, so as fresh as the cache row).
      */
-    pluginPayloadByPrefix?: Map<string, unknown>;
+    pluginPayloadByProvider?: Map<string, unknown>;
   },
 ): { accounts: ParsedAccount[]; unkeyed: number; warnings: string[] } {
   const warnings: string[] = [];
@@ -468,15 +653,16 @@ export function parseAuthFiles(
   const entries: unknown[] = Array.isArray(payload)
     ? payload
     : root
-      ? (["files", "auth_files", "authFiles", "accounts", "entries"]
+      ? (["files", "auth_files", "authFiles", "accounts", "entries", "data", "items", "results"]
           .map((k) => (root as Json)[k])
           .find((v) => Array.isArray(v)) as unknown[]) ?? []
       : [];
   if (entries.length === 0) {
-    warnings.push("auth-files payload holds no entries; every mapped account will drift-warn as missing.");
+    warnings.push("auth-files payload holds no entries; every configured provider will drift-warn as having no enabled accounts.");
     return { accounts, unkeyed, warnings };
   }
 
+  const seenKeys = new Map<string, number>();
   for (const e of entries) {
     const entry = asObj(e);
     if (!entry) {
@@ -484,54 +670,149 @@ export function parseAuthFiles(
       warnings.push("skipping a non-object auth-files entry.");
       continue;
     }
-    const prefix = getStr(entry, "prefix", "Prefix");
     const channel =
-      getStr(entry, "channel", "provider", "kind", "type", "Provider", "Channel") ?? "unknown";
+      getStr(entry, "provider", "Provider", "type", "Type", "channel", "Channel", "kind") ?? "unknown";
     const provider = normalizeProvider(channel);
-    if (!prefix || !/^[A-Za-z0-9][A-Za-z0-9_-]*$/.test(prefix)) {
+
+    // Stable identity: CLIProxy `id` first, then the auth-file `path`.
+    const stableId = getStr(entry, "id", "ID", "auth_id") ?? getStr(entry, "path", "Path") ?? null;
+    if (!stableId) {
       unkeyed += 1;
       warnings.push(
-        `${channel}: entry without a single-segment prefix cannot be keyed to the map; ignoring its quota.`,
+        `${channel}: entry without a stable id/path cannot be keyed across syncs; ignoring its quota.`,
       );
       continue;
     }
+    let key = `acct-${hashIdentity([stableId])?.slice(0, 16) ?? "unknown"}`;
+    const dupes = seenKeys.get(key) ?? 0;
+    seenKeys.set(key, dupes + 1);
+    if (dupes > 0) {
+      warnings.push(`${channel}: duplicate auth-files identity for row ${key}; keeping the first, ignoring the repeat.`);
+      continue;
+    }
 
-    const quota = getObj(entry, "quota", "Quota", "observation", "usage");
+    const disabled = entry.disabled === true;
+    const unavailable = entry.unavailable === true;
+    const nextRetryAfter = toIsoTimestamp(entry.next_retry_after ?? entry.nextRetryAfter ?? null);
+    const nowMs = Date.parse(opts.now);
+    const retryFuture = nextRetryAfter !== null && !Number.isNaN(nowMs) && Date.parse(nextRetryAfter) > nowMs;
+    const status: AccountStatus = disabled
+      ? "disabled"
+      : unavailable
+        ? retryFuture
+          ? "cooling"
+          : "error"
+        : "active";
+    const statusMessage = getStr(entry, "status_message", "statusMessage", "StatusMessage");
+    const priorityRaw = entry.priority ?? entry.Priority ?? null;
+    const priority =
+      typeof priorityRaw === "number" && Number.isFinite(priorityRaw)
+        ? priorityRaw
+        : typeof priorityRaw === "string" && priorityRaw.trim() !== "" && Number.isFinite(Number(priorityRaw))
+          ? Number(priorityRaw)
+          : null;
+
     const allowList = opts.allowLists[provider] ?? [];
     // NIM is local-estimate only: its numbers ride along as non-gating
     // context (soft signal), and the account stays quota-blind for routing.
     const softGating = provider === "nvidia-nim";
-    // The per-window observation times ride on each limit's `observedAt`;
-    // the row-level `observedAt` is intentionally not used for `checkedAt`
-    // (cache age is the fetch time — see below).
-    const { limits, warnings: sigWarnings } = parsePassiveSignals(provider, quota, allowList);
+    const labelPrefix =
+      provider === "claude" ? "Claude unified" : provider === "codex" ? "Codex" : provider === "devin" ? "Devin" : provider;
 
-    const pluginPayload = opts.pluginPayloadByPrefix?.get(prefix);
+    // Passive account-level observation.
+    const quota = getObj(entry, "quota", "Quota", "observation", "usage");
+    const observedAt = quota
+      ? (toIsoTimestamp(quota.observed_at ?? quota.observedAt ?? quota.observedAtMs ?? null) ?? null)
+      : null;
+    if (quota && !observedAt) {
+      // Passive signals refresh only when the account serves traffic; without
+      // their own observed_at the observation is one step less trustworthy.
+    }
+    const signalInputs: Array<{ signals: Record<string, unknown>; observed: string | null; models: string[] | null }> = [];
+    if (quota) {
+      const rawSignals: unknown = quota.signals ?? quota.Signals ?? null;
+      if (rawSignals !== null && typeof rawSignals === "object" && !Array.isArray(rawSignals)) {
+        signalInputs.push({ signals: rawSignals as Record<string, unknown>, observed: observedAt, models: null });
+      } else if (Array.isArray(rawSignals)) {
+        signalInputs.push({ signals: { __legacy: rawSignals } as unknown as Record<string, unknown>, observed: observedAt, models: null });
+      } else if (rawSignals !== null) {
+        // Present but unparseable: counts as an observation with no windows.
+        signalInputs.push({ signals: {}, observed: observedAt, models: null });
+      }
+    }
+
+    // Per-model observations: CLIProxy keys them by model
+    // (`model_quotas: {<model>: {observed_at, signals}}`).
+    const modelQuotas: unknown = entry.model_quotas ?? entry.modelQuotas ?? entry.ModelQuotas ?? null;
+    if (modelQuotas && typeof modelQuotas === "object" && !Array.isArray(modelQuotas)) {
+      for (const [model, obs] of Object.entries(modelQuotas as Record<string, unknown>)) {
+        const o = asObj(obs);
+        if (!o) continue;
+        const mObserved = toIsoTimestamp(o.observed_at ?? o.observedAt ?? null) ?? null;
+        const mSignals: unknown = o.signals ?? o.Signals ?? null;
+        if (mSignals !== null && typeof mSignals === "object" && !Array.isArray(mSignals)) {
+          signalInputs.push({ signals: mSignals as Record<string, unknown>, observed: mObserved, models: [model.toLowerCase()] });
+        }
+      }
+    } else if (Array.isArray(modelQuotas)) {
+      for (const mq of modelQuotas) {
+        const o = asObj(mq);
+        if (!o) continue;
+        const model = getStr(o, "model", "Model", "window", "name") ?? null;
+        const mObserved = toIsoTimestamp(o.observed_at ?? o.observedAt ?? null) ?? null;
+        const mSignals: unknown = o.signals ?? o.Signals ?? null;
+        if (mSignals !== null && typeof mSignals === "object" && !Array.isArray(mSignals)) {
+          signalInputs.push({
+            signals: mSignals as Record<string, unknown>,
+            observed: mObserved,
+            models: model ? [model.toLowerCase()] : null,
+          });
+        }
+      }
+    }
+
+    const limits: UsageLimitRow[] = [];
+    const parseWarnings: string[] = [];
+    let planType: string | null =
+      getStr(entry, "plan", "planType", "Plan", "account_type", "AccountType") ?? null;
+    for (const input of signalInputs) {
+      if ("__legacy" in input.signals) {
+        const parsed = parseLegacySignalList(provider, (input.signals as Record<string, unknown>).__legacy, input.observed, allowList, {
+          models: input.models,
+          labelPrefix,
+        });
+        parseWarnings.push(...parsed.warnings);
+        limits.push(...stampLimits(parsed.limits, input.observed, opts.now));
+        continue;
+      }
+      const parsed = parseHeaderSignals(provider, input.signals, input.observed, allowList, {
+        models: input.models,
+        labelPrefix,
+      });
+      parseWarnings.push(...parsed.warnings);
+      if (Object.keys(input.signals).length === 0) {
+        parseWarnings.push(`${provider}: account observation carries no quota signals; treating as unknown.`);
+      }
+      limits.push(...stampLimits(parsed.limits, input.observed, opts.now));
+      if (!planType && parsed.planType) planType = parsed.planType;
+    }
+
+    const pluginPayload = opts.pluginPayloadByProvider?.get(provider);
     let pluginQuota: ParsedPluginQuota | null = null;
-    if (pluginPayload !== undefined) {
+    if (pluginPayload !== undefined && !disabled) {
       pluginQuota = parsePluginQuota(provider, pluginPayload, allowList, {
-        softGating: softGating,
+        softGating,
         // Plugin-quota limits are fetched right now: their observation time is
         // the sync's fetch time, never the passive `observed_at`.
         observedAt: opts.now,
       });
     }
     const pluginLimits: UsageLimitRow[] = pluginQuota?.limits ?? [];
-    let planType: string | null = getStr(entry, "plan", "planType", "Plan") ?? null;
     if (pluginQuota?.planType) planType = pluginQuota.planType;
 
-    const cooling =
-      getObj(entry, "cooldown", "Cooldown") ?? (entry.cooling_down || entry.coolingDown ? entry : null);
-    const co = asObj(cooling);
-    const coolingDown =
-      co?.active === true ||
-      co?.cooling === true ||
-      entry.cooling_down === true ||
-      entry.coolingDown === true ||
-      getNum(co ?? {}, "next_recover_at", "nextRecoverAt") !== null;
-    const cooldownUntil = coolingDown
-      ? (toIsoTimestamp(co?.next_recover_at ?? co?.nextRecoverAt ?? co?.until ?? null) ?? null)
-      : null;
+    const stamped = softGating
+      ? [...limits.map((l) => ({ ...l, gating: false })), ...pluginLimits]
+      : [...limits, ...pluginLimits];
 
     const quotaBlind =
       provider === "meta" ||
@@ -541,20 +822,23 @@ export function parseAuthFiles(
       provider === "compat" ||
       provider === "unknown-provider" ||
       provider === "nvidia-nim" ||
-      (limits.length === 0 && pluginLimits.length === 0);
+      (stamped.length === 0 && pluginLimits.length === 0);
 
-    // Passive limits without their own observed_at inherit the fetch time —
-    // the parser already warned that the observation is one step less
-    // trustworthy — so every window carries an explicit observation time.
-    const stampedPassive = limits.map((l) => (l.observedAt ? l : { ...l, observedAt: opts.now }));
+    if (quota && !observedAt) {
+      parseWarnings.push(`${provider}: observation has no usable observed_at; using fetch time.`);
+    }
+
     accounts.push({
-      prefix,
+      key,
       provider,
       channel,
-      limits: softGating ? [...stampedPassive.map((l) => ({ ...l, gating: false })), ...pluginLimits] : [...stampedPassive, ...pluginLimits],
+      status,
+      statusMessage,
+      priority,
+      limits: stamped,
       planType,
       // Cache age: the sync's own fetch time. It drives the bounded fail-open
-      // then fail-closed when sync dies — never the passive observed_at, which
+      // then unknown when sync dies — never the passive observed_at, which
       // only refreshes when the account serves traffic (an idle healthy
       // account must not be shut out for good).
       checkedAt: opts.now,
@@ -563,13 +847,25 @@ export function parseAuthFiles(
         getStr(entry, "account_id", "accountId", "id"),
         getStr(entry, "email", "Email", "login"),
         getStr(entry, "label", "name"),
+        getStr(entry, "account", "Account"),
+        getStr(entry, "project_id", "projectId"),
         channel,
-        prefix,
+        stableId,
       ]),
-      coolingDown,
-      cooldownUntil,
-      parseWarnings: [...sigWarnings, ...(pluginQuota?.warnings ?? [])],
+      coolingDown: unavailable,
+      cooldownUntil: retryFuture ? (nextRetryAfter as string) : null,
+      parseWarnings: [...parseWarnings, ...(pluginQuota?.warnings ?? [])],
     });
   }
   return { accounts, unkeyed, warnings };
+}
+
+/**
+ * Passive limits without their own observed_at inherit the fetch time — the
+ * parser already warned that the observation is one step less trustworthy —
+ * so every window carries an explicit observation time.
+ */
+function stampLimits(limits: UsageLimitRow[], observed: string | null, fetchNow: string): UsageLimitRow[] {
+  if (observed) return limits;
+  return limits.map((l) => (l.observedAt ? l : { ...l, observedAt: fetchNow }));
 }

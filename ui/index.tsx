@@ -1,5 +1,5 @@
 /**
- * CLIProxy Connector UI: plugin page + dashboard widget.
+ * CLIProxy Connector UI: plugin page + dashboard widget (v2, per-provider).
  *
  * Runs in the host frontend as an ES module bundle (see `npm run build:ui`).
  * All data comes from the worker (`cliproxy-page` / `cliproxy-widget`);
@@ -27,6 +27,16 @@ function FreshnessBadge({ freshness }: { freshness: string }) {
   return <span style={{ ...tone, borderRadius: 4, padding: "1px 6px", fontSize: 12 }}>{freshness}</span>;
 }
 
+function StateBadge({ state }: { state: string }) {
+  const tone =
+    state === "allowed"
+      ? { background: "#14532d", color: "#bbf7d0" }
+      : state === "exhausted"
+        ? { background: "#7f1d1d", color: "#fecaca" }
+        : { background: "#78350f", color: "#fde68a" };
+  return <span style={{ ...tone, borderRadius: 4, padding: "1px 6px", fontSize: 12 }}>{state}</span>;
+}
+
 export function CliProxyPage({ context }: PluginPageProps) {
   const companyId = useCompanyId(context);
   const { data, loading, error, refresh } = usePluginData<PageData>("cliproxy-page", { companyId });
@@ -34,7 +44,7 @@ export function CliProxyPage({ context }: PluginPageProps) {
   const reenable = usePluginAction("cliproxy-reenable");
 
   if (!companyId) return <div>No company context.</div>;
-  if (loading) return <div>Loading CLIProxy account state…</div>;
+  if (loading) return <div>Loading CLIProxy provider state…</div>;
   if (error) return <div>Error: {error.message}</div>;
   if (!data) return <div>No data yet — run a sync.</div>;
 
@@ -104,44 +114,59 @@ export function CliProxyPage({ context }: PluginPageProps) {
           <ul>
             {data.drift.map((d, i) => (
               <li key={i}>
-                [{d.kind}] {d.prefix}: {d.detail}
+                [{d.kind}] {d.provider}: {d.detail}
               </li>
             ))}
           </ul>
         </div>
       )}
-      {data.accounts.map((a) => (
-        <div key={a.prefix} style={{ border: "1px solid #444", borderRadius: 6, padding: 12 }}>
+      {data.providers.map((p) => (
+        <div key={p.provider} style={{ border: "1px solid #444", borderRadius: 6, padding: 12 }}>
           <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
-            <strong>{a.prefix}</strong>
-            <FreshnessBadge freshness={a.freshness} />
-            {a.quotaBlind && <span>quota-blind (unknown, never headroom)</span>}
-            {a.coolingDown && <span>cooling down{a.cooldownUntil ? ` until ${a.cooldownUntil}` : ""}</span>}
-            {!a.mapped && <span>unmapped — add to prefixMap</span>}
+            <strong>{p.provider}</strong>
+            <StateBadge state={p.state} />
+            <FreshnessBadge freshness={p.freshness} />
+            {p.waitResumeOff && <span>wait/resume off: inventory not confirmed complete</span>}
           </div>
           <div>
-            provider {a.provider} · plan {a.planType ?? "—"} · connection {a.connectionId ?? "—"} · checked{" "}
-            {a.checkedAt}
+            connection {p.connectionId} · completeInventory {p.completeInventory ? "confirmed" : "not confirmed"} ·{" "}
+            {p.enabledAccounts} enabled account{p.enabledAccounts === 1 ? "" : "s"}
+            {p.headroomAccounts > 0 ? `, ${p.headroomAccounts} with headroom` : ""}
+            {p.retryAt ? ` · retry ${p.retryAt} (${p.retryIn})` : ""}
           </div>
-          <ul>
-            {a.limits.map((l) => (
-              <li key={l.id}>
-                {l.label}: {l.remainingPercent ?? "?"}% remaining
-                {l.resetsAt ? ` · resets ${l.resetsAt} (${l.resetIn})` : " · no reset known"}
-                {!l.gating && " (informational, not gating)"}
-                {l.allowed === false && " · not admitted"}
-              </li>
-            ))}
-            {a.limits.length === 0 && <li>No quota windows — unknown.</li>}
-          </ul>
-          {a.lastError && <div>Last note: {a.lastError}</div>}
-          <details>
-            <summary>Connection settings (copy-paste for the operator runbook)</summary>
-            <pre>{a.connectionSnippet}</pre>
-            <div>
-              Member profile.model: <code>{a.suggestedProfileModel}</code>
-            </div>
-          </details>
+          <div>{p.reason}</div>
+          {p.accounts.length > 0 && (
+            <details>
+              <summary>Discovered accounts ({p.accounts.length}, informational)</summary>
+              <ul>
+                {p.accounts.map((a) => (
+                  <li key={a.key}>
+                    <code>{a.key}</code> · {a.status}
+                    {a.statusMessage ? ` — ${a.statusMessage}` : ""}
+                    {a.planType ? ` · plan ${a.planType}` : ""}
+                    {a.priority !== null ? ` · priority ${a.priority}` : ""} · checked {a.checkedAt}
+                    {a.quotaBlind && " · quota-blind"}
+                    {a.coolingDown && ` · cooling down${a.cooldownUntil ? ` until ${a.cooldownUntil}` : ""}`}
+                    {a.limits.length > 0 && (
+                      <ul>
+                        {a.limits.map((l) => (
+                          <li key={l.id}>
+                            {l.label}: {l.remainingPercent ?? "?"}% remaining
+                            {l.resetsAt ? ` · resets ${l.resetsAt} (${l.resetIn})` : " · no reset known"}
+                            {!l.gating && " (informational, not gating)"}
+                            {l.allowed === false && " · not admitted"}
+                            {l.models && l.models.length > 0 && ` · models ${l.models.join(", ")}`}
+                          </li>
+                        ))}
+                      </ul>
+                    )}
+                    {a.limits.length === 0 && <div>No quota windows — unknown.</div>}
+                    {a.lastError && <div>Last note: {a.lastError}</div>}
+                  </li>
+                ))}
+              </ul>
+            </details>
+          )}
         </div>
       ))}
     </div>
@@ -159,8 +184,8 @@ export function CliProxyWidget({ context }: PluginWidgetProps) {
     <div style={{ display: "grid", gap: 4 }}>
       <strong>CLIProxy quota: {data.status}</strong>
       <div>
-        {data.accounts} accounts · {data.quotaBlind} quota-blind · {data.staleCount} stale · {data.driftCount}{" "}
-        drift
+        {data.providers} providers · {data.allowed} allowed · {data.exhausted} exhausted ·{" "}
+        {data.unknownProviders} unknown · {data.waitResumeOff} wait/resume off · {data.driftCount} drift
       </div>
       {data.earliestReset && (
         <div>

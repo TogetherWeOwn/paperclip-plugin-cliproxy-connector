@@ -1,11 +1,31 @@
 /**
  * Company-level connector configuration: parsing, validation and defaults.
  *
+ * v2 is per-provider: the operator enters one row per CLIProxy provider
+ * family (`providers: [{ provider, connectionId, completeInventory }]`), once.
+ * Accounts added, removed or disabled in CLIProxy appear in or vanish from
+ * the sync cache with zero config change (auto-discovery).
+ *
  * The host carries company config opaquely (`ctx.config.get(companyId)`), so
  * this module is the single place that turns it into a typed, validated
  * `ConnectorConfig`. Anything security-relevant (loopback base URL, explicit
  * key header, secret_ref shape) fails validation loudly here.
  */
+
+export interface ProviderEntry {
+  /** CLIProxy provider string, normalized lowercase (e.g. `claude`). */
+  provider: string;
+  /** Paperclip connection id for this provider family (unprefixed models). */
+  connectionId: string;
+  /**
+   * The operator confirms this provider has no hidden config-key credentials
+   * (CLIProxy omits `claude-api-key`, `codex-api-key` incl. MetaKey/XAIKey
+   * aliases, `openai-compatibility` and vertex from `auth-files`). Defaults
+   * to false: a provider with unconfirmed inventory can only reach `allowed`
+   * or `unknown`, never `exhausted` (fail open, never wait).
+   */
+  completeInventory: boolean;
+}
 
 export interface ConnectorConfig {
   /** Loopback-only CLIProxy base URL, e.g. `http://127.0.0.1:8317`. */
@@ -16,7 +36,7 @@ export interface ConnectorConfig {
   managementSecretRef: unknown;
   /** Sync cadence in minutes. The cron job runs every 5; larger values skip. */
   syncIntervalMinutes: number;
-  /** Default reserve: members at or below this remaining % are skipped. */
+  /** Default reserve: providers at or below this remaining % are not headroom. */
   reservePercent: number;
   /** Per-pool reserve overrides keyed by pool id. */
   perPoolReservePercent: Record<string, number>;
@@ -28,11 +48,11 @@ export interface ConnectorConfig {
   graceMultiplier: number;
   /** Tolerance for `checkedAt` slightly in the future. */
   futureSkewSeconds: number;
-  /** Operator map: CLIProxy prefix → Paperclip connection id. */
-  prefixMap: Record<string, string>;
+  /** One row per provider family, never per account. */
+  providers: ProviderEntry[];
   /** Per-provider gating-window allow-list (lowercased substring match). */
   providerWindows: Record<string, string[]>;
-  /** CLIProxy plugin id per prefix for quota fetch (our five plugins). */
+  /** CLIProxy plugin id per provider for quota fetch (our five plugins). */
   pluginQuotaIds: Record<string, string>;
   /** Operator confirms the page audience exposure is intended (proposal §4.4). */
   audienceConfirmed: boolean;
@@ -87,10 +107,14 @@ export interface ConfigValidation {
   errors: string[];
 }
 
+function isPlainObject(v: unknown): v is Record<string, unknown> {
+  return typeof v === "object" && v !== null && !Array.isArray(v);
+}
+
 export function parseConfig(raw: unknown): { config: ConnectorConfig; validation: ConfigValidation } {
   const warnings: string[] = [];
   const errors: string[] = [];
-  const r = (typeof raw === "object" && raw !== null ? raw : {}) as Record<string, unknown>;
+  const r = (isPlainObject(raw) ? raw : {}) as Record<string, unknown>;
 
   const str = (v: unknown) => (typeof v === "string" ? v : "");
   const num = (v: unknown, fallback: number) =>
@@ -126,39 +150,65 @@ export function parseConfig(raw: unknown): { config: ConnectorConfig; validation
     errors.push(`syncIntervalMinutes must be within [1, 60]; got ${syncIntervalMinutes}.`);
   }
 
-  const prefixMapIn = (r.prefixMap ?? {}) as Record<string, unknown>;
-  const prefixMap: Record<string, string> = {};
+  // v2 provider rows. Unknown provider words are skipped with a warning (a
+  // typo must not fail the whole sync closed); the discovered accounts of a
+  // skipped provider drift-warn as unconfigured instead.
+  const providers: ProviderEntry[] = [];
+  const providersIn = r.providers ?? [];
+  const seenProviders = new Set<string>();
   const seenConnections = new Map<string, string>();
-  if (typeof prefixMapIn !== "object" || prefixMapIn === null || Array.isArray(prefixMapIn)) {
-    errors.push("prefixMap must be an object of CLIProxy prefix → Paperclip connection id.");
+  if (!Array.isArray(providersIn)) {
+    errors.push("providers must be a list of { provider, connectionId, completeInventory } rows.");
   } else {
-    for (const [prefix, connectionId] of Object.entries(prefixMapIn)) {
-      if (!SINGLE_SEGMENT.test(prefix)) {
-        errors.push(`prefixMap key ${JSON.stringify(prefix)} is not a single path segment (no "/", must match [A-Za-z0-9_-]+).`);
+    for (const [index, entryRaw] of providersIn.entries()) {
+      const where = `providers[${index}]`;
+      if (!isPlainObject(entryRaw)) {
+        errors.push(`${where} must be an object with provider and connectionId.`);
         continue;
       }
-      if (typeof connectionId !== "string" || !connectionId) {
-        errors.push(`prefixMap[${prefix}] must be a non-empty connection id.`);
+      const provider = str(entryRaw.provider).trim().toLowerCase();
+      const connectionId = str(entryRaw.connectionId).trim();
+      if (!provider) {
+        errors.push(`${where}.provider is required: the CLIProxy provider string from auth-files (e.g. claude, codex, meta).`);
         continue;
       }
-      prefixMap[prefix] = connectionId;
-      const prev = seenConnections.get(connectionId);
-      if (prev !== undefined && prev !== prefix) {
+      if (seenProviders.has(provider)) {
+        errors.push(`${where}: duplicate provider row for ${JSON.stringify(provider)}; keep one row per provider.`);
+        continue;
+      }
+      seenProviders.add(provider);
+      if (!connectionId) {
+        errors.push(`${where} for ${JSON.stringify(provider)}: connectionId must be a non-empty Paperclip connection id.`);
+        continue;
+      }
+      if (!isKnownProviderWord(provider)) {
         warnings.push(
-          `prefixMap: connection ${connectionId} is mapped from both ${prev} and ${prefix}; quota rows may be attributed ambiguously.`,
+          `${where}: ${JSON.stringify(provider)} is not a known CLIProxy provider word; the row is ignored and discovered accounts of it will drift-warn as unconfigured.`,
+        );
+        continue;
+      }
+      const prev = seenConnections.get(connectionId);
+      if (prev !== undefined && prev !== provider) {
+        warnings.push(
+          `providers: connection ${connectionId} is mapped from both ${prev} and ${provider}; per-provider aggregates may attribute the same connection twice.`,
         );
       } else {
-        seenConnections.set(connectionId, prefix);
+        seenConnections.set(connectionId, provider);
       }
+      providers.push({
+        provider,
+        connectionId,
+        completeInventory: entryRaw.completeInventory === true,
+      });
     }
   }
-  if (Object.keys(prefixMap).length === 0) {
-    warnings.push("prefixMap is empty: every CLIProxy account will drift-warn as unmapped until the operator fills the map.");
+  if (providers.length === 0) {
+    warnings.push("providers is empty: every discovered CLIProxy provider will drift-warn as unconfigured and no pool will route quota-aware.");
   }
 
   const providerWindows: Record<string, string[]> = { ...DEFAULT_PROVIDER_WINDOWS };
-  const providerWindowsIn = (r.providerWindows ?? {}) as Record<string, unknown>;
-  if (typeof providerWindowsIn === "object" && providerWindowsIn !== null) {
+  const providerWindowsIn = r.providerWindows ?? {};
+  if (isPlainObject(providerWindowsIn)) {
     for (const [provider, list] of Object.entries(providerWindowsIn)) {
       if (!Array.isArray(list) || !list.every((s) => typeof s === "string" && s)) {
         errors.push(`providerWindows[${provider}] must be a list of non-empty window substrings.`);
@@ -174,21 +224,28 @@ export function parseConfig(raw: unknown): { config: ConnectorConfig; validation
     }
   }
 
+  // v2: one plugin quota route per provider (not per account). The fetched
+  // windows are attached to every enabled account row of that provider with
+  // the sync fetch time as their observation.
   const pluginQuotaIds: Record<string, string> = {};
   const pluginQuotaIdsIn = (r.pluginQuotaIds ?? {}) as Record<string, unknown>;
-  if (typeof pluginQuotaIdsIn === "object" && pluginQuotaIdsIn !== null) {
-    for (const [prefix, pluginId] of Object.entries(pluginQuotaIdsIn)) {
+  if (isPlainObject(pluginQuotaIdsIn)) {
+    for (const [provider, pluginId] of Object.entries(pluginQuotaIdsIn)) {
       if (typeof pluginId !== "string" || !pluginId) {
-        errors.push(`pluginQuotaIds[${prefix}] must be a non-empty CLIProxy plugin id.`);
+        errors.push(`pluginQuotaIds[${provider}] must be a non-empty CLIProxy plugin id.`);
         continue;
       }
-      pluginQuotaIds[prefix] = pluginId;
+      if (!SINGLE_SEGMENT.test(pluginId)) {
+        errors.push(`pluginQuotaIds[${provider}] must be a single path segment; got ${JSON.stringify(pluginId)}.`);
+        continue;
+      }
+      pluginQuotaIds[provider.toLowerCase()] = pluginId;
     }
   }
 
   const perPoolReservePercent: Record<string, number> = {};
   const perPoolIn = (r.perPoolReservePercent ?? {}) as Record<string, unknown>;
-  if (typeof perPoolIn === "object" && perPoolIn !== null) {
+  if (isPlainObject(perPoolIn)) {
     for (const [poolId, value] of Object.entries(perPoolIn)) {
       if (typeof value !== "number" || !(value > 0 && value < 50)) {
         errors.push(`perPoolReservePercent[${poolId}] must be within (0, 50).`);
@@ -200,14 +257,21 @@ export function parseConfig(raw: unknown): { config: ConnectorConfig; validation
 
   if (r.audienceConfirmed !== true) {
     warnings.push(
-      "audienceConfirmed is not set: the plugin page shows upstream account identity (emails/labels). Confirm which company roles may view plugin pages and that the exposure is intended (proposal §4 point 4), then set audienceConfirmed: true.",
+      "audienceConfirmed is not set: the plugin page shows upstream account quota state (providers, plan labels, per-account status). Confirm which company roles may view plugin pages and that the exposure is intended (proposal §4 point 4), then set audienceConfirmed: true.",
     );
   }
 
-  // NOTE: the management client uses pinned paths (see cliproxy.ts
+  // The management client uses pinned paths (see cliproxy.ts
   // AUTH_FILES_PATH / pluginQuotaPath) — there are deliberately no config
-  // knobs for them. Unknown keys (including the removed authFilesPath /
-  // pluginQuotaPathTemplate / modelsPath) are ignored, never honoured.
+  // knobs for them. Unknown keys (including the removed v1 prefixMap,
+  // authFilesPath / pluginQuotaPathTemplate / modelsPath) are ignored, never
+  // honoured. A leftover v1 prefixMap errors loudly so the operator migrates
+  // instead of running a dead map.
+  if (r.prefixMap !== undefined) {
+    errors.push(
+      "prefixMap was removed in v2 (per-provider config replaces the per-account map). Delete prefixMap and add one providers[] row per CLIProxy provider instead.",
+    );
+  }
   const config: ConnectorConfig = {
     cliproxyBaseUrl,
     managementKeyHeader,
@@ -219,12 +283,33 @@ export function parseConfig(raw: unknown): { config: ConnectorConfig; validation
     maxAgeMultiplier: num(r.maxAgeMultiplier, DEFAULTS.maxAgeMultiplier),
     graceMultiplier: num(r.graceMultiplier, DEFAULTS.graceMultiplier),
     futureSkewSeconds: num(r.futureSkewSeconds, DEFAULTS.futureSkewSeconds),
-    prefixMap,
+    providers,
     providerWindows,
     pluginQuotaIds,
     audienceConfirmed: r.audienceConfirmed === true,
   };
   return { config, validation: { ok: errors.length === 0, warnings, errors } };
+}
+
+/** CLIProxy provider words the connector understands (auth-files `provider`). */
+const KNOWN_PROVIDER_WORDS = new Set([
+  "claude",
+  "codex",
+  "devin",
+  "meta",
+  "antigravity",
+  "xai",
+  "kimi",
+  "compat",
+  "synthetic",
+  "nvidia-nim",
+  "cloudflare",
+  "zai",
+  "opencode-go",
+]);
+
+export function isKnownProviderWord(provider: string): boolean {
+  return KNOWN_PROVIDER_WORDS.has(provider.toLowerCase());
 }
 
 /**

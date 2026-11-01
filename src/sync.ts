@@ -2,8 +2,9 @@
  * Sync job (cron 2–5 min + on-demand): CLIProxy → plugin cache.
  *
  * Reads the CLIProxy account list + per-provider quota through the proposal
- * §4 safe path (GET-only allow-list, `api-call` excluded) and normalises into
- * `AiConnectionUsage`-shaped rows in the plugin's own namespace.
+ * §4 safe path (GET-only allow-list, `api-call` excluded), groups accounts by
+ * provider, and normalises into `AiConnectionUsage`-shaped rows in the
+ * plugin's own namespace. No core changes, no fork.
  *
  * Security properties (all tested):
  * - the management key is resolved per run and kept in memory only;
@@ -16,7 +17,7 @@
  */
 
 import { CliproxyAuthError, CliproxyManagementClient, type ManagementFetch } from "./cliproxy.js";
-import type { ConnectorConfig } from "./config.js";
+import type { ConnectorConfig, ProviderEntry } from "./config.js";
 import { parseAuthFiles, type ParsedAccount } from "./parsers.js";
 import type {
   AccountUsageRow,
@@ -187,40 +188,52 @@ export async function runSync(deps: SyncDeps, inFlight: { running: boolean }): P
         throw err;
       });
 
-      // Per-plugin quota fetch is best-effort: a failing plugin route leaves
-      // the account on its passive signals (or unknown), never headroom.
-      // Raw payloads ride along by prefix; parseAuthFiles parses each with
-      // its owning account's provider + allow-list.
-      const pluginPayloadByPrefix = new Map<string, unknown>();
+      // Per-provider plugin quota fetch is best-effort: a failing plugin
+      // route leaves the provider's accounts on their passive signals (or
+      // unknown), never headroom. One fetch per configured provider; raw
+      // payloads ride along by provider and are attached to every enabled
+      // account row of that provider at parse time.
+      const pluginPayloadByProvider = new Map<string, unknown>();
       const pluginErrors: string[] = [];
-      for (const [prefix, pluginId] of Object.entries(deps.config.pluginQuotaIds)) {
+      const fetchedPluginIds = new Map<string, string>();
+      for (const entry of deps.config.providers) {
+        const pluginId = deps.config.pluginQuotaIds[entry.provider];
+        if (!pluginId) continue;
+        if (fetchedPluginIds.has(pluginId)) {
+          const first = fetchedPluginIds.get(pluginId) as string;
+          const prior = pluginPayloadByProvider.get(first);
+          if (prior !== undefined) pluginPayloadByProvider.set(entry.provider, prior);
+          continue;
+        }
         try {
-          pluginPayloadByPrefix.set(prefix, await client.getPluginQuota(pluginId));
+          const payload = await client.getPluginQuota(pluginId);
+          fetchedPluginIds.set(pluginId, entry.provider);
+          pluginPayloadByProvider.set(entry.provider, payload);
         } catch (err) {
           if (err instanceof CliproxyAuthError) throw err; // stop after first rejected key
-          pluginErrors.push(`${prefix} (plugin ${pluginId}): ${err instanceof Error ? err.message : "fetch failed"}`);
+          pluginErrors.push(`${entry.provider} (plugin ${pluginId}): ${err instanceof Error ? err.message : "fetch failed"}`);
         }
       }
 
       const { accounts, unkeyed, warnings } = parseAuthFiles(authFiles, {
         now: deps.now,
         allowLists: deps.config.providerWindows,
-        pluginPayloadByPrefix,
+        pluginPayloadByProvider,
       });
 
-      // Group by prefix: duplicates defeat pinning (spike G-K1) and alarm loudly.
-      const byPrefix = new Map<string, typeof accounts>();
+      // Group by stable row key: duplicates defeat keying (spike G-K1) and
+      // alarm loudly. The parser already drops repeats; a repeated key here
+      // means two entries hashed alike — keep the first.
+      const byKey = new Map<string, ParsedAccount>();
       for (const a of accounts) {
-        const list = byPrefix.get(a.prefix) ?? [];
-        list.push(a);
-        byPrefix.set(a.prefix, list);
+        if (!byKey.has(a.key)) byKey.set(a.key, a);
       }
 
-      const { rows, drift } = accountsToRows(byPrefix, unkeyed, deps.config.prefixMap);
+      const { rows, drift } = accountsToRows(byKey, deps.config.providers, unkeyed);
 
       const errors = [...pluginErrors, ...warnings];
       for (const d of drift) {
-        await deps.logActivity(`cliproxy-connector drift [${d.kind}] ${d.prefix}: ${d.detail}`, {
+        await deps.logActivity(`cliproxy-connector drift [${d.kind}] ${d.provider}: ${d.detail}`, {
           companyId: deps.companyId,
         });
       }
@@ -258,62 +271,63 @@ export async function runSync(deps: SyncDeps, inFlight: { running: boolean }): P
 }
 
 /**
- * Turn parsed accounts (grouped by prefix) into cache rows + drift findings.
- * Exported so route-level regression tests run the real sync mapping instead
- * of hand-built rows.
+ * Turn parsed accounts (keyed by stable row key) into cache rows + per-
+ * provider drift findings. Exported so route-level regression tests run the
+ * real sync mapping instead of hand-built rows.
  */
 export function accountsToRows(
-  byPrefix: Map<string, ParsedAccount[]>,
+  byKey: Map<string, ParsedAccount>,
+  providers: ProviderEntry[],
   unkeyed: number,
-  prefixMap: Record<string, string>,
 ): { rows: Record<string, AccountUsageRow>; drift: DriftFinding[] } {
   const rows: Record<string, AccountUsageRow> = {};
   const drift: DriftFinding[] = [];
-  for (const [prefix, list] of byPrefix) {
-    if (list.length > 1) {
-      drift.push({
-        kind: "duplicate-prefix",
-        prefix,
-        detail: `${list.length} CLIProxy accounts share prefix ${prefix}; pinning is ambiguous. Keeping the first row only — give every account a unique prefix.`,
-      });
+  const configured = new Map(providers.map((p) => [p.provider, p]));
+  const enabledByProvider = new Map<string, number>();
+  const discovered = new Set<string>();
+
+  for (const [rowKey, a] of byKey) {
+    discovered.add(a.provider);
+    if (a.status !== "disabled") {
+      enabledByProvider.set(a.provider, (enabledByProvider.get(a.provider) ?? 0) + 1);
     }
-    const first = list[0] as ParsedAccount;
-    rows[prefix] = {
-      prefix,
-      connectionId: prefixMap[prefix] ?? null,
-      provider: first.provider,
-      poolFamily: "unknown",
-      limits: first.limits,
-      planType: first.planType,
-      checkedAt: first.checkedAt,
+    rows[rowKey] = {
+      key: rowKey,
+      provider: a.provider,
+      channel: a.channel,
+      status: a.status,
+      statusMessage: a.statusMessage,
+      priority: a.priority,
+      limits: a.limits,
+      planType: a.planType,
+      checkedAt: a.checkedAt,
       source: "plugin:cliproxy-connector",
-      quotaBlind: first.quotaBlind,
-      accountHash: first.accountHash,
-      lastError: first.parseWarnings.length > 0 ? first.parseWarnings.join(" | ") : null,
-      coolingDown: first.coolingDown,
-      cooldownUntil: first.cooldownUntil,
+      quotaBlind: a.quotaBlind,
+      accountHash: a.accountHash,
+      lastError: a.parseWarnings.length > 0 ? a.parseWarnings.join(" | ") : null,
+      coolingDown: a.coolingDown,
+      cooldownUntil: a.cooldownUntil,
     };
-    if (prefixMap[prefix] === undefined) {
-      drift.push({
-        kind: "unmapped-account",
-        prefix,
-        detail: `CLIProxy account ${prefix} (${first.channel}) has no prefix → connectionId mapping; the router cannot trust its quota.`,
-      });
-    }
   }
   if (unkeyed > 0) {
-    drift.push({
-      kind: "unkeyed-observation",
-      prefix: "(unkeyed)",
-      detail: `${unkeyed} auth-files entr${unkeyed === 1 ? "y has" : "ies have"} no single-segment prefix and cannot be keyed to the map; their quota is ignored.`,
-    });
+    // Entries without a stable identity cannot be keyed across syncs and were
+    // ignored. This is a sync warning, not per-provider drift.
   }
-  for (const prefix of Object.keys(prefixMap)) {
-    if (!byPrefix.has(prefix)) {
+  for (const provider of [...discovered].sort()) {
+    if (!configured.has(provider)) {
       drift.push({
-        kind: "mapped-but-missing",
-        prefix,
-        detail: `map points ${prefix} at a connection, but CLIProxy reports no such account; the router decides on missing telemetry for this member.`,
+        kind: "unconfigured-provider",
+        provider,
+        detail: `CLIProxy reports ${provider} accounts but no providers[] row maps it to a connection; the router cannot trust quota for ${provider} and treats it as unknown.`,
+      });
+    }
+  }
+  for (const entry of [...providers].sort((a, b) => a.provider.localeCompare(b.provider))) {
+    if ((enabledByProvider.get(entry.provider) ?? 0) === 0) {
+      drift.push({
+        kind: "no-enabled-accounts",
+        provider: entry.provider,
+        detail: `providers[] maps ${entry.provider} to a connection, but CLIProxy reports zero enabled accounts for it; the provider routes as unknown until accounts appear.`,
       });
     }
   }
@@ -371,23 +385,24 @@ export async function reenableAfterStrike(
   const nowMs = Date.parse(nowIso);
   const kept = pruneFailures(strike.failures, Number.isNaN(nowMs) ? Date.now() : nowMs);
   const waitUntil = strikeWaitUntil(kept, Number.isNaN(nowMs) ? Date.now() : nowMs);
-  const next: StrikeBudgetState = waitUntil
-    ? {
-        failures: kept,
-        disabled: true,
-        disabledAt: nowIso,
-        disabledReason:
-          `strike budget still full (${kept.length}/${STRIKE_LIMIT} auth failures in 30 min); ` +
-          `wait until ${waitUntil} before probing again. No probe was sent.`,
-        secretBad: false,
-      }
-    : {
-        failures: kept,
-        disabled: false,
-        disabledAt: null,
-        disabledReason: null,
-        secretBad: false,
-      };
+  const next: StrikeBudgetState =
+    waitUntil
+      ? {
+          failures: kept,
+          disabled: true,
+          disabledAt: nowIso,
+          disabledReason:
+            `strike budget still full (${kept.length}/${STRIKE_LIMIT} auth failures in 30 min); ` +
+            `wait until ${waitUntil} before probing again. No probe was sent.`,
+          secretBad: false,
+        }
+      : {
+          failures: kept,
+          disabled: false,
+          disabledAt: null,
+          disabledReason: null,
+          secretBad: false,
+        };
   await saveStrike(next);
   return next;
 }
