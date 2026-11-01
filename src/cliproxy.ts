@@ -17,6 +17,8 @@
  * key is resolved per run from a `secret_ref` and kept in memory only.
  */
 
+import { createHash } from "node:crypto";
+
 import { SINGLE_SEGMENT, isLoopbackUrl, stripTrailingSlashes } from "./config.js";
 
 export const MANAGEMENT_TIMEOUT_MS = 15_000;
@@ -67,7 +69,13 @@ export function isSafeAuthFileName(name: string): boolean {
 
 export function authFileModelsPath(name: string): string {
   if (!isSafeAuthFileName(name)) {
-    throw new CliproxyConfigError(`refusing to build a served-set path from an untrusted auth-file name: ${name}`);
+    // The name is untrusted — and may itself be hostile — while served-set
+    // errors are board-visible, so the refusal names it by a short hash of
+    // the value, never the raw name (which may be an account email).
+    const digest = createHash("sha256").update(name, "utf8").digest("hex").slice(0, 16);
+    throw new CliproxyConfigError(
+      `refusing to build a served-set path from an untrusted auth-file name (sha256:${digest})`,
+    );
   }
   return `${AUTH_FILE_MODELS_PATH}?name=${encodeURIComponent(name)}`;
 }

@@ -7,6 +7,7 @@ import {
   type SyncDeps,
 } from "./sync.js";
 import type { AccountUsageRow, StrikeBudgetState, SyncFailure, SyncSummary } from "./types.js";
+import { buildPageData, buildWidgetData } from "./ui-data.js";
 
 const NOW = "2026-11-01T12:00:00.000Z";
 const KEY = "SECRET-KEY-MATERIAL-abc123";
@@ -889,6 +890,109 @@ describe("sync failure visibility (S2)", () => {
     const summary = await runSync(d, { running: false });
     expect(summary.skipped).toBe(true);
     expect(s.failure?.message).toMatch(/could not resolve/);
+    assertNoKeyLeak(s);
+  });
+});
+
+describe("auth-file name hygiene (TWO-689)", () => {
+  const EMAIL_A = "antigravity-user@example.com.json";
+  const EMAIL_B = "claude-user@example.com.json";
+  const EMAIL_C = "codex-user@example.com.json";
+  const EMAIL_KIMI = "kimi-user@example.com.json";
+
+  it("email-style auth-file names never reach sync errors, activity, or page/widget data", async () => {
+    // EMAIL_A 404s (shared by two accounts, covering the shared-file label),
+    // EMAIL_B fails with a 500, EMAIL_C answers with a payload that warns, and
+    // the kimi account drifts (so the activity log is non-empty).
+    const fetchNames = vi.fn(async (input: string | URL | Request): Promise<Response> => {
+      const url = new URL(String(input));
+      if (url.pathname === "/v0/management/auth-files") {
+        return jsonResponse(200, [
+          { id: "ag-1", name: EMAIL_A, provider: "antigravity" },
+          { id: "ag-2", name: EMAIL_A, provider: "antigravity" },
+          { id: "claude-1", name: EMAIL_B, provider: "claude" },
+          { id: "codex-1", name: EMAIL_C, provider: "codex" },
+          { id: "kimi-1", name: EMAIL_KIMI, provider: "kimi" },
+        ]);
+      }
+      if (url.pathname === "/v0/management/auth-files/models") {
+        const name = url.searchParams.get("name") ?? "";
+        if (name === EMAIL_B) return new Response("boom", { status: 500 });
+        if (name === EMAIL_C) return jsonResponse(200, { data: [{}] }); // warns: no usable id
+        return new Response("no such file", { status: 404 });
+      }
+      return new Response("not found", { status: 404 });
+    });
+    const s = store();
+    const d = deps(s, fetchNames as unknown as typeof fetch);
+    d.config = parseConfig({
+      ...baseConfigRaw(),
+      providers: [
+        { provider: "antigravity", connectionId: "conn-antigravity", completeInventory: true },
+        { provider: "claude", connectionId: "conn-claude", completeInventory: true },
+        { provider: "codex", connectionId: "conn-codex", completeInventory: true },
+      ],
+      pluginQuotaIds: {},
+    }).config;
+    const summary = await runSync(d, { running: false });
+    expect(summary.skipped).toBe(false);
+    // Every served-set warning path fired…
+    expect(summary.errors.some((e) => e.includes("returned 404"))).toBe(true);
+    expect(summary.errors.some((e) => e.includes("HTTP 500"))).toBe(true);
+    expect(summary.errors.some((e) => e.includes("without a usable id"))).toBe(true);
+    // …and the drift activity log fired (kimi has no providers[] row).
+    expect(s.activity.length).toBeGreaterThan(0);
+
+    const rows = s.savedRows as Record<string, AccountUsageRow>;
+    const rowKeys = Object.keys(rows);
+    expect(rowKeys).toHaveLength(5);
+
+    // …but no raw auth-file name anywhere board-visible.
+    const page = buildPageData({
+      now: NOW,
+      config: d.config,
+      rows,
+      lastSync: summary,
+      strike: s.strike,
+      lastFailure: s.failure,
+    });
+    const widget = buildWidgetData({
+      now: NOW,
+      config: d.config,
+      rows,
+      lastSync: summary,
+      strike: s.strike,
+      lastFailure: s.failure,
+    });
+    const blob = JSON.stringify([summary, s.activity, rows, page, widget]);
+    for (const secret of [EMAIL_A, EMAIL_B, EMAIL_C, EMAIL_KIMI, "example.com"]) {
+      expect(blob).not.toContain(secret);
+    }
+    // …while the warnings still point at the affected credentials by row key.
+    const errorBlob = JSON.stringify(summary.errors);
+    for (const k of rowKeys) expect(errorBlob).toContain(k);
+    assertNoKeyLeak(s);
+  });
+
+  it("an unsafe auth-file name is refused by hash, never echoed", async () => {
+    const hostile = "../evil-escape";
+    const fetchHostile = vi.fn(async (input: string | URL | Request): Promise<Response> => {
+      const url = new URL(String(input));
+      if (url.pathname === "/v0/management/auth-files") {
+        return jsonResponse(200, [{ id: "claude-1", name: hostile, provider: "claude" }]);
+      }
+      return new Response("not found", { status: 404 });
+    });
+    const s = store();
+    const d = deps(s, fetchHostile as unknown as typeof fetch);
+    d.config = parseConfig({ ...baseConfigRaw(), pluginQuotaIds: {} }).config;
+    const summary = await runSync(d, { running: false });
+    // Best-effort per-file warning (like any other served-set fetch failure).
+    expect(summary.skipped).toBe(false);
+    expect(summary.errors.some((e) => e.includes("untrusted auth-file name"))).toBe(true);
+    const blob = JSON.stringify([summary, s.activity, s.failure]);
+    expect(blob).not.toContain(hostile);
+    expect(blob).toMatch(/sha256:[0-9a-f]{16}/);
     assertNoKeyLeak(s);
   });
 });

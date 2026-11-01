@@ -357,7 +357,22 @@ export async function runSync(deps: SyncDeps, inFlight: { running: boolean }): P
  * strike budget; a 404 on *every* file means the endpoint is missing on this
  * CLIProxy build and derivation degrades to the heuristic with one warning;
  * any other per-file failure warns for that file and keeps the rest.
+ *
+ * PII hygiene: warnings name an auth file by the sorted row key(s) of the
+ * accounts fetched through it (`acct-<hash>`, the page's public account
+ * identity) — never the raw entry `name`. CLIProxy OAuth files are often
+ * named after the account email, and these warnings are board-visible.
+ *
+ * The board-visible reference itself is built by `fileRef` below, so the
+ * operator can still map a warning back to its credential via the page.
  */
+function fileRef(keys: Set<string> | undefined): string {
+  const sorted = [...(keys ?? [])].sort();
+  if (sorted.length === 1) return `row ${sorted[0]}`;
+  if (sorted.length > 1) return `rows ${sorted.join(", ")}`;
+  return "an auth file with no parsed rows";
+}
+
 async function fetchServedSets(
   client: CliproxyManagementClient,
   accounts: ParsedAccount[],
@@ -374,7 +389,10 @@ async function fetchServedSets(
   const okFiles = new Set<string>();
   const okProviders = new Set<string>();
   // Enabled files only; group names so one GET serves every entry sharing it.
+  // The companion row keys identify each file in warnings (never the raw
+  // name — see the hygiene note above).
   const providersByName = new Map<string, Set<string>>();
+  const keysByName = new Map<string, Set<string>>();
   for (const a of accounts) {
     if (a.status === "disabled") continue;
     if (!a.fileName) {
@@ -389,6 +407,12 @@ async function fetchServedSets(
       providersByName.set(a.fileName, set);
     }
     set.add(a.provider);
+    let keys = keysByName.get(a.fileName);
+    if (!keys) {
+      keys = new Set<string>();
+      keysByName.set(a.fileName, keys);
+    }
+    keys.add(a.key);
   }
   if (providersByName.size === 0) {
     warnings.push(
@@ -399,6 +423,9 @@ async function fetchServedSets(
   let ok = 0;
   let notFound = 0;
   for (const [name, providers] of [...providersByName.entries()].sort()) {
+    // Board-visible reference to this file: the row key(s) of the accounts
+    // fetched through it, never the raw entry name.
+    const ref = fileRef(keysByName.get(name));
     let payload: unknown;
     try {
       payload = await client.getAuthFileModels(name);
@@ -407,12 +434,12 @@ async function fetchServedSets(
       if (err instanceof CliproxyNotFoundError) {
         notFound += 1;
         warnings.push(
-          `${[...providers].sort().join(", ")}: served-set fetch for auth file ${JSON.stringify(name)} returned 404; no served evidence from this file this run.`,
+          `${[...providers].sort().join(", ")}: served-set fetch for the auth file of ${ref} returned 404; no served evidence from this file this run.`,
         );
         continue;
       }
       warnings.push(
-        `${[...providers].sort().join(", ")}: served-set fetch for auth file ${JSON.stringify(name)} failed (${err instanceof Error ? err.message : "fetch failed"}); no served evidence from this file this run.`,
+        `${[...providers].sort().join(", ")}: served-set fetch for the auth file of ${ref} failed (${err instanceof Error ? err.message : "fetch failed"}); no served evidence from this file this run.`,
       );
       continue;
     }
@@ -424,7 +451,7 @@ async function fetchServedSets(
     okFiles.add(name);
     for (const provider of providers) okProviders.add(provider);
     for (const w of parsed.warnings) {
-      warnings.push(`${[...providers].sort().join(", ")} served set (${JSON.stringify(name)}): ${w}`);
+      warnings.push(`${[...providers].sort().join(", ")} served set (${ref}): ${w}`);
     }
     for (const m of parsed.models) {
       for (const provider of providers) {
