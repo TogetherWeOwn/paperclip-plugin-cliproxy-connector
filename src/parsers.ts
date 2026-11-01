@@ -525,6 +525,10 @@ export function parseHeaderSignals(
     }
     if (provider === "codex" && key === "x-codex-credits-balance") continue; // informational only
     if (provider === "codex" && key.endsWith("-limit-name")) {
+      // The tier is part of the window identity, exactly as in the metric
+      // branch below: a bare `secondary` limit-name belongs to `secondary`
+      // (never the primary default), and a namespaced one belongs to
+      // `<ns>-<tier>` (never a phantom `<ns>` window).
       const m = /^x-codex-(?:(.*?)-)?(primary|secondary)-limit-name$/.exec(key);
       if (m) acc(m[1] ? `${m[1]}-${m[2]}` : m[2]).labelExtra = value;
       continue;
@@ -553,18 +557,23 @@ export function parseHeaderSignals(
       continue;
     }
     // Codex namespaced: x-codex-[<ns>-]<primary|secondary>-<metric>.
+    // The namespace and its separator are one optional unit, so the stock
+    // unnamespaced `x-codex-primary-*` headers parse too (never silently
+    // quota-blind).
     m = /^x-codex-(?:(.*?)-)?(primary|secondary)-(used-percent|window-minutes|reset-at|reset-after-seconds|allowed|limit-reached|over-secondary-limit-percent)$/.exec(key);
     if (m && (provider === "codex" || provider === "unknown-provider")) {
       const window = m[1] ? `${m[1]}-${m[2]}` : m[2];
       const a = acc(window);
       const metric = m[3];
       if (metric === "used-percent") {
-        // Codex reports 0-100 percent directly (unlike Claude's 0-1
-        // utilization fraction): never route through toUsedPercent, which
-        // would turn 1% into 100%. Overage readings up to 150 still count —
-        // they mean exhausted, and dropping them would read unknown instead.
-        const n = Number(value);
-        const used = Number.isFinite(n) && n >= 0 && n <= 150 ? n : null;
+        // Codex `used-percent` is already 0–100 (unlike Claude's fractional
+        // utilization): a nearly-unused account reads "1", never 100. Never
+        // route through toUsedPercent. Overage readings up to 150 still
+        // count — they mean exhausted, and dropping them would read unknown
+        // instead of out.
+        const direct = Number(value);
+        const used =
+          Number.isFinite(direct) && direct >= 0 && direct <= 150 ? direct : null;
         if (used !== null) a.used = Math.max(a.used ?? -Infinity, used);
         else ignored += 1;
       } else if (metric === "reset-at") {
@@ -597,6 +606,14 @@ export function parseHeaderSignals(
 
   const limits: UsageLimitRow[] = [];
   for (const a of byWindow.values()) {
+    // Metadata alone is never a window: a bare limit-name — or a lone
+    // reset timestamp — with no quota reading must not emit an allowed:null
+    // row, which reads as limiting for admission-signal providers and would
+    // false-exhaust the account. A reset bound ships with the next real
+    // reading; until then the window is unknown, never limiting.
+    if (a.used === null && a.allowed === null && !a.limitReached) {
+      continue;
+    }
     let usedPercent: number | null = a.used;
     let remainingPercent: number | null =
       usedPercent !== null ? Math.max(0, 100 - Math.min(100, usedPercent)) : null;
@@ -631,9 +648,9 @@ export function parseHeaderSignals(
         resetsAt: new Date(resetMs).toISOString(),
         limitReached: true,
         allowed: false,
-        // An explicit 429 watermark gates for every provider: it is an
-        // admission signal, not a provider window name, so the allow-list
-        // (which carries window substrings like "5h") must not filter it.
+        // An explicit 429 watermark always gates, whatever the provider's
+        // quota-window allow-list names: it is evidence of throttling (an
+        // admission signal), not a quota window.
         gating: true,
         observedAt,
         models: opts?.models ?? null,
@@ -996,10 +1013,10 @@ export function parseAuthFiles(
       ]),
       coolingDown: unavailable,
       // Keep the parsed retry time even when it has passed: the aggregator
-      // needs the past timestamp to tell "cooldown lifted → unknown" from
-      // "unavailable with no retry time → out with no bound". Dropping it
-      // here made every lifted cooldown stay exhausted forever.
-      cooldownUntil: unavailable ? nextRetryAfter : null,
+      // needs the past timestamp to tell "cooldown lifted, no fresh
+      // telemetry" (unknown) apart from "no recovery bound at all" (out).
+      // Nulling it here dead-coded that branch and re-waited forever.
+      cooldownUntil: nextRetryAfter,
       parseWarnings: [...parseWarnings, ...(pluginQuota?.warnings ?? [])],
     });
   }

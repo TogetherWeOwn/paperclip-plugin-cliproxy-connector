@@ -270,24 +270,34 @@ export async function runSync(deps: SyncDeps, inFlight: { running: boolean }): P
       // Accounts with no usable file name (or a failed fetch) keep the
       // heuristic — that is the fallback. Disabled accounts are excluded
       // everywhere else (quota aggregation, served-set fetching); they are
-      // excluded here too, so disabling a credential clears its claims.
+      // excluded here too, so disabling a credential clears its claims —
+      // including `owned_by` claims, which read scope (not quota keys).
       const quotaAccounts = accounts.filter(
         (a) => a.status !== "disabled" && !(a.fileName && servedSets.okFiles.has(a.fileName)),
       );
-      // The `owned_by` fallback must not let a provider without credential
-      // evidence claim catalog ids: a disabled Claude file would let
-      // `anthropic` claim a model only Antigravity can serve, hiding
-      // Antigravity's usable model as an overlap. Namespace attribution still
-      // uses the full scope (including configured rows); only the `owned_by`
-      // fallback requires an enabled account with no live evidence.
-      const ownedByEligible = [
-        ...new Set(accounts.filter((a) => a.status !== "disabled").map((a) => a.provider)),
-      ];
+      const disabledProviders = new Set(
+        accounts.filter((a) => a.status === "disabled").map((a) => a.provider),
+      );
+      const enabledProviders = new Set(
+        accounts.filter((a) => a.status !== "disabled").map((a) => a.provider),
+      );
+      // Belt and braces with the scope above: the `owned_by` fallback must
+      // not let a provider without credential evidence claim catalog ids. A
+      // disabled Claude file would otherwise let `anthropic` claim a model
+      // only Antigravity can serve, hiding Antigravity's usable model as an
+      // overlap. Providers with live evidence are still gated by liveOk; this
+      // covers the no-live-evidence path.
+      const ownedByEligible = [...enabledProviders];
       const derivation = deriveProviderModels(catalog.served, {
         authProviders: [
           ...new Set([
-            ...accounts.map((a) => a.provider),
-            ...deps.config.providers.map((p) => p.provider),
+            ...enabledProviders,
+            // Configured-but-undiscovered providers keep the heuristic
+            // fallback; a configured provider whose credentials are all
+            // disabled claims nothing.
+            ...deps.config.providers
+              .map((p) => p.provider)
+              .filter((p) => enabledProviders.has(p) || !disabledProviders.has(p)),
           ]),
         ],
         ownedByEligible,

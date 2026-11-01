@@ -261,11 +261,11 @@ export function aggregateProvider(args: {
   }
 
   // Cache age: the newest row fetch is the sync's fetch time; the oldest
-  // bounds trust. An expired cache is unknown, never a verdict. A fetch time
-  // later than now + future skew is rejected outright (same rule as
-  // classifyFreshness): otherwise a future-dated row stays "fresh" forever.
-  const checked = enabled.map((r) => parseTime(r.checkedAt));
-  if (checked.some((t) => t === null || (t as number) > nowMs + futureSkewMs)) {
+  // bounds trust. An expired cache is unknown, never a verdict. Row fetch
+  // times go through the same future-skew rejection as window observations:
+  // a checkedAt beyond the skew is missing, never fresh.
+  const infos = enabled.map((r) => classifyFreshness(r.checkedAt, nowMs, maxAge, grace, futureSkewMs));
+  if (infos.some((i) => i.freshness === "missing")) {
     return {
       provider,
       model,
@@ -278,7 +278,7 @@ export function aggregateProvider(args: {
       reason: `telemetry for ${provider} has no usable fetch time; unknown.`,
     };
   }
-  const oldest = Math.max(...(checked as number[]).map((t) => nowMs - Math.min(t, nowMs)));
+  const oldest = Math.max(...infos.map((i) => i.ageMs as number));
   const freshness: Freshness = oldest <= maxAge ? "fresh" : oldest <= grace ? "stale" : "expired";
   if (freshness === "expired") {
     return {
