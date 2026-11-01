@@ -24,10 +24,10 @@
  *    provider plugins return, serialized with lowercase JSON tags
  *    (`subscription{plan,…}`, `summary[]`, `groups[].buckets[]` with
  *    `window`, `remainingFraction`, `resetTime`, `description`). Devin
- *    additionally reports `daily_quota_remaining_percent` /
- *    `weekly_quota_remaining_percent` (trailing `%` stripped, with
- *    `daily_reset_at` / `weekly_reset_at`), parsed into `daily` / `weekly`
- *    windows.
+ *    daily/weekly windows come primarily from auth-files passive signals
+ *    (see `parseHeaderSignals`): the `daily|weekly_quota_remaining_percent`
+ *    / `daily|weekly_quota_reset_at` fields sometimes echoed at the plugin
+ *    payload root are accepted only as a fallback.
  */
 
 import { createHash } from "node:crypto";
@@ -519,11 +519,15 @@ export function quotaBlindReason(parserKey: ProviderKey, hasWindows: boolean): s
  * Parse the normalized `QuotaFetchResponse` our provider plugins return
  * (lowercase wire tags: `subscription{plan,tierName,tierId}`, `summary[]`,
  * `groups[].buckets[]` with `window`, `remainingFraction`, `resetTime`,
- * `description`; PascalCase aliases accepted shape-tolerantly). Devin
- * additionally reports `daily_quota_remaining_percent` /
- * `weekly_quota_remaining_percent` (trailing `%` stripped, with
- * `daily_reset_at` / `weekly_reset_at`), parsed into `daily` / `weekly`
- * windows under the same allow-list gating.
+ * `description`; PascalCase aliases accepted shape-tolerantly).
+ *
+ * Devin daily/weekly fallback: when the payload root carries
+ * `daily|weekly_quota_remaining_percent` (trailing `%` stripped, with
+ * `daily|weekly_quota_reset_at` / `daily|weekly_reset_at`), they parse into
+ * `daily` / `weekly` windows under the same allow-list gating. This is only
+ * a fallback — the primary source is the auth-files passive observation
+ * (`quota.signals` on the Devin entry, parsed by `parseHeaderSignals`),
+ * because no Devin plugin quota route serves these fields.
  *
  * Mapping: `usedPercent = (1 − remainingFraction) × 100`,
  * `resetsAt = resetTime`, `allowed = remainingFraction > 0`.
@@ -639,11 +643,14 @@ export function parsePluginQuota(
     }
   }
 
-  // Devin percent fields (`daily_quota_remaining_percent` /
+  // Devin percent fields fallback (`daily_quota_remaining_percent` /
   // `weekly_quota_remaining_percent`, trailing `%` stripped) with
-  // `daily_reset_at` / `weekly_reset_at`. Same gating, same observation.
-  // A Groups-less payload that carries only these fields still parses — the
-  // missing-groups warning fires only when no window came from either shape.
+  // `daily|weekly_quota_reset_at` (also `daily|weekly_reset_at` tolerated).
+  // Same gating, same observation. A Groups-less payload that carries only
+  // these fields still parses — the missing-groups warning fires only when
+  // no window came from either shape. Primary source stays the auth-files
+  // passive signals (see `parseHeaderSignals`); this root shape exists only
+  // for plugin payloads that echo the fields.
   for (const window of ["daily", "weekly"] as const) {
     const raw =
       root[`${window}_quota_remaining_percent`] ??
@@ -667,7 +674,13 @@ export function parsePluginQuota(
         usedPercent,
         remainingPercent,
         resetsAt: toIsoTimestamp(
-          root[`${window}_reset_at`] ?? root[`${window}ResetAt`] ?? root[`${capitalize(window)}ResetAt`] ?? null,
+          root[`${window}_quota_reset_at`] ??
+            root[`${window}_reset_at`] ??
+            root[`${window}QuotaResetAt`] ??
+            root[`${window}ResetAt`] ??
+            root[`${capitalize(window)}QuotaResetAt`] ??
+            root[`${capitalize(window)}ResetAt`] ??
+            null,
         ),
         limitReached: exhausted,
         allowed: exhausted ? false : true,
@@ -744,7 +757,13 @@ function toUsedPercent(v: number): number | null {
  * (`utilization` fraction, `reset` timestamp, `status` allowed/rejected).
  * Codex windows come from `x-codex-[<ns>-]<primary|secondary>-<metric>`
  * (`used-percent` 0–100, `reset-at` unix, `reset-after-seconds`,
- * `allowed`, `limit-reached`). A bare `retry-after` (seconds) is an explicit
+ * `allowed`, `limit-reached`). Devin daily/weekly windows are the primary
+ * source for that provider and come from the auth-files passive observation
+ * (`internal/auth/devin/record.go` writes them into `quotaSignals`, served
+ * as `quota.signals` on the Devin entry):
+ * `<daily|weekly>-quota-remaining-percent` (`"75%"`, trailing `%` stripped,
+ * `used = 100 − remaining`), `<daily|weekly>-quota-reset-at` (RFC3339) and
+ * `plan`. A bare `retry-after` (seconds) is an explicit
  * 429 watermark for any provider and always limits.
  */
 export function parseHeaderSignals(
@@ -866,6 +885,32 @@ export function parseHeaderSignals(
         ignored += 1;
       }
       continue;
+    }
+    // Devin passive observation (primary source for daily/weekly — no Devin
+    // plugin quota route serves these): `<daily|weekly>-quota-remaining-
+    // percent` (`"75%"`, trailing `%` stripped via parseRemainingPercentField,
+    // `used = 100 − remaining`), `<daily|weekly>-quota-reset-at` (RFC3339)
+    // and `plan`. Unknown-provider stays tolerant so a Devin-shaped entry
+    // filed under a future provider word still parses.
+    if (provider === "devin" || provider === "unknown-provider") {
+      const dm = /^(daily|weekly)-quota-(remaining-percent|reset-at)$/.exec(key);
+      if (dm) {
+        const a = acc(dm[1]!);
+        if (dm[2] === "remaining-percent") {
+          const remaining = parseRemainingPercentField(value);
+          if (remaining !== null) a.used = Math.max(a.used ?? -Infinity, 100 - remaining);
+          else ignored += 1;
+        } else {
+          const iso = toIsoTimestamp(value);
+          if (iso) a.extraResetMs.push(Date.parse(iso));
+          else ignored += 1;
+        }
+        continue;
+      }
+      if (key === "plan") {
+        planType = value;
+        continue;
+      }
     }
     ignored += 1;
   }

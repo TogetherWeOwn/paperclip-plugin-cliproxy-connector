@@ -536,6 +536,54 @@ describe("parseAuthFiles (redacted fixture)", () => {
     expect(modelWindow?.usedPercent).toBe(90);
   });
 
+  it("parses Devin daily/weekly from the auth-files passive signals (live wire shape)", () => {
+    // Live shape (CLIProxy v8.0.49 `internal/auth/devin/record.go` →
+    // `auth_files.go` quota observation): `quota.signals` carries
+    // `daily|weekly_quota_remaining_percent` ("75%") with
+    // `daily|weekly_quota_reset_at` (RFC3339) plus `plan`. No Devin plugin
+    // quota route serves these — the passive loop is the primary source.
+    const { accounts, warnings } = parse(
+      [
+        {
+          id: "REDACTED-ID-DEVIN-2",
+          provider: "devin",
+          quota: {
+            observed_at: NOW,
+            signals: {
+              daily_quota_remaining_percent: "75%",
+              daily_quota_reset_at: iso(NOW_MS + 24 * 3_600_000),
+              weekly_quota_remaining_percent: "0%",
+              weekly_quota_reset_at: iso(NOW_MS + 7 * 24 * 3_600_000),
+              plan: "teams",
+            },
+          },
+        },
+      ],
+      { allowLists: { devin: ["daily", "weekly"] } },
+    );
+    expect(accounts).toHaveLength(1);
+    const devin = accounts[0]!;
+    expect(devin.quotaBlind).toBe(false);
+    expect(devin.planType).toBe("teams");
+    expect(devin.limits.find((l) => l.id === "devin:daily")).toMatchObject({
+      usedPercent: 25,
+      remainingPercent: 75,
+      resetsAt: iso(NOW_MS + 24 * 3_600_000),
+      allowed: true,
+      limitReached: false,
+      gating: true,
+      observedAt: NOW,
+    });
+    expect(devin.limits.find((l) => l.id === "devin:weekly")).toMatchObject({
+      usedPercent: 100,
+      remainingPercent: 0,
+      allowed: false,
+      limitReached: true,
+      gating: true,
+    });
+    expect(warnings).toEqual([]);
+  });
+
   it("reconciles cooling / disabled lifecycle from unavailable + next_retry_after", () => {
     const { accounts } = parse();
     const cooling = accounts.find((a) => a.key !== undefined && a.status === "cooling");
