@@ -1287,3 +1287,65 @@ describe("parseAuthFiles with live provider-API payloads (TWO-801)", () => {
     expect(accounts[0]?.quotaBlindReason).toBe("upstream exposes nothing");
   });
 });
+
+describe("live windows supersede same-id passive windows (TWO-801)", () => {
+  it("keeps one fresh live window instead of a stale passive twin", async () => {
+    const { parseAuthFiles } = await import("./parsers.js");
+    const resetUnix = Math.floor(NOW_MS / 1000) + 7200;
+    const { accounts } = parseAuthFiles(
+      {
+        files: [
+          {
+            id: "REDACTED-ID-DEVIN",
+            auth_index: "d1",
+            name: "REDACTED-NAME",
+            provider: "devin",
+            disabled: false,
+            unavailable: false,
+            quota: {
+              observed_at: "2026-10-01T12:00:00.000Z",
+              signals: {
+                "daily-quota-remaining-percent": "10%",
+                "daily-quota-reset-at": "2026-10-01T13:00:00.000Z",
+                "weekly-quota-remaining-percent": "20%",
+                "weekly-quota-reset-at": "2026-10-08T12:00:00.000Z",
+                plan: "Devin",
+              },
+            },
+          },
+        ],
+      },
+      {
+        now: NOW,
+        allowLists: { ...DEFAULT_PROVIDER_WINDOWS },
+        apiCallPayloadByAuthIndex: new Map([
+          [
+            "d1",
+            {
+              statusCode: 200,
+              body: {
+                userStatus: {
+                  planStatus: {
+                    dailyQuotaRemainingPercent: 60,
+                    dailyQuotaResetAtUnix: resetUnix,
+                    weeklyQuotaRemainingPercent: 80,
+                    weeklyQuotaResetAtUnix: resetUnix + 86400,
+                    planInfo: { planName: "Devin Pro" },
+                  },
+                },
+              },
+            },
+          ],
+        ]),
+        apiCallObservedAt: NOW,
+      },
+    );
+    expect(accounts).toHaveLength(1);
+    const ids = accounts[0]?.limits.map((l) => l.id) ?? [];
+    expect(ids).toEqual(["devin:daily", "devin:weekly"]);
+    expect(accounts[0]?.limits[0]?.remainingPercent).toBe(60);
+    expect(accounts[0]?.limits[0]?.observedAt).toBe(NOW);
+    expect(accounts[0]?.limits.every((l) => l.viaProviderApi === true)).toBe(true);
+    expect(accounts[0]?.quotaBlind).toBe(false);
+  });
+});

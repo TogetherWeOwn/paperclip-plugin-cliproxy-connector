@@ -1738,9 +1738,16 @@ export function parseAuthFiles(
       }
     }
 
+    // Live windows supersede same-id passive/plugin windows: the RPC reads the
+    // same underlying quota fresher (observed at sync time), and keeping both
+    // would duplicate the row and let a stale passive reading veto the fresh
+    // live headroom. Failover stays: when the live fetch fails there is no
+    // apiLimit, so the passive/plugin windows show again.
+    const liveIds = new Set(apiLimits.map((l) => l.id));
+    const live = (l: UsageLimitRow) => !liveIds.has(l.id);
     const stamped = softGating
-      ? [...limits.map((l) => ({ ...l, gating: false })), ...pluginLimits, ...apiLimits]
-      : [...limits, ...pluginLimits, ...apiLimits];
+      ? [...limits.filter(live).map((l) => ({ ...l, gating: false })), ...pluginLimits.filter(live), ...apiLimits]
+      : [...limits.filter(live), ...pluginLimits.filter(live), ...apiLimits];
 
     // Meta and Antigravity publish no passive signals: without live provider-API
     // windows they stay quota-blind. With at least one gating live window they
