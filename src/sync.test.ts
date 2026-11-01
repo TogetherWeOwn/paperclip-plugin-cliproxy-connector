@@ -314,6 +314,41 @@ describe("happy path", () => {
     assertNoKeyLeak(s);
   });
 
+  it("sends the per-file quota fetch for a numeric auth_index (upstream shape-tolerance)", async () => {
+    const quotaUrls: string[] = [];
+    const fetchNumeric = vi.fn(async (input: string | URL | Request): Promise<Response> => {
+      const url = new URL(String(input));
+      if (url.pathname === "/v0/management/auth-files") {
+        // Numeric shape (a JSON number, not a string) must still drive the
+        // per-file fetch — never fall back to the legacy route that 400s on
+        // current builds.
+        return jsonResponse(200, [{ id: "claude-1", provider: "claude", auth_index: 7 }]);
+      }
+      if (url.pathname === "/v0/management/plugins/claude-quota/quota") {
+        quotaUrls.push(url.toString());
+        if (url.searchParams.get("auth_index") === "7") {
+          return jsonResponse(200, { Groups: [{ Buckets: [{ Window: "weekly", RemainingFraction: 0.6 }] }] });
+        }
+        return new Response("auth_index is required", { status: 400 });
+      }
+      if (url.pathname === "/v1/models") return jsonResponse(200, modelsBody());
+      return new Response("not found", { status: 404 });
+    });
+    const s = store();
+    const summary = await runSync(deps(s, fetchNumeric as unknown as typeof fetch), { running: false });
+    expect(summary.skipped).toBe(false);
+    expect(quotaUrls).toHaveLength(1);
+    expect(new URL(quotaUrls[0] as string).searchParams.get("auth_index")).toBe("7");
+    expect(summary.errors.some((e) => e.includes("plugin"))).toBe(false);
+    const rows = s.savedRows as Record<string, AccountUsageRow>;
+    expect(Object.keys(rows)).toHaveLength(1);
+    expect(Object.values(rows)[0]?.limits.find((l) => l.id === "claude:weekly")).toMatchObject({
+      remainingPercent: 60,
+    });
+    expect(s.strike.failures).toHaveLength(0);
+    assertNoKeyLeak(s);
+  });
+
   it("a failing per-file quota fetch is best-effort: the sync succeeds and spends no strike", async () => {
     const fetchOneBad = vi.fn(async (input: string | URL | Request): Promise<Response> => {
       const url = new URL(String(input));

@@ -1,7 +1,7 @@
 import type { PaperclipPluginManifestV1 } from "@paperclipai/plugin-sdk";
 
 export const PLUGIN_ID = "togetherweown.cliproxy-connector";
-export const PLUGIN_VERSION = "0.2.1";
+export const PLUGIN_VERSION = "0.2.2";
 export const SYNC_JOB_KEY = "cliproxy-sync";
 export const PAGE_DATA_KEY = "cliproxy-page";
 export const WIDGET_DATA_KEY = "cliproxy-widget";

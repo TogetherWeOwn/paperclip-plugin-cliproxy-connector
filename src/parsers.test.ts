@@ -460,6 +460,25 @@ describe("parseAuthFiles (redacted fixture)", () => {
     expect(cf[0]?.quotaBlind).toBe(false);
   });
 
+  it("coerces a numeric auth_index shape-tolerantly and drops non-index shapes", () => {
+    const { accounts } = parse([
+      { id: "s-1", provider: "claude", auth_index: "abc123" },
+      { id: "n-1", provider: "claude", auth_index: 7 },
+      { id: "z-1", provider: "claude", auth_index: 0 },
+      { id: "f-1", provider: "claude", auth_index: 1.5 },
+      { id: "g-1", provider: "claude", auth_index: -1 },
+      { id: "u-1", provider: "claude", auth_index: Number.MAX_SAFE_INTEGER + 1 },
+      { id: "b-1", provider: "claude", auth_index: true },
+      { id: "e-1", provider: "claude", auth_index: "" },
+    ]);
+    const indexOf = (id: string) =>
+      accounts.find((a) => a.key === `acct-${hashIdentity([id])?.slice(0, 16)}`)?.authIndex;
+    expect(indexOf("s-1")).toBe("abc123");
+    expect(indexOf("n-1")).toBe("7");
+    expect(indexOf("z-1")).toBe("0");
+    for (const id of ["f-1", "g-1", "u-1", "b-1", "e-1"]) expect(indexOf(id)).toBeNull();
+  });
+
   it("carries the auth-file name for the served-set fetch", () => {
     const { accounts } = parse([
       { id: "n-1", provider: "claude", name: "claude-file" },
@@ -547,10 +566,14 @@ describe("parseAuthFiles (redacted fixture)", () => {
   });
 
   it("attaches per-provider plugin quota with the sync fetch time as observation", () => {
-    const payload = new Map<string, unknown>([
-      ["claude", { Subscription: { Plan: "pro" }, Groups: [{ Buckets: [{ Window: "weekly", RemainingFraction: 0.8, ResetTime: iso(NOW_MS + 7 * 24 * 3_600_000) }] }] }],
-    ]);
-    const { accounts } = parse(redactedAuthFiles(), { pluginPayloadByProvider: payload });
+    const body = { Subscription: { Plan: "pro" }, Groups: [{ Buckets: [{ Window: "weekly", RemainingFraction: 0.8, ResetTime: iso(NOW_MS + 7 * 24 * 3_600_000) }] }] };
+    const payload = new Map<string, unknown>([["claude", body]]);
+    // The fixture's first claude entry carries a numeric auth_index (1), so it
+    // attaches only its own file's payload, never the provider-level one.
+    const { accounts } = parse(redactedAuthFiles(), {
+      pluginPayloadByProvider: payload,
+      pluginPayloadByAuthIndex: new Map([["1", body]]),
+    });
     const claude = accounts.filter((a) => a.provider === "claude" && a.status !== "disabled");
     expect(claude.length).toBeGreaterThan(0);
     for (const a of claude) {
