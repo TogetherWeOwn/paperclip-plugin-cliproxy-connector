@@ -153,7 +153,7 @@ describe("reserve math (kept from v1)", () => {
   });
 });
 
-describe("TWO-801 live provider-API window defaults", () => {
+describe("live provider-API window defaults", () => {
   it("gates the meta window/weekly and antigravity time windows the live parsers emit", async () => {
     const { DEFAULT_PROVIDER_WINDOWS } = await import("./config.js");
     const { isGatingWindow } = await import("./parsers.js");

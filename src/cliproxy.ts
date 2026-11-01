@@ -40,7 +40,7 @@ export const AUTH_FILES_PATH = "/v0/management/auth-files";
 const PLUGIN_QUOTA_SHAPE = /^\/v0\/management\/plugins\/[A-Za-z0-9][A-Za-z0-9_-]*\/quota$/;
 
 /**
- * Pinned `api-call` management path (TWO-801). POST-only, and only reachable
+ * Pinned `api-call` management path. POST-only, and only reachable
  * through `postApiCall` with one of the three frozen templates below — the
  * GET allow-list (`assertAllowListed`) still refuses this path outright.
  *
@@ -95,7 +95,7 @@ function copyApiCallTemplate(template: ApiCallTemplate): ApiCallTemplate {
 }
 
 /**
- * The three pinned `api-call` templates (TWO-801). Frozen: callers select by
+ * The three pinned `api-call` templates. Frozen: callers select by
  * key (`ApiCallTemplateKey`) and can never supply their own URL, headers or
  * body, so the guarded POST below cannot send an arbitrary upstream request.
  *
@@ -177,6 +177,23 @@ export function apiCallTemplate(key: string): ApiCallTemplate {
 /** All pinned template keys (one per provider family served through `api-call`). */
 export function apiCallTemplateKeys(): ApiCallTemplateKey[] {
   return Object.keys(API_CALL_TEMPLATES) as ApiCallTemplateKey[];
+}
+
+/**
+ * Exact template allow-map from an auth file's raw provider word to its pinned
+ * template key. Only the three provider words the templates were pinned for
+ * (`meta`, `antigravity`, `devin`) resolve; anything else — `gemini`,
+ * `gemini-cli`, `metafoo`, future provider words — returns null and is never
+ * called. This is deliberately NOT `normalizeProvider`: fuzzy/substring
+ * matching would send one account's stored credential through another
+ * family's request (e.g. a Gemini token as Bearer to the Antigravity Code
+ * Assist URL). Callers compare the trimmed, lowercased raw provider string
+ * for exact equality only.
+ */
+export function apiCallTemplateKeyForProvider(rawProvider: string): ApiCallTemplateKey | null {
+  const word = rawProvider.trim().toLowerCase();
+  if (!Object.prototype.hasOwnProperty.call(API_CALL_TEMPLATES, word)) return null;
+  return word as ApiCallTemplateKey;
 }
 
 /**
@@ -377,7 +394,7 @@ function assertModelsAllowListed(url: URL, what: string): void {
 }
 
 /**
- * Pinned `api-call` POST allow-list (TWO-801). The ONLY path the guarded POST
+ * Pinned `api-call` POST allow-list. The ONLY path the guarded POST
  * below may address: exactly `/v0/management/api-call` with no query string.
  * Template contents (upstream URL, headers, body) are never part of the URL —
  * they travel in the POST body built internally from a frozen template — so a
@@ -630,7 +647,7 @@ export class CliproxyManagementClient {
   }
 
   /**
-   * POST one pinned `api-call` template for one credential (TWO-801).
+   * POST one pinned `api-call` template for one credential.
    *
    * The caller names a template KEY only (`meta`, `antigravity`, `devin`); the
    * upstream method, URL, headers and body come from the frozen template, so

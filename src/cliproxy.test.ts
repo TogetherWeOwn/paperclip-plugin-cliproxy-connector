@@ -15,6 +15,7 @@ import {
   isSafeAuthFileName,
   MODELS_PATH,
   apiCallTemplate,
+  apiCallTemplateKeyForProvider,
   pluginQuotaPath,
 } from "./cliproxy.js";
 
@@ -473,7 +474,7 @@ describe("plugin quota auth_index (v8.0.49, per-file quota)", () => {
   });
 });
 
-describe("pinned api-call POST (TWO-801, three frozen templates)", () => {
+describe("pinned api-call POST (three frozen templates)", () => {
   const envelope = (statusCode: number, body: unknown) =>
     json(200, { status_code: statusCode, header: {}, body: JSON.stringify(body) });
 
@@ -486,6 +487,18 @@ describe("pinned api-call POST (TWO-801, three frozen templates)", () => {
       CliproxyConfigError,
     );
     expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it("resolves template keys by exact provider word only (no fuzzy matching)", async () => {
+    expect(apiCallTemplateKeyForProvider("meta")).toBe("meta");
+    expect(apiCallTemplateKeyForProvider("antigravity")).toBe("antigravity");
+    expect(apiCallTemplateKeyForProvider("devin")).toBe("devin");
+    expect(apiCallTemplateKeyForProvider(" Meta ")).toBe("meta");
+    // Fuzzy/substring lookalikes must never resolve: a Gemini credential must
+    // not travel through the Antigravity request, nor a made-up word through Meta.
+    for (const word of ["gemini", "gemini-cli", "metafoo", "metas", "mydevin", "claude", "", "constructor"]) {
+      expect(apiCallTemplateKeyForProvider(word)).toBeNull();
+    }
   });
 
   it("rejects inherited prototype keys, not only unknown names", async () => {

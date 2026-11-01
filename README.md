@@ -162,7 +162,7 @@ own pinned path (`/v1/models`, `MODELS_PATH`) fetched with the separate client A
 (Bearer auth) under the same guarded-fetch rules (loopback, manual redirects, timeouts,
 caps, no key leaks); neither key can travel to the other's paths. Meta, Antigravity and
 Devin publish no passive quota signals, so one pinned `POST /v0/management/api-call`
-per credential per sync (TWO-801) reads the same live quota the Management Center panel
+per credential per sync reads the same live quota the Management Center panel
 shows: three frozen request templates (exact upstream method, URL, headers and body
 copied from the panel source, `apiCallTemplate()` in `src/cliproxy.ts`) whose only
 variable is the credential `auth_index` — callers cannot supply their own URL, headers
@@ -195,7 +195,7 @@ tests mirrors the public CLIProxyAPI source shapes.
   it). Client-key 401/403s never spend the management strike budget.
 - Safe path only: loopback base URL, key header attached after origin validation, pinned
   GET allow-list (`api-call` excluded from it and un-admittable through it) plus the
-  three pinned TWO-801 `api-call` POST templates (exact upstream requests, credential
+  three pinned `api-call` POST templates (exact upstream requests, credential
   `auth_index` the only variable), manual redirects with revalidation
   (max 2, same-origin loopback), 15 s timeouts, 2 MB caps, schema-checked JSON. The worker
   fetches through its own guarded loopback transport (Node fetch, never the host client —

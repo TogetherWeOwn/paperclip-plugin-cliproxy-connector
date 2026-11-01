@@ -2,7 +2,7 @@
  * Sync job (cron 2–5 min + on-demand): CLIProxy → plugin cache.
  *
  * Reads the CLIProxy account list + per-provider quota through the proposal
- * §4 safe path (pinned GET allow-list plus the three pinned TWO-801
+ * §4 safe path (pinned GET allow-list plus the three pinned
  * `api-call` POST templates for Meta/Antigravity/Devin, one call per account
  * per sync), groups accounts by provider, and normalises into
  * `AiConnectionUsage`-shaped rows in the plugin's own namespace. No core
@@ -19,6 +19,7 @@
  */
 
 import {
+  apiCallTemplateKeyForProvider,
   CliproxyAuthError,
   CliproxyClientApiClient,
   CliproxyConfigError,
@@ -33,7 +34,7 @@ import {
   parseModelsPayload,
   type ServedModel,
 } from "./models.js";
-import { hashIdentity, normalizeProvider, parseAuthFiles, type ParsedAccount } from "./parsers.js";
+import { hashIdentity, parseAuthFiles, type ParsedAccount } from "./parsers.js";
 import type {
   AccountUsageRow,
   DriftFinding,
@@ -46,6 +47,14 @@ import type {
 export const STRIKE_WINDOW_MS = 30 * 60_000;
 export const STRIKE_LIMIT = 2;
 export const MIN_SYNC_INTERVAL_MS = 60_000;
+/**
+ * Minimum gap between two credential-bearing provider-API calls for the same
+ * credential (`auth_index`). The scheduled sync runs every 5 minutes, so this
+ * bounds live quota reads to at most one call per account per sync even when
+ * the on-demand resync action fires back to back — repeated provider hits
+ * with stored credentials could otherwise get those accounts flagged.
+ */
+export const API_CALL_MIN_INTERVAL_MS = 5 * 60_000;
 
 export function emptyStrikeBudget(): StrikeBudgetState {
   return { failures: [], disabled: false, disabledAt: null, disabledReason: null, secretBad: false };
@@ -98,6 +107,12 @@ export interface SyncDeps {
    */
   recordFailure: (failure: SyncFailure | null) => Promise<void>;
   logActivity: (message: string, metadata?: Record<string, unknown>) => Promise<void>;
+  /**
+   * Last provider-API call time per credential `auth_index` (epoch millis).
+   * The worker owns one shared map across runs; callers that omit it get no
+   * cross-run throttling. Tests pass their own map to assert the bound.
+   */
+  apiCallLastCall?: Map<string, number>;
 }
 
 function summary(
@@ -305,33 +320,48 @@ export async function runSync(deps: SyncDeps, inFlight: { running: boolean }): P
         }
       }
 
-      // Live provider-API quota (TWO-801): one pinned
+      // Live provider-API quota: one pinned
       // `POST /v0/management/api-call` per distinct credential index among the
       // enabled, configured meta/antigravity/devin accounts — the families the
-      // three frozen templates serve. Disabled accounts are never called;
-      // cooling accounts keep their cooldown (no probe while the provider says
+      // three frozen templates serve. The template comes from an exact
+      // allow-map on the auth file's raw provider word, never from fuzzy
+      // matching: a `gemini` account must not send its credential through the
+      // Antigravity request. Disabled accounts are never called; cooling
+      // accounts keep their cooldown (no probe while the provider says
       // wait); one call per index per sync bounds the rate to the sync cadence
-      // (every 5 min). Raw envelopes ride along by `auth_index` and attach to
-      // their own account row at parse time. Failed calls warn per file and
-      // stay quota-blind; only a rejected key (401/403) stops the run.
+      // (every 5 min), and the per-credential throttle below holds that bound
+      // across back-to-back resyncs. Raw envelopes ride along by `auth_index`
+      // and attach to their own account row at parse time. Failed calls warn
+      // per file and stay quota-blind; only a rejected key (401/403) stops
+      // the run.
       const apiCallPayloadByAuthIndex = new Map<string, { statusCode: number; body: unknown }>();
       const fetchedApiCallIndexes = new Set<string>();
       const configuredProviders = new Set(deps.config.providers.map((p) => p.provider));
       for (const a of discovered.accounts) {
         if (a.status === "disabled" || a.status === "cooling") continue;
         if (!a.authIndex || !configuredProviders.has(a.provider)) continue;
-        const family = normalizeProvider(a.provider);
-        if (family !== "meta" && family !== "antigravity" && family !== "devin") continue;
+        const templateKey = apiCallTemplateKeyForProvider(a.provider);
+        if (!templateKey) continue;
         if (fetchedApiCallIndexes.has(a.authIndex)) continue;
         fetchedApiCallIndexes.add(a.authIndex);
+        // Cross-run per-credential throttle: skip the provider call when this
+        // credential was already called less than 5 minutes ago (e.g. a manual
+        // resync right after the scheduled sync). The account stays unknown
+        // this run rather than spending another credential-bearing hit.
+        const lastCall = deps.apiCallLastCall?.get(a.authIndex);
+        if (lastCall !== undefined && nowMs - lastCall < API_CALL_MIN_INTERVAL_MS) continue;
         try {
-          const result = await client.postApiCall(family, a.authIndex);
+          const result = await client.postApiCall(templateKey, a.authIndex);
+          deps.apiCallLastCall?.set(a.authIndex, nowMs);
           apiCallPayloadByAuthIndex.set(a.authIndex, {
             statusCode: result.statusCode,
             body: result.body,
           });
         } catch (err) {
           if (err instanceof CliproxyAuthError) throw err; // stop after first rejected key
+          // A provider hit happened even when it fails (transport error,
+          // upstream envelope rejection), so the throttle still records it.
+          deps.apiCallLastCall?.set(a.authIndex, nowMs);
           // Auth indexes are opaque tokens, but never persist one raw in a
           // warning: the short hash distinguishes files for debugging.
           const fileRef = `auth ${hashIdentity([a.authIndex])?.slice(0, 8) ?? "unknown"}`;

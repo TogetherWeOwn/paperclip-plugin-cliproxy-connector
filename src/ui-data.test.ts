@@ -451,7 +451,7 @@ describe("widget data", () => {
   });
 });
 
-describe("via provider API provenance (TWO-801)", () => {
+describe("via provider API provenance", () => {
   it("passes the live-quota flag through to usage page windows", async () => {
     const { buildUsageData } = await import("./ui-data.js");
     const { parseConfig } = await import("./config.js");

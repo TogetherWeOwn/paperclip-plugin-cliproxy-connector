@@ -1246,7 +1246,7 @@ describe("sync failure visibility (S2)", () => {
   });
 });
 
-describe("live provider-API quota (TWO-801 pinned api-call templates)", () => {
+describe("live provider-API quota (pinned api-call templates)", () => {
   const RESET = Math.floor(Date.parse(NOW) / 1000) + 3600;
   const metaBody = () => ({
     subs_usage: {
@@ -1394,6 +1394,61 @@ describe("live provider-API quota (TWO-801 pinned api-call templates)", () => {
     expect(rows[0]?.quotaBlind).toBe(true);
     expect(rows[0]?.limits).toEqual([]);
     expect((summary.errors.join(" ") + (rows[0]?.lastError ?? ""))).toMatch(/500/);
+    assertNoKeyLeak(s);
+  });
+
+  it("never sends fuzzy provider words through a pinned template (no credential to the wrong request)", async () => {
+    const s = store();
+    const calls: string[] = [];
+    // `gemini`/`gemini-cli` fuzzy-match to antigravity and `metafoo` contains
+    // `meta` under substring matching: none of them may produce an api-call.
+    const files = [
+      { id: "gemini-a", provider: "gemini", auth_index: "g1" },
+      { id: "gemini-cli-a", provider: "gemini-cli", auth_index: "g2" },
+      { id: "metafoo-a", provider: "metafoo", auth_index: "mX" },
+    ];
+    const config = configWith(
+      { provider: "gemini", connectionId: "conn-gemini" },
+      { provider: "gemini-cli", connectionId: "conn-gemini-cli" },
+      { provider: "metafoo", connectionId: "conn-metafoo" },
+    );
+    const summary = await runSync(depsWith(s, config, apiFetch(calls, files) as never), {
+      running: false,
+    });
+    expect(summary.skipped).toBe(false);
+    expect(calls).toHaveLength(0);
+    const rows = Object.values(s.savedRows ?? {});
+    expect(rows).toHaveLength(3);
+    expect(rows.every((r) => r.limits.every((l) => l.viaProviderApi !== true))).toBe(true);
+    assertNoKeyLeak(s);
+  });
+
+  it("two syncs back to back make one api-call per credential (per-index 5-minute throttle)", async () => {
+    const s = store();
+    const calls: string[] = [];
+    const files = [
+      { id: "meta-a", provider: "meta", auth_index: "m1" },
+      { id: "devin-a", provider: "devin", auth_index: "d1" },
+    ];
+    const config = configWith(
+      { provider: "meta", connectionId: "conn-meta" },
+      { provider: "devin", connectionId: "conn-devin" },
+    );
+    const apiCallLastCall = new Map<string, number>();
+    const first = await runSync(
+      { ...depsWith(s, config, apiFetch(calls, files) as never), apiCallLastCall },
+      { running: false },
+    );
+    expect(first.skipped).toBe(false);
+    expect(calls).toHaveLength(2);
+    const second = await runSync(
+      { ...depsWith(s, config, apiFetch(calls, files) as never), apiCallLastCall },
+      { running: false },
+    );
+    expect(second.skipped).toBe(false);
+    // No further provider calls: the throttle held both credentials.
+    expect(calls).toHaveLength(2);
+    expect([...apiCallLastCall.keys()].sort()).toEqual(["d1", "m1"]);
     assertNoKeyLeak(s);
   });
 });

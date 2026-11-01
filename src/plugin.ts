@@ -35,6 +35,14 @@ import { buildPageData, buildUsageData, buildWidgetData } from "./ui-data.js";
 
 const inFlight: { running: boolean } = { running: false };
 
+/**
+ * Worker-level last provider-API call time per credential `auth_index` (epoch
+ * millis). Bounds credential-bearing live quota reads to at most one call per
+ * account per 5 minutes across back-to-back resyncs; the scheduled 5-minute
+ * cadence never trips it. In memory only, never persisted or logged.
+ */
+const apiCallLastCall = new Map<string, number>();
+
 type CompanyStateKey = { scopeKind: "company"; scopeId: string; namespace: string; stateKey: string };
 type InstanceStateKey = { scopeKind: "instance"; namespace: string; stateKey: string };
 
@@ -358,6 +366,7 @@ async function runCompanySync(
         }
       },
       logActivity: (message, metadata) => ctx.activity.log({ companyId, message, metadata }),
+      apiCallLastCall,
     },
     inFlight,
   );

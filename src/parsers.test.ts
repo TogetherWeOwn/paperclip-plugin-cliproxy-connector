@@ -1280,7 +1280,7 @@ describe("parseDevinQuota (panel devinQuota.ts shape)", () => {
   });
 });
 
-describe("parseAuthFiles with live provider-API payloads (TWO-801)", () => {
+describe("parseAuthFiles with live provider-API payloads", () => {
   const filesFor = (provider: string, authIndex: string) => ({
     files: [
       {
@@ -1379,7 +1379,7 @@ describe("parseAuthFiles with live provider-API payloads (TWO-801)", () => {
   });
 });
 
-describe("live windows supersede same-id passive windows (TWO-801)", () => {
+describe("live windows supersede same-id passive windows", () => {
   it("keeps one fresh live window instead of a stale passive twin", async () => {
     const { parseAuthFiles } = await import("./parsers.js");
     const resetUnix = Math.floor(NOW_MS / 1000) + 7200;

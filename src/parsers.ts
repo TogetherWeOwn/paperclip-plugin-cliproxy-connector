@@ -733,7 +733,7 @@ function capitalize(s: string): string {
 }
 
 /* ------------------------------------------------------------------ */
-/* live provider-API quota (pinned api-call templates, TWO-801)        */
+/* live provider-API quota (pinned api-call templates)                 */
 /* ------------------------------------------------------------------ */
 
 export interface ParsedApiQuota {
@@ -1036,7 +1036,7 @@ function parseDevinUnixSeconds(value: unknown): string | null {
  * digits-only) and `{daily,weekly}QuotaResetAtUnix` (unix seconds), plus
  * `planInfo.planName`. This reads the live RPC — never auth-file metadata or
  * `quota.signals` — which is why the connector saw nothing for Devin before
- * TWO-801. An expected window without a usable percent is emitted as an
+ * the live provider-API reads. An expected window without a usable percent is emitted as an
  * explicit unknown row: for Devin's admission semantics that unknown is
  * limiting (fail closed), so a partial response cannot leave a usable sibling
  * as false headroom. Zero usable windows is `empty_data`-equivalent: plan
@@ -1526,7 +1526,7 @@ export function parseAuthFiles(
      */
     pluginPayloadByAuthIndex?: Map<string, unknown>;
     /**
-     * Live provider-API answers by credential `auth_index` (TWO-801 pinned
+     * Live provider-API answers by credential `auth_index` (pinned
      * `POST /v0/management/api-call` templates, one call per account per
      * sync). The parser selects the parser by the account's own family
      * (`meta`, `antigravity`, `devin`) — never by a caller-supplied key — and
@@ -1775,7 +1775,7 @@ export function parseAuthFiles(
     const pluginLimits: UsageLimitRow[] = pluginQuota?.limits ?? [];
     if (pluginQuota?.planType) planType = pluginQuota.planType;
 
-    // Live provider-API windows (TWO-801): the account's own api-call answer,
+    // Live provider-API windows: the account's own api-call answer,
     // parsed by its own family's parser. A non-2xx upstream answer warns per
     // file and attaches nothing — fail open, never headroom.
     let apiLimits: UsageLimitRow[] = [];
@@ -1788,12 +1788,16 @@ export function parseAuthFiles(
           `${provider}: provider API returned upstream HTTP ${apiPayload.statusCode}; treating this account as unknown for live quota.`,
         );
       } else {
+        // Exact match on the raw provider word — never the fuzzy parser key:
+        // a `gemini` answer must not parse as Antigravity quota (or vice
+        // versa). The sync loop only fetches exact-word accounts, so this is
+        // defense-in-depth for direct callers.
         const parsedApi: ParsedApiQuota | null =
-          parserKey === "meta"
+          provider === "meta"
             ? parseMetaQuota(apiPayload.body, apiObservedAt, allowList)
-            : parserKey === "antigravity"
+            : provider === "antigravity"
               ? parseAntigravitySubscription(apiPayload.body, apiObservedAt, allowList)
-              : parserKey === "devin"
+              : provider === "devin"
                 ? parseDevinQuota(apiPayload.body, apiObservedAt, allowList)
                 : null;
         if (!parsedApi) {
