@@ -64,8 +64,16 @@ function asObj(v: unknown): Json | null {
  * (`{data: [...]}`), a `{models: [...]}` wrapper, or a bare array. Entries
  * accept `{id, owned_by|ownedBy|owner}` objects or plain id strings. Entries
  * without a usable id are skipped with a warning — never trusted.
+ *
+ * Pass `{ emptyIsValid: true }` for per-file served-set fetches
+ * (`GET auth-files/models?name=<file>`): a successful empty answer is valid
+ * evidence that the credential serves nothing, not the catalog-wide "no
+ * provider has proven models" signal.
  */
-export function parseModelsPayload(payload: unknown): { models: ServedModel[]; warnings: string[] } {
+export function parseModelsPayload(
+  payload: unknown,
+  opts?: { emptyIsValid?: boolean },
+): { models: ServedModel[]; warnings: string[] } {
   const warnings: string[] = [];
   const models: ServedModel[] = [];
   const root = asObj(payload);
@@ -77,7 +85,9 @@ export function parseModelsPayload(payload: unknown): { models: ServedModel[]; w
           .find((v) => Array.isArray(v)) as unknown[]) ?? []
       : [];
   if (entries.length === 0) {
-    warnings.push("models payload holds no entries; no provider has proven models this run.");
+    if (!opts?.emptyIsValid) {
+      warnings.push("models payload holds no entries; no provider has proven models this run.");
+    }
     return { models, warnings };
   }
   const seen = new Set<string>();

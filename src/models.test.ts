@@ -34,6 +34,14 @@ describe("parseModelsPayload", () => {
     expect(models).toEqual([]);
     expect(warnings.length).toBeGreaterThan(0);
   });
+
+  it("treats an empty payload as valid evidence for per-file served-set fetches", () => {
+    // An empty served set means the credential serves nothing — not the
+    // catalog-wide "no provider has proven models" signal.
+    const { models, warnings } = parseModelsPayload({ data: [] }, { emptyIsValid: true });
+    expect(models).toEqual([]);
+    expect(warnings).toEqual([]);
+  });
 });
 
 describe("namespaceOfModelId", () => {
