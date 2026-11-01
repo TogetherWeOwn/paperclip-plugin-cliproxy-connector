@@ -61,6 +61,26 @@ function getObj(o: Json, ...keys: string[]): Json | null {
 }
 
 /**
+ * Credential `auth_index` from an `auth-files` entry. Upstream serializes it
+ * as a string (`auth_files_fields.go`: `AuthIndex string`), but a numeric
+ * shape is accepted shape-tolerantly: only a non-negative safe integer, and
+ * only as its plain decimal rendering. Anything else (floats, negatives,
+ * unsafe integers, booleans, objects) reads as absent, and the value still
+ * passes the management client's `isSafeAuthIndex` check before any fetch.
+ */
+function getAuthIndex(o: Json, ...keys: string[]): string | null {
+  for (const k of keys) {
+    const v = o[k];
+    if (typeof v === "string" && v.trim()) return v.trim();
+  }
+  for (const k of keys) {
+    const v = o[k];
+    if (typeof v === "number" && Number.isSafeInteger(v) && v >= 0) return String(v);
+  }
+  return null;
+}
+
+/**
  * Coerce epoch seconds / epoch millis / ISO string / Date into ISO.
  * Returns null when the value is absent or unparseable. Numbers that are
  * implausibly far in the past/future are rejected.
@@ -934,7 +954,7 @@ export function parseAuthFiles(
     // class; unknown providers fall back to the generic (quota-blind) parser.
     const parserKey = normalizeProvider(provider);
     const fileName = getStr(entry, "name", "Name") ?? null;
-    const authIndex = getStr(entry, "auth_index", "authIndex", "AuthIndex")?.trim() || null;
+    const authIndex = getAuthIndex(entry, "auth_index", "authIndex", "AuthIndex");
 
     // Stable identity: CLIProxy `id` first, then the auth-file `path`.
     const stableId = getStr(entry, "id", "ID", "auth_id") ?? getStr(entry, "path", "Path") ?? null;
