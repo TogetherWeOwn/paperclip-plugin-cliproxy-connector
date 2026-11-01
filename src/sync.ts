@@ -79,7 +79,7 @@ export function apiCallOriginKey(cliproxyBaseUrl: string): string {
   try {
     return new URL(cliproxyBaseUrl).origin;
   } catch {
-    return cliproxyBaseUrl.trim().replace(/\/+$/, "");
+    return cliproxyBaseUrl.trim();
   }
 }
 
