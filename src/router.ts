@@ -19,15 +19,15 @@
  * Host contract (stated honestly, tested): `retryAt` is advisory — core owns
  * the actual wait and clamps it to its own bounds. The router returns member
  * selection plus `skipped` notes only; it never sees, forwards, or constrains
- * the task's native execution input. `missing-connection` drift means a
- * `providers[]` row whose connection is bound by no pool using this router
- * (fleet-wide), or a connection that is archived or missing: it is computed
- * across every pool's member bindings — never from one pool's members alone,
- * where every sibling row would false-positive — and reported as page drift.
- * Per route, the only missing-connection this pool can vouch for is its own
- * member binding naming a connection with no `providers[]` row; that is
- * reported as a `skipped["pool:<id>"]` note. Neither note ever blocks
- * selection.
+ * the task's native execution input. `missing-connection` drift is the
+ * intended meaning: a `providers[]` row whose connection is bound by no pool
+ * using this router (fleet-wide). It cannot be evaluated yet — the host's
+ * route input carries only the current pool's candidates, so nothing computes
+ * it across pools and nothing reports it as page drift today (see TWO-690 for
+ * the sibling-pool membership gap). Per route, the only missing-connection
+ * this pool can vouch for is its own member binding naming a connection with
+ * no `providers[]` row; that is reported as a `skipped["pool:<id>"]` note.
+ * Neither note ever blocks selection.
  *
  * Rotation (not most-headroom) orders the selectable members; unknown members
  * rotate with healthy ones (fail open), never ahead of them by design — order
