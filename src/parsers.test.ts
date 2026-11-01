@@ -1496,6 +1496,255 @@ describe("live windows supersede same-id passive windows", () => {
     expect(accounts[0]?.quotaBlind).toBe(false);
   });
 
+  it("a model-scoped passive twin does not cover an account-wide live unknown row", async () => {
+    const { parseAuthFiles } = await import("./parsers.js");
+    const { aggregateProvider } = await import("./aggregate.js");
+    const { parseConfig } = await import("./config.js");
+    const resetUnix = Math.floor(NOW_MS / 1000) + 7200;
+    const { accounts } = parseAuthFiles(
+      {
+        files: [
+          {
+            id: "REDACTED-ID-DEVIN",
+            auth_index: "d1",
+            name: "REDACTED-NAME",
+            provider: "devin",
+            disabled: false,
+            unavailable: false,
+            model_quotas: {
+              "model-a": {
+                observed_at: NOW,
+                signals: {
+                  "daily-quota-remaining-percent": "50%",
+                  "daily-quota-reset-at": iso(NOW_MS + 3_600_000),
+                },
+              },
+            },
+          },
+        ],
+      },
+      {
+        now: NOW,
+        allowLists: { ...DEFAULT_PROVIDER_WINDOWS },
+        apiCallPayloadByAuthIndex: new Map([
+          [
+            "d1",
+            {
+              statusCode: 200,
+              // No usable daily: only weekly parses, so daily degrades to an
+              // account-wide unknown row.
+              body: {
+                userStatus: {
+                  planStatus: {
+                    weeklyQuotaRemainingPercent: 80,
+                    weeklyQuotaResetAtUnix: resetUnix + 86400,
+                    planInfo: { planName: "Devin Pro" },
+                  },
+                },
+              },
+            },
+          ],
+        ]),
+        apiCallObservedAt: NOW,
+      },
+    );
+    expect(accounts).toHaveLength(1);
+    const limits = accounts[0]?.limits ?? [];
+    // The model-A passive row survives as per-model evidence ...
+    const scoped = limits.find((l) => l.id === "devin:daily" && (l.models ?? []).includes("model-a"));
+    expect(scoped).toMatchObject({ remainingPercent: 50 });
+    expect(scoped?.viaProviderApi).not.toBe(true);
+    // ... and the account-wide live unknown daily joins it instead of being
+    // dropped as a duplicate.
+    const liveDaily = limits.find(
+      (l) => l.id === "devin:daily" && (!l.models || l.models.length === 0) && l.viaProviderApi === true,
+    );
+    expect(liveDaily).toMatchObject({ remainingPercent: null, allowed: true });
+    expect(limits.filter((l) => l.id === "devin:daily")).toHaveLength(2);
+    const { config: cfg, validation } = parseConfig({
+      cliproxyBaseUrl: "http://127.0.0.1:8317",
+      managementKeyHeader: "X-Test-Key",
+      managementSecretRef: { uid: "secret-1" },
+      providers: [{ provider: "devin", connectionId: "conn-devin", completeInventory: true }],
+    });
+    expect(validation.ok).toBe(true);
+    // A request for another model sees the unknown daily, never headroom.
+    const forB = aggregateProvider({
+      provider: "devin",
+      model: "model-b",
+      rows: accounts.map((a) => ({ ...a, source: "test", lastError: null })),
+      completeInventory: true,
+      config: cfg,
+      now: NOW,
+    });
+    expect(forB.state).toBe("unknown");
+  });
+
+  it("a model-scoped passive row still applies to its own model", async () => {
+    const { parseAuthFiles } = await import("./parsers.js");
+    const { aggregateProvider } = await import("./aggregate.js");
+    const { parseConfig } = await import("./config.js");
+    const resetUnix = Math.floor(NOW_MS / 1000) + 7200;
+    const weeklyOnlyLive = {
+      statusCode: 200,
+      body: {
+        userStatus: {
+          planStatus: {
+            weeklyQuotaRemainingPercent: 80,
+            weeklyQuotaResetAtUnix: resetUnix + 86400,
+            planInfo: { planName: "Devin Pro" },
+          },
+        },
+      },
+    };
+    const { config: cfg, validation } = parseConfig({
+      cliproxyBaseUrl: "http://127.0.0.1:8317",
+      managementKeyHeader: "X-Test-Key",
+      managementSecretRef: { uid: "secret-1" },
+      providers: [{ provider: "devin", connectionId: "conn-devin", completeInventory: true }],
+    });
+    expect(validation.ok).toBe(true);
+    const assess = (rows: { limits: unknown }[], model: string) =>
+      aggregateProvider({
+        provider: "devin",
+        model,
+        rows: rows.map((a) => ({ ...a, source: "test", lastError: null })) as never,
+        completeInventory: true,
+        config: cfg,
+        now: NOW,
+      });
+    // Healthy scoped row: kept with its model tag, and the live unknown
+    // daily still vetoes headroom for its own model too.
+    const healthy = parseAuthFiles(
+      {
+        files: [
+          {
+            id: "REDACTED-ID-DEVIN",
+            auth_index: "d1",
+            name: "REDACTED-NAME",
+            provider: "devin",
+            disabled: false,
+            unavailable: false,
+            model_quotas: {
+              "model-a": {
+                observed_at: NOW,
+                signals: {
+                  "daily-quota-remaining-percent": "50%",
+                  "daily-quota-reset-at": iso(NOW_MS + 3_600_000),
+                },
+              },
+            },
+          },
+        ],
+      },
+      {
+        now: NOW,
+        allowLists: { ...DEFAULT_PROVIDER_WINDOWS },
+        apiCallPayloadByAuthIndex: new Map([["d1", weeklyOnlyLive]]),
+        apiCallObservedAt: NOW,
+      },
+    );
+    const scoped = (healthy.accounts[0]?.limits ?? []).find(
+      (l) => l.id === "devin:daily" && (l.models ?? []).includes("model-a"),
+    );
+    expect(scoped).toMatchObject({ remainingPercent: 50 });
+    expect(assess(healthy.accounts, "model-a").state).toBe("unknown");
+    // Exhausted scoped row: it limits its own model but never another one.
+    const exhausted = parseAuthFiles(
+      {
+        files: [
+          {
+            id: "REDACTED-ID-DEVIN",
+            auth_index: "d1",
+            name: "REDACTED-NAME",
+            provider: "devin",
+            disabled: false,
+            unavailable: false,
+            model_quotas: {
+              "model-a": {
+                observed_at: NOW,
+                signals: {
+                  "daily-quota-remaining-percent": "0%",
+                  "daily-quota-reset-at": iso(NOW_MS + 3_600_000),
+                },
+              },
+            },
+          },
+        ],
+      },
+      {
+        now: NOW,
+        allowLists: { ...DEFAULT_PROVIDER_WINDOWS },
+        apiCallPayloadByAuthIndex: new Map([["d1", weeklyOnlyLive]]),
+        apiCallObservedAt: NOW,
+      },
+    );
+    expect(assess(exhausted.accounts, "model-a").state).not.toBe("allowed");
+    expect(assess(exhausted.accounts, "model-b").state).toBe("unknown");
+  });
+
+  it("a usable account-level live row does not evict a model-scoped twin", async () => {
+    const { parseAuthFiles } = await import("./parsers.js");
+    const resetUnix = Math.floor(NOW_MS / 1000) + 7200;
+    const { accounts } = parseAuthFiles(
+      {
+        files: [
+          {
+            id: "REDACTED-ID-DEVIN",
+            auth_index: "d1",
+            name: "REDACTED-NAME",
+            provider: "devin",
+            disabled: false,
+            unavailable: false,
+            model_quotas: {
+              "model-a": {
+                observed_at: NOW,
+                signals: {
+                  "daily-quota-remaining-percent": "50%",
+                  "daily-quota-reset-at": iso(NOW_MS + 3_600_000),
+                },
+              },
+            },
+          },
+        ],
+      },
+      {
+        now: NOW,
+        allowLists: { ...DEFAULT_PROVIDER_WINDOWS },
+        apiCallPayloadByAuthIndex: new Map([
+          [
+            "d1",
+            {
+              statusCode: 200,
+              body: {
+                userStatus: {
+                  planStatus: {
+                    dailyQuotaRemainingPercent: 60,
+                    dailyQuotaResetAtUnix: resetUnix,
+                    weeklyQuotaRemainingPercent: 80,
+                    weeklyQuotaResetAtUnix: resetUnix + 86400,
+                    planInfo: { planName: "Devin Pro" },
+                  },
+                },
+              },
+            },
+          ],
+        ]),
+        apiCallObservedAt: NOW,
+      },
+    );
+    expect(accounts).toHaveLength(1);
+    const dailies = (accounts[0]?.limits ?? []).filter((l) => l.id === "devin:daily");
+    // Per-model evidence is stricter-limit telemetry: both rows survive.
+    expect(dailies).toHaveLength(2);
+    expect(dailies.find((l) => (l.models ?? []).includes("model-a"))).toMatchObject({
+      remainingPercent: 50,
+    });
+    expect(dailies.find((l) => (!l.models || l.models.length === 0) && l.viaProviderApi === true)).toMatchObject({
+      remainingPercent: 60,
+    });
+  });
+
   it("an unreadable live answer with no twins still marks the windows unknown", async () => {
     const { parseAuthFiles } = await import("./parsers.js");
     const { accounts } = parseAuthFiles(

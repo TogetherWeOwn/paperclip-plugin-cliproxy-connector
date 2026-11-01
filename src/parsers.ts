@@ -1838,11 +1838,17 @@ export function parseAuthFiles(
     // percents degrades to unknown instead of discarding genuine headroom.
     // Failover stays: when the live fetch fails there is no apiLimit, so the
     // passive/plugin windows show again.
+    // Twin scope is account-level only: passive rows from `model_quotas`
+    // carry `models: [m]` while keeping the same account-level id
+    // (`${provider}:${window}`). A model-scoped twin is per-model evidence —
+    // possibly a stricter limit — so it neither covers an account-wide live
+    // row nor is evicted by one.
     const usableLive = (l: UsageLimitRow) => l.remainingPercent !== null || l.limitReached;
-    const liveIds = new Set(apiLimits.filter(usableLive).map((l) => l.id));
-    const live = (l: UsageLimitRow) => !liveIds.has(l.id);
+    const accountLevel = (l: UsageLimitRow) => !l.models || l.models.length === 0;
+    const liveIds = new Set(apiLimits.filter((l) => usableLive(l) && accountLevel(l)).map((l) => l.id));
+    const live = (l: UsageLimitRow) => (accountLevel(l) ? !liveIds.has(l.id) : true);
     const twinIds = new Set(
-      [...limits.filter(live), ...pluginLimits.filter(live)].map((l) => l.id),
+      [...limits.filter(live), ...pluginLimits.filter(live)].filter(accountLevel).map((l) => l.id),
     );
     const apiRows = apiLimits.filter((l) => usableLive(l) || !twinIds.has(l.id));
     const stamped = softGating
