@@ -17,6 +17,8 @@
  * key is resolved per run from a `secret_ref` and kept in memory only.
  */
 
+import { createHash } from "node:crypto";
+
 import { SINGLE_SEGMENT, isLoopbackUrl, stripTrailingSlashes } from "./config.js";
 
 export const MANAGEMENT_TIMEOUT_MS = 15_000;
@@ -65,9 +67,24 @@ export function isSafeAuthFileName(name: string): boolean {
   );
 }
 
+/**
+ * Short opaque identifier for an untrusted value that must stay out of
+ * board-visible errors (auth-file names are often account emails; redirect
+ * targets are fully attacker-influenced). Operators can still correlate by
+ * hashing candidates; the raw value is never echoed.
+ */
+export function shortHash(value: string): string {
+  return createHash("sha256").update(value, "utf8").digest("hex").slice(0, 16);
+}
+
 export function authFileModelsPath(name: string): string {
   if (!isSafeAuthFileName(name)) {
-    throw new CliproxyConfigError(`refusing to build a served-set path from an untrusted auth-file name: ${name}`);
+    // The name is untrusted — and may itself be hostile — while served-set
+    // errors are board-visible, so the refusal names it by a short hash of
+    // the value, never the raw name (which may be an account email).
+    throw new CliproxyConfigError(
+      `refusing to build a served-set path from an untrusted auth-file name (sha256:${shortHash(name)})`,
+    );
   }
   return `${AUTH_FILE_MODELS_PATH}?name=${encodeURIComponent(name)}`;
 }
@@ -233,9 +250,13 @@ async function guardedGetJson(args: {
       }
       try {
         args.assertAllowed(next, `redirect target ${next.pathname}`);
-      } catch (err) {
+      } catch {
+        // The redirect target is untrusted: a hostile Location can smuggle an
+        // auth-file name (often an account email) into its pathname, and this
+        // error is board-visible — so the nested allow-list detail, which
+        // echoes that pathname, is replaced by a short hash of the target.
         throw new CliproxyRedirectError(
-          `redirect target is outside the pinned GET allow-list; refusing to follow: ${err instanceof Error ? err.message : "blocked"}`,
+          `redirect target is outside the pinned GET allow-list; refusing to follow (target sha256:${shortHash(next.pathname)})`,
         );
       }
       url = next;
