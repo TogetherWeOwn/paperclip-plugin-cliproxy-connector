@@ -19,10 +19,13 @@
  * - Two ages: **cache age** (`row.checkedAt`, the sync fetch time) drives the
  *   bounded fail-open then fail-closed when sync dies; **observation age**
  *   (per window, `limit.observedAt`) decides whether a window's verdict is
- *   still evidence. An old observation becomes `unknown` (fail-open, never
- *   headroom), never `low` — idle accounts must not be shut out for good. A
- *   limiting verdict whose reset already passed, and a cooldown whose
- *   recovery time already passed, stop limiting the same way.
+ *   still evidence. An old observation that said "healthy" becomes `unknown`
+ *   (fail-open, never headroom), never `low` — idle accounts must not be shut
+ *   out for good. A limiting verdict with a future reset stays limiting
+ *   whatever the observation age (usage cannot drop before its reset); a
+ *   limiting verdict whose reset already passed, a limiting verdict with no
+ *   reset and an old observation, and a cooldown whose recovery time already
+ *   passed, stop limiting the same way (unknown).
  */
 
 import { effectiveReservePercent, graceMs, maxAgeMs, type ConnectorConfig } from "./config.js";
@@ -232,18 +235,17 @@ function assess(
   // Two ages matter here. Cache age (row.checkedAt, classified above) tells
   // whether sync is alive. Observation age (per window) tells whether the
   // window's verdict is still evidence: passive signals only refresh when the
-  // account serves traffic, so an old observation — healthy or not — proves
-  // nothing and makes the window unknown (fail-open), never low. Likewise a
-  // limiting verdict whose reset has already passed is overtaken: the window
-  // may have refreshed, and without fresh telemetry it is unknown, not low.
+  // account serves traffic, so an old observation that said "healthy" proves
+  // nothing and makes the window unknown (fail-open), never low. But usage
+  // cannot go down before its reset, so a *limiting* verdict with a future
+  // reset stays true no matter how old the observation is — it still limits,
+  // and its reset still bounds the wait. A limiting verdict whose reset has
+  // already passed is overtaken: the window may have refreshed, and without
+  // fresh telemetry it is unknown, not low. A limiting verdict with no reset
+  // and an old observation is likewise unknown (nothing bounds the wait).
   const limiting: string[] = [];
   const unknownWindows: string[] = [];
   for (const w of gating) {
-    const obsAge = windowObservationAgeMs(w.observedAt, row.checkedAt, nowMs, futureSkewMs);
-    if (obsAge === null || obsAge > grace) {
-      unknownWindows.push(w.id);
-      continue;
-    }
     const resetMs = w.resetsAt ? parseTime(w.resetsAt) : null;
     const verdict: "limiting" | "healthy" | "unknown" = (() => {
       if (w.allowed === false || w.limitReached) return "limiting";
@@ -252,16 +254,34 @@ function assess(
       if (w.allowed === null && !admission) return "unknown";
       return "unknown"; // gating window with no percent and no verdict
     })();
-    if (verdict === "limiting" && resetMs !== null && resetMs <= nowMs) {
+    if (verdict === "limiting" && resetMs !== null) {
+      if (resetMs > nowMs) {
+        // Exhausted with a future reset: still true whatever the observation
+        // age (usage cannot drop before the reset). Its reset feeds the wait.
+        limiting.push(w.id);
+        continue;
+      }
       // The reset has passed since the observation: the verdict is stale.
       unknownWindows.push(`${w.id} (reset passed)`);
       continue;
     }
+    const obsAge = windowObservationAgeMs(w.observedAt, row.checkedAt, nowMs, futureSkewMs);
+    const stale = obsAge === null || obsAge > grace;
     if (verdict === "limiting") {
+      // No reset to bound the wait: only a fresh observation limits.
+      if (stale) {
+        unknownWindows.push(w.id);
+        continue;
+      }
       limiting.push(w.id);
       continue;
     }
     if (verdict === "unknown") {
+      unknownWindows.push(w.id);
+      continue;
+    }
+    // Healthy: only a fresh observation is evidence of headroom.
+    if (stale) {
       unknownWindows.push(w.id);
       continue;
     }

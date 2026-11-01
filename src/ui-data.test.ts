@@ -186,5 +186,6 @@ describe("buildWidgetData", () => {
       args({ lastSync, lastFailure: { attemptedAt: "2026-11-01T10:00:00.000Z", message: "old" } }),
     );
     expect(cleared.sync.lastError).toBeNull();
+    expect(cleared.sync.lastAttemptAt).toBeNull();
   });
 });

@@ -202,7 +202,9 @@ export function buildPageData(args: {
       skipReason: lastSync?.skipReason ?? "no sync has run yet.",
       errors: lastSync?.errors ?? [],
       // A failure newer than the last successful run is shown explicitly so
-      // the page never silently presents stale success as current state.
+      // the page never silently presents stale success as current state. An
+      // older failure stays recorded but shows neither message nor attempt
+      // time next to the newer success.
       lastError:
         lastFailure &&
         (!lastSync ||
@@ -210,7 +212,13 @@ export function buildPageData(args: {
           Date.parse(lastFailure.attemptedAt) > Date.parse(lastSync.finishedAt))
           ? lastFailure.message
           : null,
-      lastAttemptAt: lastFailure?.attemptedAt ?? null,
+      lastAttemptAt:
+        lastFailure &&
+        (!lastSync ||
+          Number.isNaN(Date.parse(lastSync.finishedAt)) ||
+          Date.parse(lastFailure.attemptedAt) > Date.parse(lastSync.finishedAt))
+          ? lastFailure.attemptedAt
+          : null,
     },
     strike: {
       disabled: strike.disabled,

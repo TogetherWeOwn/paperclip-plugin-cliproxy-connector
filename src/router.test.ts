@@ -481,6 +481,50 @@ describe("review regressions (B1, B2, S1) via parseAuthFiles", () => {
     if (r.kind === "exhausted") expect(r.retryAt).toBe("2026-11-01T12:01:00.000Z");
   });
 
+  it("B1': a stale exhausted verdict with a future reset still limits (fail-closed wait), not fail-open", () => {
+    const r = routeFromAuthFiles(
+      [
+        {
+          prefix: "acct-a",
+          channel: "claude",
+          quota: {
+            observed_at: "2026-11-01T09:00:00Z", // 3 h old
+            signals: [{ window: "7d", usedPercent: 100, resetAt: "2026-11-05T00:00:00Z" }],
+          },
+        },
+      ],
+      [{ memberId: "m-a", model: "acct-a/claude-sonnet-5", connectionId: "conn-a" }],
+    );
+    // Before the fix: selected — a task sent to a known-exhausted account
+    // fails with a 429 instead of waiting. Usage cannot drop before its
+    // reset, so "exhausted, resets at T" stays true until T.
+    expect(r.kind).toBe("exhausted");
+    if (r.kind === "exhausted") expect(r.retryAt).toBe("2026-11-05T00:00:00.000Z");
+  });
+
+  it("B1': a stale healthy 5h window plus an exhausted 7d window waits on the 7d reset", () => {
+    const r = routeFromAuthFiles(
+      [
+        {
+          prefix: "acct-a",
+          channel: "claude",
+          quota: {
+            observed_at: "2026-11-01T09:00:00Z", // 3 h old: 5h verdict is stale
+            signals: [
+              { window: "5h", usedPercent: 10, resetAt: RESET_1H },
+              { window: "7d", usedPercent: 100, resetAt: RESET_3H },
+            ],
+          },
+        },
+      ],
+      [{ memberId: "m-a", model: "acct-a/claude-sonnet-5", connectionId: "conn-a" }],
+    );
+    // The stale healthy 5h observation is unknown (fail-open, never headroom)
+    // but the exhausted 7d window with a future reset still limits.
+    expect(r.kind).toBe("exhausted");
+    if (r.kind === "exhausted") expect(r.retryAt).toBe(RESET_3H);
+  });
+
   it("S1: one member with 5h + 7d limiting waits on the latest reset, not the earliest", () => {
     const r = routeFromAuthFiles(
       [
