@@ -107,9 +107,24 @@ export class CliproxyAuthError extends Error {
     this.status = status;
   }
 }
-export class CliproxyRedirectError extends Error {}
-export class CliproxyBodyError extends Error {}
-export class CliproxyNetworkError extends Error {}
+export class CliproxyRedirectError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "CliproxyRedirectError";
+  }
+}
+export class CliproxyBodyError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "CliproxyBodyError";
+  }
+}
+export class CliproxyNetworkError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "CliproxyNetworkError";
+  }
+}
 
 /** The client only ever GETs string URLs; keep the type structural. */
 export type ManagementFetch = (input: string, init?: RequestInit) => Promise<Response>;
@@ -181,6 +196,21 @@ function assertNoKeyLeak(text: string, key: string, where: string): void {
 }
 
 /**
+ * Release an unread response body back to the transport pool. Node fetch
+ * streams every body: a socket cannot be reused until the body is consumed
+ * or cancelled, so every non-success branch below cancels before throwing.
+ * Cancelling is local (no network round trip), so the stop-after-first-
+ * auth-failure path stays immediate. Never throws.
+ */
+async function releaseBody(res: Response): Promise<void> {
+  try {
+    await res.body?.cancel();
+  } catch {
+    /* Local cleanup only; never delays or masks the error path. */
+  }
+}
+
+/**
  * Shared guarded GET: the loopback/method/allow-list/redirect/timeout/cap/
  * no-leak rules both clients enforce. `headersFor` builds the auth headers
  * after origin + allow-list validation; `assertAllowed` is the client's own
@@ -209,39 +239,52 @@ async function guardedGetJson(args: {
         signal: AbortSignal.timeout(args.timeoutMs),
       });
     } catch (err) {
-      throw new CliproxyNetworkError(
-        `management GET ${url.pathname} failed: ${err instanceof Error ? err.name : "fetch failed"}`,
-      );
+      // The transport reports only `err.name`, so keep the root cause visible
+      // (e.g. `TimeoutError`, not `Error`); `instanceof` still matches.
+      const label = err instanceof Error && err.name ? err.name : "fetch failed";
+      const wrapped = new CliproxyNetworkError(`management GET ${url.pathname} failed: ${label}`);
+      wrapped.name = label;
+      throw wrapped;
     }
     if (res.status === 401 || res.status === 403) {
+      await releaseBody(res);
       throw new CliproxyAuthError(res.status, url.pathname);
     }
     if (res.status === 404) {
+      await releaseBody(res);
       throw new CliproxyNotFoundError(url.pathname);
     }
     if (res.status >= 300 && res.status < 400) {
       const location = res.headers.get("location");
-      if (!location) throw new CliproxyRedirectError(`redirect without location on ${url.pathname}`);
+      if (!location) {
+        await releaseBody(res);
+        throw new CliproxyRedirectError(`redirect without location on ${url.pathname}`);
+      }
       let next: URL;
       try {
         next = new URL(location, url.toString());
       } catch {
+        await releaseBody(res);
         throw new CliproxyRedirectError(`unparseable redirect location on ${url.pathname}`);
       }
       if (next.origin !== args.baseOrigin || !isLoopbackUrl(next.toString())) {
+        await releaseBody(res);
         throw new CliproxyRedirectError(`redirect escapes the loopback origin; refusing to follow`);
       }
       try {
         args.assertAllowed(next, `redirect target ${next.pathname}`);
       } catch (err) {
+        await releaseBody(res);
         throw new CliproxyRedirectError(
           `redirect target is outside the pinned GET allow-list; refusing to follow: ${err instanceof Error ? err.message : "blocked"}`,
         );
       }
+      await releaseBody(res);
       url = next;
       continue;
     }
     if (res.status < 200 || res.status >= 300) {
+      await releaseBody(res);
       throw new CliproxyNetworkError(`management GET ${url.pathname} returned HTTP ${res.status}`);
     }
     const text = await readCapped(res, url.pathname, args.maxBytes);
