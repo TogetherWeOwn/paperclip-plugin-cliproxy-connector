@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { parseConfig } from "./config.js";
-import { buildPageData, buildWidgetData } from "./ui-data.js";
+import { buildPageData, buildUsageData, buildWidgetData } from "./ui-data.js";
 import { emptyStrikeBudget } from "./sync.js";
 import type { AccountUsageRow } from "./types.js";
 
@@ -166,6 +166,149 @@ describe("page data (per-provider)", () => {
     expect(page.audienceConfirmed).toBe(false);
     expect(page.audienceNotice).toMatch(/proposal §4 point 4/);
   });
+});
+
+describe("usage page data", () => {
+  function usageRows(): Record<string, AccountUsageRow> {
+    return {
+      "acct-aaaaaaaaaaaaaaaa": {
+        ...row(),
+        key: "acct-aaaaaaaaaaaaaaaa",
+        quotaBlindReason: null,
+        limits: [
+          {
+            id: "claude:5h",
+            label: "Claude unified 5h",
+            usedPercent: 80,
+            remainingPercent: 20,
+            resetsAt: "2026-11-01T13:00:00.000Z",
+            limitReached: false,
+            allowed: true,
+            gating: true,
+            observedAt: NOW,
+            models: null,
+            metrics: ["team plan, resets weekly"],
+          },
+          {
+            id: "claude:7d",
+            label: "Claude unified 7d",
+            usedPercent: 10,
+            remainingPercent: 90,
+            resetsAt: null,
+            limitReached: false,
+            allowed: true,
+            gating: true,
+            observedAt: NOW,
+            models: null,
+          },
+        ],
+      },
+      "acct-bbb": {
+        ...row(),
+        key: "acct-bbb",
+        provider: "meta",
+        channel: "meta",
+        status: "cooling",
+        coolingDown: true,
+        cooldownUntil: "2026-11-01T12:30:00.000Z",
+        limits: [],
+        quotaBlind: true,
+        quotaBlindReason: "upstream exposes nothing",
+      },
+    };
+  }
+
+  it("reports verdict, headroom, resets, freshness and blind badges per provider", () => {
+    const usage = buildUsageData({
+      now: NOW,
+      config: testConfig(),
+      rows: usageRows(),
+      lastSync: LAST_SYNC,
+    });
+    expect(usage.providers.map((p) => p.provider)).toEqual(["claude", "codex"]);
+    const claude = usage.providers[0];
+    expect(claude).toMatchObject({
+      state: "allowed",
+      enabledAccounts: 1,
+      headroomAccounts: 1,
+      blindAccounts: 0,
+      blindReason: null,
+      // retryAt is set only behind an exhausted verdict; per-account
+      // nextReset below still carries the reset.
+      retryAt: null,
+      retryIn: null,
+    });
+    expect(claude.freshness).toBe("fresh");
+    const [detail] = claude.accounts;
+    expect(detail).toMatchObject({
+      maskedLabel: "acct-aaaaaaaa…",
+      worstRemaining: 20,
+      nextReset: "2026-11-01T13:00:00.000Z",
+      nextResetIn: "1h 0m",
+      quotaBlind: false,
+      quotaBlindReason: null,
+    });
+    expect(detail.limits[0]).toMatchObject({ metrics: ["team plan, resets weekly"] });
+    // Meta has no providers[] row: the unconfigured account is not listed.
+    expect(allKeys(usage)).toEqual(["acct-aaaaaaaaaaaaaaaa"]);
+  });
+
+  it("badges blind accounts with their reason and a cooldown countdown", () => {
+    const config = parseConfig({
+      cliproxyBaseUrl: "http://127.0.0.1:8317",
+      managementKeyHeader: "X-Test-Key",
+      managementSecretRef: { uid: "secret-1" },
+      providers: [{ provider: "meta", connectionId: "conn-meta", completeInventory: true }],
+      audienceConfirmed: true,
+    }).config;
+    const usage = buildUsageData({ now: NOW, config, rows: usageRows(), lastSync: LAST_SYNC });
+    const meta = usage.providers[0];
+    // Cooling with a future cooldown end is positively out → exhausted,
+    // with retryAt pointing at the cooldown end.
+    expect(meta).toMatchObject({
+      state: "exhausted",
+      enabledAccounts: 1,
+      headroomAccounts: 0,
+      blindAccounts: 1,
+      blindReason: "upstream exposes nothing",
+      retryAt: "2026-11-01T12:30:00.000Z",
+      retryIn: "30m",
+    });
+    const [detail] = meta.accounts;
+    expect(detail).toMatchObject({
+      maskedLabel: "acct-bbb",
+      worstRemaining: null,
+      nextReset: null,
+      cooldownUntil: "2026-11-01T12:30:00.000Z",
+      cooldownIn: "30m",
+      quotaBlindReason: "upstream exposes nothing",
+    });
+    expect(detail.key).toBe("acct-bbb"); // full key retained for React keys
+  });
+
+  it("derives the blind reason for rows cached before the field existed", () => {
+    const legacy = usageRows()["acct-bbb"] as AccountUsageRow;
+    const withoutReason: AccountUsageRow = { ...legacy };
+    delete withoutReason.quotaBlindReason;
+    expect(withoutReason.quotaBlindReason).toBeUndefined();
+    const usage = buildUsageData({
+      now: NOW,
+      config: parseConfig({
+        cliproxyBaseUrl: "http://127.0.0.1:8317",
+        managementKeyHeader: "X-Test-Key",
+        managementSecretRef: { uid: "secret-1" },
+        providers: [{ provider: "meta", connectionId: "conn-meta", completeInventory: true }],
+        audienceConfirmed: true,
+      }).config,
+      rows: { "acct-bbb": withoutReason },
+      lastSync: LAST_SYNC,
+    });
+    expect(usage.providers[0]?.blindReason).toBe("upstream exposes nothing");
+  });
+
+  function allKeys(usage: ReturnType<typeof buildUsageData>): string[] {
+    return usage.providers.flatMap((p) => p.accounts.map((a) => a.key));
+  }
 });
 
 describe("widget data", () => {

@@ -6,12 +6,13 @@
  * actions (`cliproxy-resync`, `cliproxy-reenable`) run worker-side.
  * This bundle never sees the management key.
  */
+import { useState } from "react";
 import { usePluginAction, usePluginData } from "@paperclipai/plugin-sdk/ui";
 import type {
   PluginPageProps,
   PluginWidgetProps,
 } from "@paperclipai/plugin-sdk/ui";
-import type { PageData, WidgetData } from "../src/ui-data.js";
+import type { PageData, ProviderAccountDetail, UsagePageData, WidgetData } from "../src/ui-data.js";
 
 function useCompanyId(context: PluginPageProps["context"]): string | null {
   return context.companyId;
@@ -197,6 +198,225 @@ export function CliProxyPage({ context }: PluginPageProps) {
           )}
         </div>
       ))}
+    </div>
+  );
+}
+
+function WindowBar({ label, remaining, resetIn }: { label: string; remaining: number | null; resetIn: string | null }) {
+  const pct = remaining === null ? null : Math.max(0, Math.min(100, remaining));
+  const tone =
+    pct === null
+      ? "#57534e"
+      : pct <= 0
+        ? "#7f1d1d"
+        : pct <= 10
+          ? "#78350f"
+          : "#14532d";
+  return (
+    <div style={{ display: "flex", gap: 6, alignItems: "center", margin: "2px 0" }}>
+      <span style={{ minWidth: 140, fontSize: 12 }}>{label}</span>
+      <div style={{ flex: 1, minWidth: 80, height: 10, background: "#292524", borderRadius: 5, overflow: "hidden" }}>
+        <div style={{ width: `${pct ?? 0}%`, height: "100%", background: tone, opacity: pct === null ? 0.4 : 1 }} />
+      </div>
+      <span style={{ minWidth: 120, fontSize: 12 }}>
+        {pct === null ? "unknown" : `${Math.round(pct)}% remaining`}
+        {resetIn ? ` · resets ${resetIn}` : " · no reset known"}
+      </span>
+    </div>
+  );
+}
+
+type UsageSortKey = "remaining" | "reset";
+
+/**
+ * "Usage & quota" page: per-provider verdicts plus a filterable, sortable
+ * per-account table. All data comes from the already-synced cache
+ * (`cliproxy-usage`); this page never triggers a live read, and the worker
+ * never calls the destructive usage-queue endpoint.
+ *
+ * Request/token counters are intentionally absent: CLIProxy exposes no
+ * read-only per-account counters, and the connector shows only what the
+ * sync already caches.
+ */
+export function CliProxyUsagePage({ context }: PluginPageProps) {
+  const companyId = useCompanyId(context);
+  const { data, loading, error, refresh } = usePluginData<UsagePageData>("cliproxy-usage", { companyId });
+  const resync = usePluginAction("cliproxy-resync");
+  const [providerFilter, setProviderFilter] = useState<string>("all");
+  const [statusFilter, setStatusFilter] = useState<string>("all");
+  const [blindOnly, setBlindOnly] = useState<boolean>(false);
+  const [sortKey, setSortKey] = useState<UsageSortKey>("remaining");
+  const [sortDir, setSortDir] = useState<"asc" | "desc">("asc");
+
+  if (!companyId) return <div>No company context.</div>;
+  if (loading) return <div>Loading usage &amp; quota…</div>;
+  if (error) return <div>Error: {error.message}</div>;
+  if (!data) return <div>No data yet — run a sync.</div>;
+
+  const allAccounts: Array<{ provider: string; account: ProviderAccountDetail }> = data.providers.flatMap((p) =>
+    p.accounts.map((account) => ({ provider: p.provider, account })),
+  );
+  const statuses = [...new Set(allAccounts.map((a) => a.account.status))].sort();
+  const filtered = allAccounts.filter(
+    ({ provider, account }) =>
+      (providerFilter === "all" || provider === providerFilter) &&
+      (statusFilter === "all" || account.status === statusFilter) &&
+      (!blindOnly || account.quotaBlind),
+  );
+  const sorted = [...filtered].sort((x, y) => {
+    if (sortKey === "remaining") {
+      // Unknown last when ascending (worst-first keeps unknowns visible at
+      // the exhausted end is wrong: unknowns sort after every known value).
+      const xr = x.account.worstRemaining;
+      const yr = y.account.worstRemaining;
+      if (xr === null && yr === null) return x.account.key.localeCompare(y.account.key);
+      if (xr === null) return 1;
+      if (yr === null) return -1;
+      return sortDir === "asc" ? xr - yr : yr - xr;
+    }
+    const xt = x.account.nextReset ? Date.parse(x.account.nextReset) : NaN;
+    const yt = y.account.nextReset ? Date.parse(y.account.nextReset) : NaN;
+    if (Number.isNaN(xt) && Number.isNaN(yt)) return x.account.key.localeCompare(y.account.key);
+    if (Number.isNaN(xt)) return 1;
+    if (Number.isNaN(yt)) return -1;
+    return sortDir === "asc" ? xt - yt : yt - xt;
+  });
+
+  return (
+    <div style={{ display: "grid", gap: 16, padding: 16 }}>
+      {!data.audienceConfirmed && (
+        <div style={{ background: "#78350f", color: "#fde68a", padding: 12, borderRadius: 6 }}>
+          {data.audienceNotice}
+        </div>
+      )}
+      <div>
+        <strong>Sync:</strong> {data.sync.ranAt ? `last run ${data.sync.ranAt}` : "never ran"} ·{" "}
+        {data.sync.accountsSeen} accounts, {data.sync.rowsWritten} rows ·{" "}
+        {data.sync.skipped ? `skipped: ${data.sync.skipReason}` : "ok"}
+        {data.sync.errors.length > 0 && (
+          <ul>
+            {data.sync.errors.map((e, i) => (
+              <li key={i}>{e}</li>
+            ))}
+          </ul>
+        )}{" "}
+        <button
+          onClick={async () => {
+            await resync({ companyId });
+            refresh();
+          }}
+        >
+          Sync now
+        </button>
+      </div>
+      {data.earliestReset && (
+        <div>
+          Earliest known reset: {data.earliestReset} ({data.earliestResetIn})
+        </div>
+      )}
+      {data.providers.map((p) => (
+        <div key={p.provider} style={{ border: "1px solid #444", borderRadius: 6, padding: 12 }}>
+          <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+            <strong>{p.provider}</strong>
+            <StateBadge state={p.state} />
+            <FreshnessBadge freshness={p.freshness} />
+            {p.blindAccounts > 0 && (
+              <span style={{ background: "#78350f", color: "#fde68a", borderRadius: 4, padding: "1px 6px", fontSize: 12 }}>
+                blind{p.blindReason ? `: ${p.blindReason}` : ""}
+              </span>
+            )}
+            {p.waitResumeOff && <span>wait/resume off: inventory not confirmed complete</span>}
+          </div>
+          <div>
+            {p.headroomAccounts} of {p.enabledAccounts} enabled account{p.enabledAccounts === 1 ? "" : "s"} with
+            headroom
+            {p.retryAt ? ` · earliest reset ${p.retryAt} (${p.retryIn})` : ""}
+            {` · sync ${p.freshness}`}
+          </div>
+          <div>{p.reason}</div>
+        </div>
+      ))}
+      <div>
+        <strong>Accounts ({sorted.length})</strong>
+        <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap", margin: "8px 0" }}>
+          <label>
+            Provider{" "}
+            <select value={providerFilter} onChange={(e) => setProviderFilter(e.target.value)}>
+              <option value="all">all</option>
+              {data.providers.map((p) => (
+                <option key={p.provider} value={p.provider}>
+                  {p.provider}
+                </option>
+              ))}
+            </select>
+          </label>
+          <label>
+            Status{" "}
+            <select value={statusFilter} onChange={(e) => setStatusFilter(e.target.value)}>
+              <option value="all">all</option>
+              {statuses.map((s) => (
+                <option key={s} value={s}>
+                  {s}
+                </option>
+              ))}
+            </select>
+          </label>
+          <label>
+            <input type="checkbox" checked={blindOnly} onChange={(e) => setBlindOnly(e.target.checked)} /> blind
+            only
+          </label>
+          <label>
+            Sort by{" "}
+            <select value={sortKey} onChange={(e) => setSortKey(e.target.value as UsageSortKey)}>
+              <option value="remaining">remaining %</option>
+              <option value="reset">reset</option>
+            </select>
+          </label>
+          <button onClick={() => setSortDir((d) => (d === "asc" ? "desc" : "asc"))}>
+            {sortDir === "asc" ? "↑" : "↓"}
+          </button>
+        </div>
+        {sorted.length === 0 && <div>No accounts match the current filters.</div>}
+        {sorted.map(({ provider, account: a }) => (
+          <div key={a.key} style={{ border: "1px solid #333", borderRadius: 6, padding: 10, margin: "6px 0" }}>
+            <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+              <code>{a.maskedLabel}</code>
+              <span>{provider}</span>
+              <span>{a.status}</span>
+              {a.quotaBlind && (
+                <span
+                  style={{ background: "#78350f", color: "#fde68a", borderRadius: 4, padding: "1px 6px", fontSize: 12 }}
+                >
+                  blind{a.quotaBlindReason ? `: ${a.quotaBlindReason}` : ""}
+                </span>
+              )}
+              {a.planType && <span>plan {a.planType}</span>}
+              {a.priority !== null && <span>priority {a.priority}</span>}
+              {a.coolingDown && (
+                <span>cooling down{a.cooldownUntil ? ` until ${a.cooldownUntil}${a.cooldownIn ? ` (${a.cooldownIn})` : ""}` : ""}</span>
+              )}
+            </div>
+            {a.statusMessage && <div>Note: {a.statusMessage}</div>}
+            {a.limits.length === 0 && <div>No quota windows — unknown.</div>}
+            {a.limits.map((l) => (
+              <div key={l.id}>
+                <WindowBar label={l.label} remaining={l.remainingPercent} resetIn={l.resetIn} />
+                {!l.gating && <span style={{ fontSize: 12 }}>(informational, not gating)</span>}
+                {l.allowed === false && <span style={{ fontSize: 12 }}> · not admitted</span>}
+                {l.models && l.models.length > 0 && <span style={{ fontSize: 12 }}> · models {l.models.join(", ")}</span>}
+                {l.metrics && l.metrics.length > 0 && (
+                  <div style={{ fontSize: 12 }}>
+                    {l.metrics.map((m, i) => (
+                      <div key={i}>{m}</div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            ))}
+            {a.lastError && <div>Last error: {a.lastError}</div>}
+          </div>
+        ))}
+      </div>
     </div>
   );
 }

@@ -52,7 +52,7 @@ function authFilesBody() {
 }
 
 function pluginQuotaBody() {
-  return { Groups: [{ Buckets: [{ Window: "weekly", RemainingFraction: 0.8 }] }] };
+  return { groups: [{ buckets: [{ window: "weekly", remainingFraction: 0.8 }] }] };
 }
 
 function modelsBody() {
@@ -287,10 +287,10 @@ describe("happy path", () => {
         quotaUrls.push(url.toString());
         const idx = url.searchParams.get("auth_index");
         if (idx === "aaaabbbbccccdddd") {
-          return jsonResponse(200, { Groups: [{ Buckets: [{ Window: "weekly", RemainingFraction: 0.8 }] }] });
+          return jsonResponse(200, { groups: [{ buckets: [{ window: "weekly", remainingFraction: 0.8 }] }] });
         }
         if (idx === "1111222233334444") {
-          return jsonResponse(200, { Groups: [{ Buckets: [{ Window: "weekly", RemainingFraction: 0.1 }] }] });
+          return jsonResponse(200, { groups: [{ buckets: [{ window: "weekly", remainingFraction: 0.1 }] }] });
         }
         return new Response("auth_index is required", { status: 400 });
       }
@@ -327,7 +327,7 @@ describe("happy path", () => {
       if (url.pathname === "/v0/management/plugins/claude-quota/quota") {
         quotaUrls.push(url.toString());
         if (url.searchParams.get("auth_index") === "7") {
-          return jsonResponse(200, { Groups: [{ Buckets: [{ Window: "weekly", RemainingFraction: 0.6 }] }] });
+          return jsonResponse(200, { groups: [{ buckets: [{ window: "weekly", remainingFraction: 0.6 }] }] });
         }
         return new Response("auth_index is required", { status: 400 });
       }
@@ -360,7 +360,7 @@ describe("happy path", () => {
       }
       if (url.pathname === "/v0/management/plugins/claude-quota/quota") {
         if (url.searchParams.get("auth_index") === "aaaabbbbccccdddd") {
-          return jsonResponse(200, { Groups: [{ Buckets: [{ Window: "weekly", RemainingFraction: 0.8 }] }] });
+          return jsonResponse(200, { groups: [{ buckets: [{ window: "weekly", remainingFraction: 0.8 }] }] });
         }
         return new Response("auth_index is required", { status: 400 });
       }
@@ -411,6 +411,35 @@ describe("happy path", () => {
     for (const r of Object.values(rows)) {
       expect(r.limits.some((l) => l.id === "claude:weekly")).toBe(true);
     }
+    assertNoKeyLeak(s);
+  });
+
+  it("discovers the plugin quota id from quota_plugin_id when config has none", async () => {
+    const quotaUrls: string[] = [];
+    const fetchHinted = vi.fn(async (input: string | URL | Request): Promise<Response> => {
+      const url = new URL(String(input));
+      if (url.pathname === "/v0/management/auth-files") {
+        return jsonResponse(200, [{ id: "claude-1", provider: "claude", quota_plugin_id: "claude-quota" }]);
+      }
+      if (url.pathname === "/v0/management/plugins/claude-quota/quota") {
+        quotaUrls.push(url.toString());
+        return jsonResponse(200, pluginQuotaBody());
+      }
+      if (url.pathname === "/v1/models") return jsonResponse(200, modelsBody());
+      return new Response("not found", { status: 404 });
+    });
+    const s = store();
+    const d = deps(s, fetchHinted as unknown as typeof fetch);
+    // No hand-maintained pluginQuotaIds: discovery drives the fetch.
+    d.config = parseConfig({ ...baseConfigRaw(), pluginQuotaIds: {} }).config;
+    const summary = await runSync(d, { running: false });
+    expect(summary.skipped).toBe(false);
+    expect(quotaUrls).toHaveLength(1);
+    const rows = s.savedRows as Record<string, AccountUsageRow>;
+    for (const r of Object.values(rows).filter((r) => r.provider === "claude")) {
+      expect(r.limits.some((l) => l.id === "claude:weekly")).toBe(true);
+    }
+    expect(summary.errors.some((e) => e.includes("plugin"))).toBe(false);
     assertNoKeyLeak(s);
   });
 

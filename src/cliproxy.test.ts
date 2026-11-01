@@ -60,6 +60,21 @@ describe("construction and allow-list", () => {
     expect(fetch).not.toHaveBeenCalled();
   });
 
+  it("never admits the usage queue: reads would delete cpa-usage-keeper records", async () => {
+    // The connector's quota view is sync-cache only. The usage-queue read is
+    // destructive (it dequeues), so the pinned allow-list refuses it outright
+    // — including percent-encoded spellings that decode to the same path.
+    const fetch = vi.fn(async () => json(200, {}));
+    for (const path of [
+      "/v0/management/usage-queue",
+      "/v0/management/usage-queue?limit=10",
+      "/v0/management/%75sage-queue",
+    ]) {
+      await expect(client(fetch).getJson(path)).rejects.toThrow(CliproxyConfigError);
+    }
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
   it("attaches the key header only after origin validation, and sends GET", async () => {
     let seen: { method?: string; headers?: Headers } = {};
     const fetch = vi.fn(async (_url: string, init?: RequestInit) => {

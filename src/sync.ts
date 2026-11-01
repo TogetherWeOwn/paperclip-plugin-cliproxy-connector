@@ -239,7 +239,11 @@ export async function runSync(deps: SyncDeps, inFlight: { running: boolean }): P
         set.add(a.authIndex);
       }
       for (const entry of deps.config.providers) {
-        const pluginId = deps.config.pluginQuotaIds[entry.provider];
+        // Explicit config wins; otherwise an auth-files entry may advertise
+        // its own route (`quota_plugin_id`, unless `supports_quota: false`),
+        // so new quota plugins need no config change to start syncing.
+        const pluginId =
+          deps.config.pluginQuotaIds[entry.provider] ?? discovered.pluginQuotaHints.get(entry.provider);
         if (!pluginId) continue;
         const indexes = [...(enabledIndexesByProvider.get(entry.provider) ?? [])].sort();
         if (indexes.length === 0) {
@@ -657,6 +661,7 @@ export function accountsToRows(
       checkedAt: a.checkedAt,
       source: "plugin:cliproxy-connector",
       quotaBlind: a.quotaBlind,
+      quotaBlindReason: a.quotaBlindReason,
       accountHash: a.accountHash,
       lastError: a.parseWarnings.length > 0 ? a.parseWarnings.join(" | ") : null,
       coolingDown: a.coolingDown,

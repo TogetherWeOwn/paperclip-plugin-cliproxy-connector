@@ -48,6 +48,12 @@ export interface UsageLimitRow {
    * CLIProxy's per-model quota observations (`model_quotas` keyed by model).
    */
   models?: string[] | null;
+  /**
+   * Display-only quota `summary[]` entries from the plugin payload (and/or
+   * bucket), e.g. human-readable plan or window notes. Never gates routing;
+   * the router ignores this field.
+   */
+  metrics?: string[] | null;
 }
 
 /**
@@ -93,6 +99,14 @@ export interface AccountUsageRow {
   source: string;
   /** True when the provider exposes no usable quota data (`unknown` path). */
   quotaBlind: boolean;
+  /**
+   * Why the account is quota-blind (null when it is not). Display only:
+   * "upstream exposes nothing" (the provider publishes no quota),
+   * "local estimate" (client-side estimates such as NIM), or
+   * "no usable quota windows". Rows cached before this field existed carry
+   * no value; readers fall back to deriving it from the provider.
+   */
+  quotaBlindReason?: string | null;
   /** Opaque sha256 of the upstream account identity. Never a raw email/label. */
   accountHash: string | null;
   /** Last error for this account (fetch/parse), if any. Never holds the key. */

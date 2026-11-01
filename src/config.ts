@@ -88,7 +88,7 @@ export const DEFAULT_PROVIDER_WINDOWS: Record<string, string[]> = {
   // (`x-codex-primary-used-percent`) alongside namespaced ones (`5h-primary`):
   // both must gate, or stock quotas never constrain routing.
   codex: ["codex", "5h", "weekly", "primary", "secondary"],
-  devin: ["devin", "5h", "weekly"],
+  devin: ["devin", "5h", "weekly", "daily"],
   synthetic: ["weekly", "rolling-5h", "5h", "subscription"],
   "nvidia-nim": ["rpm", "minute"],
   cloudflare: ["daily", "neurons"],
@@ -351,6 +351,7 @@ const KNOWN_PROVIDER_WORDS = new Set([
   "compat",
   "synthetic",
   "nvidia-nim",
+  "openrouter",
   "cloudflare",
   "cloudflare-workers-ai",
   "zai",

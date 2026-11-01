@@ -45,8 +45,9 @@ list. A connection's model list is its provider's stock ids — bare for Claude,
 Codex/OpenAI, Antigravity and Meta; `devin/…` for Devin (built into CLIProxy); the fixed
 plugin namespaces `synthetic/…`, `nvidia/…`, `cloudflare/…`, `zai/…`, `opencode-go/…`;
 `opencode-zen-free` (openai-compat) is bare unless its entry sets the stock `prefix`
-field. Any other provider string works the same way — a future family such as
-`openrouter` needs one `providers[]` row and no plugin update. Bare-id overlap is
+field. `openrouter` is recognised as a parser key (display-only, quota-blind — its
+upstream exposes nothing usable), but like any other provider string it still needs one
+`providers[]` row and no plugin update. Bare-id overlap is
 resolved against each credential's live served set
 (`GET /v0/management/auth-files/models?name=<file>`, one fetch per enabled auth file;
 a file that answers — even with an empty set — supersedes that credential's
@@ -88,10 +89,13 @@ the operator. You read redacted output only.
    state (proposal §4.4).
 5. Add optional per-provider plugin quota routes (`pluginQuotaIds: { "claude": "<plugin id>" }`)
    for the five quota plugins (Synthetic, NIM, Cloudflare, z.ai, opencode-go); without one,
-   the provider routes on passive signals (or unknown). Each fetch sends the credential's
-   `auth_index` from the `auth-files` list (`?auth_index=…`, required since CLIProxy
-   v8.0.49), so every account attaches its own file's quota; failed fetches are
-   best-effort and never spend strikes.
+   the provider routes on passive signals (or unknown). The connector also discovers
+   plugin ids from the `auth-files` list itself: entries carrying `quota_plugin_id`
+   (unless `supports_quota: false`) supply the fetch id, so a new quota plugin needs no
+   config change — an explicit `pluginQuotaIds` entry always wins over discovery.
+   Each fetch sends the credential's `auth_index` from the `auth-files` list
+   (`?auth_index=…`, required since CLIProxy v8.0.49), so every account attaches its
+   own file's quota; failed fetches are best-effort and never spend strikes.
 6. Confirm the sync ran (plugin page shows one card per provider with its proven models),
    then run traffic — an all-cooling provider shows `exhausted` with the earliest reset as
    `retryAt`, and core wait/resume fires automatically.
@@ -104,6 +108,24 @@ the operator. You read redacted output only.
   result carries exactly `{ kind, memberId | retryAt, skipped }` (asserted in tests).
 - The `subscription-pool` CLIProxy plugin is retired: "pool" here always means Paperclip's
   native AI-connection pools behind `ai.connections.route`.
+
+## Pages: provider state and Usage & Quota
+
+The plugin ships two pages over the same sync cache:
+
+- The **provider** page: one card per `providers[]` row with the aggregate verdict,
+  connection, inventory confirmation, proven models, drift and the informational
+  per-account detail.
+- The **Usage & Quota** page (`cliproxy-usage`): per-provider verdict, headroom
+  (`<n> of <m> enabled accounts with headroom`), earliest reset with countdown,
+  freshness and quota-blind badges with their reason; plus a filterable (provider,
+  status, blind-only) and sortable (remaining %, reset — unknowns last) per-account
+  table showing the masked account label (`acct-<13 shown>…`, full key never
+  rendered), plan, priority, status, cooldown countdown, per-window bars and the
+  display-only `metrics`. Request/token counters are intentionally absent: CLIProxy
+  exposes no read-only per-account counters. Both pages are read-only over already
+  synced state; the connector never calls the destructive `/v0/management/usage-queue`
+  endpoint (asserted in tests).
 
 ## Config reference
 
@@ -119,8 +141,8 @@ the operator. You read redacted output only.
 | `recheckSeconds` | `60` | Wait before re-probing unknown/stale telemetry. |
 | `maxAgeMultiplier` / `graceMultiplier` | `2` / `3` | Freshness = sync interval × 2; grace = freshness × 3. |
 | `providers` | `[]` | One `{ provider, connectionId, completeInventory }` row per CLIProxy provider family. The provider word is the raw auth-file string (e.g. `cloudflare-workers-ai`); any string is accepted, duplicates error, and a row that matches no accounts drift-warns as having zero enabled accounts. Empty warns. |
-| `providerWindows` | spike matrix §2 | Per-provider gating-window allow-lists (lowercased substrings). |
-| `pluginQuotaIds` | `{}` | CLIProxy plugin id per provider for quota fetch. Fetched per auth file with its `auth_index` (v8.0.49+); entries without one keep one provider-level fetch. |
+| `providerWindows` | spike matrix §2 | Per-provider gating-window allow-lists (lowercased substrings). Includes Devin `daily`/`weekly` alongside `5h`. |
+| `pluginQuotaIds` | `{}` | CLIProxy plugin id per provider for quota fetch. Wins over `quota_plugin_id` discovery from the `auth-files` list. Fetched per auth file with its `auth_index` (v8.0.49+); entries without one keep one provider-level fetch. |
 | `audienceConfirmed` | `false` | Page shows upstream quota state; confirm the audience, then set `true`. |
 
 ## Endpoint assumptions
@@ -134,9 +156,17 @@ own pinned path (`/v1/models`, `MODELS_PATH`) fetched with the separate client A
 (Bearer auth) under the same guarded-fetch rules (loopback, manual redirects, timeouts,
 caps, no key leaks); neither key can travel to the other's paths. If your CLIProxy build
 differs, change the pinned constants in `src/cliproxy.ts` — everything else follows.
-Exact live management JSON is still operator-captured (spike §8 item 8); parsers are
-defensive by design: unknown shapes become warnings + quota-blind rows, never headroom.
-The redacted `auth-files` fixture in tests mirrors the public CLIProxyAPI source shapes.
+The quota-fetch wire shape is the lowercase CLIProxyAPI `sdk/pluginapi`
+`QuotaFetchResponse`: `groups[]` → `buckets[]`, with per-bucket `window`,
+`remainingFraction`, `resetTime` and a payload-level `summary[]` surfaced as a
+display-only `metrics` array per row (the router ignores it). PascalCase aliases are
+still tolerated. The always-present empty `quota: { signals: {} }` shell some
+providers send is quiet (no "no quota signals" warning); a provider also sending no
+`observed_at` still notes that. Devin reports `daily/weekly_quota_remaining_percent`
+(with `%`, e.g. `"72%"`) plus `*_reset_at` instead of buckets, parsed into
+`daily`/`weekly` windows. Parsers are defensive by design: unknown shapes become
+warnings + quota-blind rows, never headroom. The redacted `auth-files` fixture in
+tests mirrors the public CLIProxyAPI source shapes.
 
 ## Security properties (all tested)
 
@@ -174,11 +204,16 @@ namespaced/bare equivalence), `router.test.ts` (1- and 2-member pools, pinned, e
 retryAt, missing-connection notes, host-contract shape), `sync.test.ts` (strike budget +
 `loopback:<port>` migration, drift incl. `model-overlap`, single-flight, best-effort plugin
 fetch, best-effort `/v1/models` fetch that never spends strikes, redaction),
-`parsers.test.ts` (header-map signals, model quotas, window gating, redacted auth-files
-fixture, Devin quota grouped by auth-file provider), `models.test.ts` (served-list parsing,
+`parsers.test.ts` (header-map signals, model quotas, window gating, lowercase wire-shape
+fixtures incl. the 60%-remaining regression test, bucket-less warnings, `summary[]` →
+`metrics`, Devin `daily`/`weekly` percents, empty-shell quiet, per-parser blind reasons,
+`openrouter` display-only key, `quota_plugin_id` discovery, redacted auth-files fixture,
+Devin quota grouped by auth-file provider), `models.test.ts` (served-list parsing,
 namespace-first attribution, Devin `owned_by: anthropic` case, colliding bare-id overlap),
 `cliproxy.test.ts` (management + client allow-lists, redirects, caps, redaction),
 `loopback-fetch.test.ts` (worker-local loopback transport: off-loopback/off-origin/non-GET
 refused, no auto-redirects, composition with the client),
-`config.test.ts` (incl. the optional client-key `secret_ref`), `ui-data.test.ts`,
+`config.test.ts` (incl. the optional client-key `secret_ref`), `ui-data.test.ts`
+(incl. the usage-page data: verdicts, headroom, resets, freshness, blind badges with
+reasons, masked labels, metrics passthrough, legacy rows without `quotaBlindReason`),
 `plugin.test.ts` (harness: job, data, actions, API routes).
