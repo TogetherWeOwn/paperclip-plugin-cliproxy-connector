@@ -109,6 +109,51 @@ describe("page data (per-provider)", () => {
     expect(page.earliestReset).toBeNull();
   });
 
+  it("surfaces proven models, overlaps, and the catalog note", () => {
+    const page = buildPageData({
+      now: NOW,
+      config: testConfig(),
+      rows: { "acct-aaa": row() },
+      lastSync: {
+        ...LAST_SYNC,
+        providerModels: { claude: ["claude-opus-4-5"] },
+        modelOverlaps: [{ id: "shared-bare-model", providers: ["claude", "codex"] }],
+      },
+      strike: emptyStrikeBudget(),
+    });
+    expect(page.providers[0]).toMatchObject({ provider: "claude", models: ["claude-opus-4-5"] });
+    expect(page.providers[1]).toMatchObject({ provider: "codex", models: [] });
+    expect(page.modelOverlaps).toEqual([{ id: "shared-bare-model", providers: ["claude", "codex"] }]);
+    expect(page.modelsNote).toBeNull(); // catalog ran: derivation is on
+    const widget = buildWidgetData({
+      now: NOW,
+      config: testConfig(),
+      rows: { "acct-aaa": row() },
+      lastSync: {
+        ...LAST_SYNC,
+        providerModels: { claude: ["claude-opus-4-5"] },
+        modelOverlaps: [{ id: "shared-bare-model", providers: ["claude", "codex"] }],
+        drift: [{ kind: "model-overlap", provider: "claude", detail: "overlap" }],
+      },
+      strike: emptyStrikeBudget(),
+    });
+    expect(widget.modelOverlapCount).toBe(1);
+    expect(widget.status).toMatch(/drift finding/); // overlap drift is health-visible
+  });
+
+  it("notes when the model catalog is unavailable", () => {
+    const page = buildPageData({
+      now: NOW,
+      config: testConfig(),
+      rows: { "acct-aaa": row() },
+      lastSync: { ...LAST_SYNC, errors: ["clientApiKeySecretRef is not set: skipping /v1/models"] },
+      strike: emptyStrikeBudget(),
+    });
+    expect(page.providerModels).toEqual({});
+    expect(page.modelOverlaps).toEqual([]);
+    expect(page.modelsNote).toMatch(/clientApiKeySecretRef/);
+  });
+
   it("shows the audience notice until confirmed", () => {
     const unconfirmed = { ...testConfig(), audienceConfirmed: false };
     const page = buildPageData({

@@ -4,10 +4,12 @@ import {
   AUTH_FILES_PATH,
   CliproxyAuthError,
   CliproxyBodyError,
+  CliproxyClientApiClient,
   CliproxyConfigError,
   CliproxyManagementClient,
   CliproxyNetworkError,
   CliproxyRedirectError,
+  MODELS_PATH,
   pluginQuotaPath,
 } from "./cliproxy.js";
 
@@ -160,7 +162,11 @@ describe("redirects", () => {
     await expect(client(fetch).getAuthFiles()).rejects.toThrow(CliproxyRedirectError);
   });
 
-  it("refuses a redirect to the removed /v1/models path", async () => {
+  it("refuses a redirect to the /v1/models path (management key never goes there)", async () => {
+    // Revisited for v2 model → provider derivation: /v1/models is a live,
+    // pinned path — but only for the *client* key through
+    // CliproxyClientApiClient (tested below). The management client still
+    // refuses it, so the management key can never travel to /v1 paths.
     const fetch = vi.fn(async () => new Response(null, { status: 302, headers: { location: "/v1/models" } }));
     await expect(client(fetch).getAuthFiles()).rejects.toThrow(CliproxyRedirectError);
   });
@@ -169,6 +175,73 @@ describe("redirects", () => {
     const fetch = vi.fn(async () => new Response(null, { status: 302, headers: { location: AUTH_FILES_PATH } }));
     await expect(client(fetch).getAuthFiles()).rejects.toThrow(/too many redirects/);
     expect(fetch.mock.calls.length).toBeGreaterThan(1);
+  });
+});
+
+describe("client API path (/v1/models, separate key)", () => {
+  const CLIENT_KEY = "CLIENT-KEY-MATERIAL-abc";
+
+  function modelsClient(fetchImpl?: ManagementFetch) {
+    return new CliproxyClientApiClient({
+      baseUrl: "http://127.0.0.1:8317",
+      key: CLIENT_KEY,
+      fetchImpl,
+    });
+  }
+
+  it("pins the models path and GETs it with Bearer auth", async () => {
+    expect(MODELS_PATH).toBe("/v1/models");
+    let seen: { headers?: Headers } = {};
+    const fetch = vi.fn(async (_url: string, init?: RequestInit) => {
+      seen = { headers: new Headers(init?.headers) };
+      return json(200, { data: [] });
+    });
+    const body = await modelsClient(fetch).getModels();
+    expect(body).toEqual({ data: [] });
+    expect(seen.headers?.get("Authorization")).toBe(`Bearer ${CLIENT_KEY}`);
+  });
+
+  it("sends the client key only to /v1/models, never to management paths", async () => {
+    const fetch = vi.fn(async () => json(200, { data: [] }));
+    await modelsClient(fetch).getModels();
+    expect(fetch).toHaveBeenCalledTimes(1);
+    expect(String((fetch.mock.calls[0] as unknown as unknown[])[0])).toBe(
+      "http://127.0.0.1:8317/v1/models",
+    );
+  });
+
+  it("rejects an empty client key before any network happens", async () => {
+    const fetch = vi.fn(async () => json(200, {}));
+    const c = () =>
+      new CliproxyClientApiClient({ baseUrl: "http://127.0.0.1:8317", key: "" });
+    expect(c).toThrow(CliproxyConfigError);
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it("rejects non-loopback base URLs without touching the network", () => {
+    expect(
+      () =>
+        new CliproxyClientApiClient({ baseUrl: "https://cliproxy.example.com", key: CLIENT_KEY }),
+    ).toThrow(CliproxyConfigError);
+  });
+
+  it("maps 401 to CliproxyAuthError without the client key in the message", async () => {
+    const fetch = vi.fn(async () => new Response("denied", { status: 401 }));
+    const err = await modelsClient(fetch)
+      .getModels()
+      .catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(CliproxyAuthError);
+    expect((err as Error).message).not.toContain(CLIENT_KEY);
+  });
+
+  it("refuses a redirect from /v1/models to a management path", async () => {
+    const fetch = vi.fn(async () => new Response(null, { status: 302, headers: { location: AUTH_FILES_PATH } }));
+    await expect(modelsClient(fetch).getModels()).rejects.toThrow(CliproxyRedirectError);
+  });
+
+  it("refuses to propagate a body containing client-key material", async () => {
+    const fetch = vi.fn(async () => json(200, { echoed: CLIENT_KEY }));
+    await expect(modelsClient(fetch).getModels()).rejects.toThrow(CliproxyBodyError);
   });
 });
 

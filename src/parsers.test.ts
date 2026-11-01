@@ -243,6 +243,38 @@ describe("parseAuthFiles (redacted fixture)", () => {
     expect(warnings).toEqual([]);
   });
 
+  it("groups Devin quota by auth-file provider, never by owned_by", () => {
+    // Devin serves devin/… ids (including devin/claude-…) while /v1/models
+    // reports owned_by: anthropic for them. Quota rows come from auth-files,
+    // so the provider is the auth-file word — owned_by never participates.
+    const { accounts } = parse([
+      {
+        id: "REDACTED-ID-DEVIN-1",
+        provider: "devin",
+        quota: {
+          observed_at: NOW,
+          signals: {
+            "anthropic-ratelimit-unified-5h-utilization": "0.2",
+            "anthropic-ratelimit-unified-5h-status": "allowed",
+          },
+        },
+        model_quotas: {
+          "claude-opus-4-5": {
+            observed_at: NOW,
+            signals: { "anthropic-ratelimit-unified-5h-utilization": "0.9" },
+          },
+        },
+      },
+    ]);
+    expect(accounts).toHaveLength(1);
+    expect(accounts[0]?.provider).toBe("devin");
+    // Claude-shaped signals on a Devin account still parse (unknown-provider
+    // fallback in parseHeaderSignals covers the claude/provider mismatch).
+    expect(accounts[0]?.limits.length).toBeGreaterThan(0);
+    const modelWindow = accounts[0]?.limits.find((l) => (l.models ?? []).includes("claude-opus-4-5"));
+    expect(modelWindow?.usedPercent).toBe(90);
+  });
+
   it("reconciles cooling / disabled lifecycle from unavailable + next_retry_after", () => {
     const { accounts } = parse();
     const cooling = accounts.find((a) => a.key !== undefined && a.status === "cooling");

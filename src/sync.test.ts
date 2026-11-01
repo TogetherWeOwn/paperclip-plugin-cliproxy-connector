@@ -16,6 +16,7 @@ function baseConfigRaw() {
     cliproxyBaseUrl: "http://127.0.0.1:8317",
     managementKeyHeader: "X-Test-Key",
     managementSecretRef: { uid: "secret-1" },
+    clientApiKeySecretRef: { uid: "secret-client-1" },
     providers: [
       { provider: "claude", connectionId: "conn-claude", completeInventory: true },
       { provider: "meta", connectionId: "conn-meta", completeInventory: false },
@@ -54,13 +55,26 @@ function pluginQuotaBody() {
   return { Groups: [{ Buckets: [{ Window: "weekly", RemainingFraction: 0.8 }] }] };
 }
 
+function modelsBody() {
+  return {
+    data: [
+      { id: "claude-opus-4-5", owned_by: "anthropic" },
+      { id: "devin/claude-opus-4-5", owned_by: "anthropic" },
+    ],
+  };
+}
+
 /** Fetch mock routing by pathname. `overrides` may force statuses per route. */
-function mockFetch(overrides?: { authFilesStatus?: number; pluginStatus?: number }) {
+function mockFetch(overrides?: { authFilesStatus?: number; pluginStatus?: number; modelsStatus?: number }) {
   return vi.fn(async (input: string | URL | Request): Promise<Response> => {
     const url = new URL(String(input));
     if (url.pathname === "/v0/management/auth-files") {
       if (overrides?.authFilesStatus) return new Response("nope", { status: overrides.authFilesStatus });
       return jsonResponse(200, authFilesBody());
+    }
+    if (url.pathname === "/v1/models") {
+      if (overrides?.modelsStatus) return new Response("nope", { status: overrides.modelsStatus });
+      return jsonResponse(200, modelsBody());
     }
     if (url.pathname.includes("/plugins/")) {
       if (overrides?.pluginStatus === 401) return new Response("nope", { status: 401 });
@@ -101,6 +115,7 @@ function deps(s: Store, fetchImpl?: typeof fetch): SyncDeps {
     companyId: "co-1",
     now: NOW,
     resolveSecret: async () => KEY,
+    resolveClientSecret: async () => `${KEY}-client`,
     fetchImpl,
     loadStrike: async () => s.strike,
     saveStrike: async (next) => {
@@ -218,6 +233,98 @@ describe("happy path", () => {
     d2.config = d.config;
     await runSync(d2, { running: false });
     expect(Object.keys(s2.savedRows as Record<string, AccountUsageRow>)).toEqual(keys);
+  });
+});
+
+describe("served-model catalog (/v1/models + auth-files)", () => {
+  it("derives proven models and persists them on the summary", async () => {
+    const s = store();
+    const summary = await runSync(deps(s, mockFetch() as unknown as typeof fetch), { running: false });
+    expect(summary.skipped).toBe(false);
+    // Bare id via owned_by fallback (no model_quotas in this fixture), and the
+    // Devin namespaced id despite owned_by: anthropic.
+    expect(summary.providerModels?.claude).toContain("claude-opus-4-5");
+    expect(summary.providerModels?.devin).toEqual(["devin/claude-opus-4-5"]);
+    expect(summary.modelOverlaps).toEqual([]);
+    assertNoKeyLeak(s);
+  });
+
+  it("a missing client secret skips the catalog with a warning, sync still succeeds", async () => {
+    const s = store();
+    const d = deps(s, mockFetch() as unknown as typeof fetch);
+    const { config } = parseConfig({ ...baseConfigRaw(), clientApiKeySecretRef: undefined });
+    d.config = config;
+    const summary = await runSync(d, { running: false });
+    expect(summary.skipped).toBe(false);
+    expect(summary.errors.some((e) => e.includes("clientApiKeySecretRef"))).toBe(true);
+    expect(summary.providerModels).toBeUndefined();
+    expect(summary.modelOverlaps).toBeUndefined();
+  });
+
+  it("a 401 from /v1/models never spends the management strike budget", async () => {
+    const s = store();
+    const summary = await runSync(
+      deps(s, mockFetch({ modelsStatus: 401 }) as unknown as typeof fetch),
+      { running: false },
+    );
+    expect(summary.skipped).toBe(false); // best-effort: quota aggregation proceeds
+    expect(summary.errors.some((e) => e.includes("/v1/models"))).toBe(true);
+    expect(s.strike.failures).toHaveLength(0);
+    expect(s.strike.secretBad).toBe(false);
+    expect(s.strike.disabled).toBe(false);
+    assertNoKeyLeak(s);
+  });
+
+  it("a colliding bare id becomes model-overlap drift, proven for nobody", async () => {
+    const fetchOverlap = vi.fn(async (input: string | URL | Request): Promise<Response> => {
+      const url = new URL(String(input));
+      if (url.pathname === "/v0/management/auth-files") {
+        return jsonResponse(200, [
+          {
+            id: "claude-1",
+            provider: "claude",
+            model_quotas: {
+              "shared-bare-model": {
+                observed_at: NOW,
+                signals: { "anthropic-ratelimit-unified-5h-utilization": "0.2" },
+              },
+            },
+          },
+          {
+            id: "codex-1",
+            provider: "codex",
+            model_quotas: {
+              "shared-bare-model": {
+                observed_at: NOW,
+                signals: { "x-codex-primary-used-percent": "10" },
+              },
+            },
+          },
+        ]);
+      }
+      if (url.pathname === "/v1/models") {
+        return jsonResponse(200, { data: [{ id: "shared-bare-model", owned_by: "openai" }] });
+      }
+      return new Response("not found", { status: 404 });
+    });
+    const s = store();
+    const d = deps(s, fetchOverlap as unknown as typeof fetch);
+    d.config = parseConfig({
+      ...baseConfigRaw(),
+      providers: [
+        { provider: "claude", connectionId: "conn-claude", completeInventory: true },
+        { provider: "codex", connectionId: "conn-codex", completeInventory: true },
+      ],
+      pluginQuotaIds: {},
+    }).config;
+    const summary = await runSync(d, { running: false });
+    expect(summary.skipped).toBe(false);
+    expect(summary.modelOverlaps).toEqual([{ id: "shared-bare-model", providers: ["claude", "codex"] }]);
+    expect(summary.providerModels?.claude ?? []).not.toContain("shared-bare-model");
+    expect(summary.providerModels?.codex ?? []).not.toContain("shared-bare-model");
+    const overlapDrift = (summary.drift ?? []).filter((f) => f.kind === "model-overlap");
+    expect(overlapDrift.map((f) => f.provider).sort()).toEqual(["claude", "codex"]);
+    expect(summary.errors.some((e) => e.includes("shared-bare-model"))).toBe(true);
   });
 });
 

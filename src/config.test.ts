@@ -78,6 +78,24 @@ describe("providers[] rows", () => {
   });
 });
 
+describe("client API key secret_ref (/v1/models derivation)", () => {
+  it("warns (but stays valid) when the client secret is missing", () => {
+    const { config, validation } = parseConfig(base({ providers: [] }));
+    expect(validation.ok).toBe(true);
+    expect(config.clientApiKeySecretRef).toBeNull();
+    expect(validation.warnings.some((w) => w.includes("clientApiKeySecretRef"))).toBe(true);
+  });
+
+  it("accepts a secret_ref object and rejects legacy string UUIDs", () => {
+    const good = parseConfig(base({ clientApiKeySecretRef: { uid: "secret-client-1" } }));
+    expect(good.validation.ok).toBe(true);
+    expect(good.config.clientApiKeySecretRef).toEqual({ uid: "secret-client-1" });
+    const bad = parseConfig(base({ clientApiKeySecretRef: "legacy-uuid" }));
+    expect(bad.validation.ok).toBe(false);
+    expect(bad.validation.errors.some((e) => e.includes("clientApiKeySecretRef"))).toBe(true);
+  });
+});
+
 describe("security knobs (kept from v1)", () => {
   it("requires loopback base URL, explicit key header, and secret_ref object", () => {
     expect(parseConfig(base({ cliproxyBaseUrl: "https://x.example" })).validation.ok).toBe(false);

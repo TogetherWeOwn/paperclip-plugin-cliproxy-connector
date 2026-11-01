@@ -87,7 +87,28 @@ function windowObservationAgeMs(
   return nowMs - Math.min(t, nowMs);
 }
 
-function windowAppliesToModel(window: UsageLimitRow, model: string | null): boolean {
+/**
+ * Strip a leading provider namespace (`ns/rest` → `rest`) when — and only
+ * when — it names this aggregate's own provider. The namespace set is
+ * derived from provider data (`normalizeProvider`), not from a hard-coded
+ * strip list: `devin/…` and the plugin namespaces (`synthetic/…`, `nvidia/…`
+ * for `nvidia-nim`, `cloudflare/…`, `zai/…`, `opencode-go/…`) strip for
+ * their own provider. Stock bare ids have nothing to strip. A namespace
+ * naming any other (or no known) provider stays literal, so a request can
+ * never match another provider's per-model window. Matching always tries
+ * both the full and the stripped form, so bare and namespaced requests for
+ * the same model agree.
+ */
+export function stripProviderNamespace(model: string, provider: string): string {
+  const slash = model.indexOf("/");
+  if (slash <= 0 || slash === model.length - 1) return model;
+  const ns = model.slice(0, slash);
+  const rest = model.slice(slash + 1);
+  if (normalizeProvider(ns) !== normalizeProvider(provider)) return model;
+  return rest;
+}
+
+function windowAppliesToModel(window: UsageLimitRow, model: string | null, provider: string): boolean {
   const models = window.models;
   if (model === null) {
     // No requested model: only account-level windows (models == null) apply.
@@ -97,7 +118,14 @@ function windowAppliesToModel(window: UsageLimitRow, model: string | null): bool
     return !models || models.length === 0;
   }
   if (!models || models.length === 0) return true; // account-level: all models
-  return models.some((m) => m.toLowerCase() === model);
+  // CLIProxy keys `model_quotas` by bare id; the candidate's
+  // `runtimeConfig.model` may carry the provider namespace (`devin/…`,
+  // plugin namespaces). Compare both forms on both sides.
+  const candidates = new Set([model, stripProviderNamespace(model, provider)]);
+  return models.some((m) => {
+    const key = m.toLowerCase();
+    return candidates.has(key) || candidates.has(stripProviderNamespace(key, provider));
+  });
 }
 
 type AccountVerdict =
@@ -128,7 +156,7 @@ function assessAccount(
     };
   }
 
-  const applicable = row.limits.filter((l) => l.gating && windowAppliesToModel(l, model));
+  const applicable = row.limits.filter((l) => l.gating && windowAppliesToModel(l, model, row.provider));
   if (applicable.length === 0) {
     return { kind: "unknown", reason: "no gating windows applicable to this model; unknown." };
   }
@@ -271,7 +299,7 @@ export function aggregateProvider(args: {
       // Limiting windows carry their resets in the row; collect the future
       // ones as this account's recovery bound.
       for (const w of row.limits) {
-        if (!w.gating || !windowAppliesToModel(w, model)) continue;
+        if (!w.gating || !windowAppliesToModel(w, model, provider)) continue;
         const resetMs = w.resetsAt ? parseTime(w.resetsAt) : null;
         if ((w.allowed === false || w.limitReached) && resetMs !== null && resetMs > nowMs && w.resetsAt) {
           outResets.push(w.resetsAt);

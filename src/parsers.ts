@@ -426,9 +426,11 @@ export function parseHeaderSignals(
       continue;
     }
 
-    // Claude unified: anthropic-ratelimit-unified-<window>-<metric>.
+    // Claude unified: anthropic-ratelimit-unified-<window>-<metric>. Devin
+    // serves Claude-family models through the same upstream, so Devin
+    // accounts report the same shapes (grouped by auth-file provider).
     let m = /^anthropic-ratelimit-unified-(.+?)-(utilization|reset|status)$/.exec(key);
-    if (m && (provider === "claude" || provider === "unknown-provider")) {
+    if (m && (provider === "claude" || provider === "devin" || provider === "unknown-provider")) {
       const a = acc(m[1]);
       if (m[2] === "utilization") {
         const used = toUsedPercent(Number(value));

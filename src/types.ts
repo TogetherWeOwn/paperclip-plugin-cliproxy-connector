@@ -120,12 +120,20 @@ export interface StrikeBudgetState {
   secretBad: boolean;
 }
 
+/** One served model id claimed by more than one provider (lowercased). */
+export interface ModelOverlap {
+  id: string;
+  /** Sorted provider words that all plausibly serve it. */
+  providers: string[];
+}
+
 /** Drift finding from one sync run (per provider, never per account). */
 export interface DriftFinding {
   kind:
     | "unconfigured-provider"
     | "missing-connection"
-    | "no-enabled-accounts";
+    | "no-enabled-accounts"
+    | "model-overlap";
   /** Provider the finding is about (normalized lowercase). */
   provider: string;
   detail: string;
@@ -154,4 +162,13 @@ export interface SyncSummary {
   errors: string[];
   skipped: boolean;
   skipReason: string | null;
+  /**
+   * Proven served-model ids per provider from this run's `/v1/models` +
+   * auth-file derivation (lowercased). Absent when the catalog was
+   * unavailable (missing client key or failed fetch); the page then says
+   * overlap detection is off instead of showing stale lists.
+   */
+  providerModels?: Record<string, string[]>;
+  /** Overlapping served ids from this run (excluded from every proven list). */
+  modelOverlaps?: ModelOverlap[];
 }

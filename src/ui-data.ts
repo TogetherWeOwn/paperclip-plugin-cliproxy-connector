@@ -78,6 +78,8 @@ export interface ProviderCard {
   enabledAccounts: number;
   headroomAccounts: number;
   reason: string;
+  /** Proven served-model ids for this provider (stock ids), or [] when unknown. */
+  models: string[];
   accounts: ProviderAccountDetail[];
 }
 
@@ -113,6 +115,15 @@ export interface PageData {
   drift: DriftFinding[];
   providers: ProviderCard[];
   earliestReset: string | null;
+  /** Proven served-model ids per provider from the latest sync (stock ids). */
+  providerModels: Record<string, string[]>;
+  /** Served ids claimed by more than one provider (proven for nobody). */
+  modelOverlaps: Array<{ id: string; providers: string[] }>;
+  /**
+   * Why the catalog is unavailable (missing client key, failed fetch), or
+   * null when derivation ran. Overlap detection is off while this is set.
+   */
+  modelsNote: string | null;
 }
 
 export interface WidgetData {
@@ -125,6 +136,8 @@ export interface WidgetData {
   unknownProviders: number;
   waitResumeOff: number;
   driftCount: number;
+  /** Served ids claimed by more than one provider (also counted in drift). */
+  modelOverlapCount: number;
   earliestReset: string | null;
   earliestResetIn: string | null;
 }
@@ -153,6 +166,18 @@ export function buildPageData(args: {
   const { now, config, rows, lastSync, strike, lastFailure } = args;
   const nowMs = Date.parse(now);
   const allRows = Object.values(rows);
+  const providerModels = lastSync?.providerModels ?? {};
+  const modelOverlaps = lastSync?.modelOverlaps ?? [];
+  const catalogError =
+    lastSync === null
+      ? null
+      : (lastSync.errors.find((e) => e.includes("/v1/models") || e.includes("clientApiKeySecretRef")) ?? null);
+  const modelsNote =
+    lastSync === null
+      ? "no sync has run yet; model → provider derivation has no catalog."
+      : lastSync.providerModels === undefined
+        ? (catalogError ?? "model catalog unavailable this run; overlap detection is off.")
+        : null;
 
   const providers: ProviderCard[] = [...config.providers]
     .sort((a, b) => a.provider.localeCompare(b.provider))
@@ -184,6 +209,7 @@ export function buildPageData(args: {
         reason: verdict.waitResumeOff
           ? `${verdict.reason} Wait/resume is off for this provider: inventory is not confirmed complete.`
           : verdict.reason,
+        models: providerModels[entry.provider] ?? [],
         accounts: providerRows.map((row) => toAccountDetail(row, nowMs, maxAgeMs(config), graceMs(config))),
       };
     });
@@ -229,6 +255,9 @@ export function buildPageData(args: {
     drift: lastSync?.drift ?? [],
     providers,
     earliestReset,
+    providerModels,
+    modelOverlaps,
+    modelsNote,
   };
 }
 
@@ -303,7 +332,9 @@ export function buildWidgetData(args: {
           ? "no providers configured yet"
           : exhausted > 0 && allowed === 0
             ? `all routed providers exhausted (retry ${page.earliestReset ?? "unknown"})`
-            : "healthy";
+            : page.modelOverlaps.length > 0
+              ? `healthy (${page.modelOverlaps.length} overlapping model${page.modelOverlaps.length === 1 ? "" : "s"} excluded from proven models)`
+              : "healthy";
   return {
     generatedAt: args.now,
     ok: !args.strike.disabled,
@@ -314,6 +345,7 @@ export function buildWidgetData(args: {
     unknownProviders,
     waitResumeOff,
     driftCount: page.drift.length,
+    modelOverlapCount: page.modelOverlaps.length,
     earliestReset: page.earliestReset,
     earliestResetIn: resetIn(page.earliestReset, nowMs),
   };

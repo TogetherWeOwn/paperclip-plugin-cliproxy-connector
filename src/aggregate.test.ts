@@ -219,6 +219,75 @@ describe("per-model aggregation", () => {
   });
 });
 
+describe("namespaced requested models (stock CLIProxy ids)", () => {
+  function devinRow(): AccountUsageRow {
+    return row({
+      provider: "devin",
+      channel: "devin",
+      limits: [
+        limit({ id: "devin:5h", label: "Devin 5h", observedAt: NOW }), // account-level
+        limit({
+          id: "devin:window",
+          label: "Devin window",
+          usedPercent: 100,
+          remainingPercent: 0,
+          resetsAt: iso(NOW_MS + 3_600_000),
+          limitReached: true,
+          allowed: false,
+          observedAt: NOW,
+          models: ["claude-opus-5-5"],
+        }),
+      ],
+    });
+  }
+
+  function devinAssess(model: string) {
+    const c = config();
+    return aggregateProvider({
+      provider: "devin",
+      model,
+      rows: [devinRow()],
+      completeInventory: true,
+      config: c,
+      now: NOW,
+    });
+  }
+
+  it("a namespaced request matches the bare model_quotas key", () => {
+    expect(devinAssess("devin/claude-opus-5-5").state).toBe("exhausted");
+  });
+
+  it("the bare form matches the same window", () => {
+    expect(devinAssess("claude-opus-5-5").state).toBe("exhausted");
+  });
+
+  it("other models route on the account-level window", () => {
+    expect(devinAssess("devin/other-model").state).toBe("allowed");
+    expect(devinAssess("other-model").state).toBe("allowed");
+  });
+
+  it("a foreign namespace never matches this provider's per-model window", () => {
+    // `other/x` must not match the `["x"]` window: no cross-provider match.
+    const r = row({
+      limits: [
+        limit({ observedAt: NOW }),
+        limit({
+          id: "claude:x",
+          usedPercent: 100,
+          remainingPercent: 0,
+          resetsAt: iso(NOW_MS + 3_600_000),
+          limitReached: true,
+          allowed: false,
+          observedAt: NOW,
+          models: ["x"],
+        }),
+      ],
+    });
+    const a = assess([r], { model: "other/x" });
+    expect(a.state).toBe("allowed");
+  });
+});
+
 describe("limiting verdict edges", () => {
   it("fresh limiting with no reset stays out (age-independent)", () => {
     const r = row({ limits: [limit({ remainingPercent: 0, usedPercent: 100, limitReached: true, resetsAt: null })] });

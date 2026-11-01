@@ -15,7 +15,7 @@
 export interface ProviderEntry {
   /** CLIProxy provider string, normalized lowercase (e.g. `claude`). */
   provider: string;
-  /** Paperclip connection id for this provider family (unprefixed models). */
+  /** Paperclip connection id for this provider family (stock model ids). */
   connectionId: string;
   /**
    * The operator confirms this provider has no hidden config-key credentials
@@ -34,6 +34,15 @@ export interface ConnectorConfig {
   managementKeyHeader: string;
   /** Paperclip `secret_ref` object for the management key. Never persisted. */
   managementSecretRef: unknown;
+  /**
+   * Board `secret_ref` for the CLIProxy *client* (non-management) API key,
+   * used only for `GET /v1/models` (served-model list for model → provider
+   * derivation). Resolved per run and never persisted, under the same
+   * loopback and `redirect:"manual"` rules as the management path. Optional
+   * for validation (missing → derivation and overlap detection stay off with
+   * a warning; quota aggregation still runs), required for full function.
+   */
+  clientApiKeySecretRef?: unknown;
   /** Sync cadence in minutes. The cron job runs every 5; larger values skip. */
   syncIntervalMinutes: number;
   /** Default reserve: providers at or below this remaining % are not headroom. */
@@ -139,6 +148,13 @@ export function parseConfig(raw: unknown): { config: ConnectorConfig; validation
     errors.push("managementSecretRef is required: board-created secret_ref for the CLIProxy management key.");
   } else if (typeof r.managementSecretRef !== "object") {
     errors.push("managementSecretRef must be the secret_ref object shape; legacy string UUIDs fail closed.");
+  }
+  if (r.clientApiKeySecretRef === undefined || r.clientApiKeySecretRef === null) {
+    warnings.push(
+      "clientApiKeySecretRef is not set: the plugin cannot fetch /v1/models, so model → provider derivation and overlap detection stay off (quota aggregation still runs). Add the board secret_ref for the CLIProxy client API key for full function.",
+    );
+  } else if (typeof r.clientApiKeySecretRef !== "object") {
+    errors.push("clientApiKeySecretRef must be the secret_ref object shape; legacy string UUIDs fail closed.");
   }
 
   const reservePercent = num(r.reservePercent, DEFAULTS.reservePercent);
@@ -276,6 +292,7 @@ export function parseConfig(raw: unknown): { config: ConnectorConfig; validation
     cliproxyBaseUrl,
     managementKeyHeader,
     managementSecretRef: r.managementSecretRef,
+    clientApiKeySecretRef: r.clientApiKeySecretRef ?? null,
     syncIntervalMinutes,
     reservePercent,
     perPoolReservePercent,

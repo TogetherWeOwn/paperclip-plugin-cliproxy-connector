@@ -108,6 +108,25 @@ export function CliProxyPage({ context }: PluginPageProps) {
         </button>
       </div>
       {data.earliestReset && <div>Earliest known reset: {data.earliestReset}</div>}
+      {data.modelsNote && (
+        <div style={{ background: "#78350f", color: "#fde68a", padding: 12, borderRadius: 6 }}>
+          Model catalog unavailable: {data.modelsNote} Overlap detection is off until the next successful
+          catalog fetch.
+        </div>
+      )}
+      {data.modelOverlaps.length > 0 && (
+        <div style={{ background: "#78350f", color: "#fde68a", padding: 12, borderRadius: 6 }}>
+          <strong>Overlapping models ({data.modelOverlaps.length})</strong> — served by more than one
+          provider, proven for none:
+          <ul>
+            {data.modelOverlaps.map((o) => (
+              <li key={o.id}>
+                <code>{o.id}</code>: {o.providers.join(", ")}
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
       {data.drift.length > 0 && (
         <div>
           <strong>Drift findings ({data.drift.length})</strong>
@@ -133,6 +152,15 @@ export function CliProxyPage({ context }: PluginPageProps) {
             {p.enabledAccounts} enabled account{p.enabledAccounts === 1 ? "" : "s"}
             {p.headroomAccounts > 0 ? `, ${p.headroomAccounts} with headroom` : ""}
             {p.retryAt ? ` · retry ${p.retryAt} (${p.retryIn})` : ""}
+          </div>
+          <div>
+            {p.models.length > 0 ? (
+              <span>
+                Proven models ({p.models.length}): <code>{p.models.join(", ")}</code>
+              </span>
+            ) : (
+              <span>No proven models yet — unknown until the model catalog confirms them.</span>
+            )}
           </div>
           <div>{p.reason}</div>
           {p.accounts.length > 0 && (

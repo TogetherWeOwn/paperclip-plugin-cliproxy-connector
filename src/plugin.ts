@@ -315,6 +315,9 @@ async function runCompanySync(
       companyId,
       now,
       resolveSecret: (ref) => ctx.secrets.resolve(ref as never, { companyId }),
+      // Same per-run, never-persisted rule as the management key: both
+      // secrets resolve inside the sync run and live in memory only.
+      resolveClientSecret: (ref) => ctx.secrets.resolve(ref as never, { companyId }),
       fetchImpl: ctx.http.fetch.bind(ctx.http),
       loadStrike: () => loadStrike(ctx, companyId, origin, legacyOrigin),
       saveStrike: (s) => saveStrike(ctx, origin, s),

@@ -16,12 +16,24 @@
  * - single-flight + minimum interval between runs.
  */
 
-import { CliproxyAuthError, CliproxyManagementClient, type ManagementFetch } from "./cliproxy.js";
+import {
+  CliproxyAuthError,
+  CliproxyClientApiClient,
+  CliproxyManagementClient,
+  type ManagementFetch,
+} from "./cliproxy.js";
 import type { ConnectorConfig, ProviderEntry } from "./config.js";
+import {
+  deriveProviderModels,
+  observedModelKeysByProvider,
+  parseModelsPayload,
+  type ServedModel,
+} from "./models.js";
 import { parseAuthFiles, type ParsedAccount } from "./parsers.js";
 import type {
   AccountUsageRow,
   DriftFinding,
+  ModelOverlap,
   StrikeBudgetState,
   SyncFailure,
   SyncSummary,
@@ -63,6 +75,11 @@ export interface SyncDeps {
   now: string;
   /** Resolve the management key from the secret_ref. Per run, memory only. */
   resolveSecret: (ref: unknown) => Promise<string>;
+  /**
+   * Resolve the client (non-management) API key from its secret_ref, for
+   * `GET /v1/models` only. Per run, memory only, same as the management key.
+   */
+  resolveClientSecret: (ref: unknown) => Promise<string>;
   fetchImpl?: ManagementFetch;
   loadStrike: () => Promise<StrikeBudgetState>;
   saveStrike: (s: StrikeBudgetState) => Promise<void>;
@@ -231,7 +248,41 @@ export async function runSync(deps: SyncDeps, inFlight: { running: boolean }): P
 
       const { rows, drift } = accountsToRows(byKey, deps.config.providers, unkeyed);
 
-      const errors = [...pluginErrors, ...warnings];
+      // Served-model catalog (best-effort): live `/v1/models` with the
+      // *client* key, intersected with the auth-file list. A failed or
+      // unconfigured catalog only disables derivation + overlap detection
+      // for this run — quota aggregation still proceeds. Client-key 401/403s
+      // are ordinary fetch failures here: they never touch the management
+      // strike budget (different key, no host lockout).
+      const catalog = await fetchModelCatalog(deps);
+      const derivation = deriveProviderModels(catalog.served, {
+        authProviders: [
+          ...new Set([
+            ...accounts.map((a) => a.provider),
+            ...deps.config.providers.map((p) => p.provider),
+          ]),
+        ],
+        observedKeysByProvider: observedModelKeysByProvider(accounts),
+      });
+      for (const overlap of derivation.overlaps) {
+        for (const provider of overlap.providers) {
+          drift.push({
+            kind: "model-overlap",
+            provider,
+            detail:
+              `model ${JSON.stringify(overlap.id)} is served by CLIProxy and maps to more than one provider ` +
+              `(${overlap.providers.join(", ")}); it is not counted as ${provider}'s proven model. ` +
+              `Quota still groups by auth-file provider. If this id comes from an openai-compat entry, ` +
+              `setting that entry's stock prefix field disambiguates it (optional).`,
+          });
+        }
+      }
+
+      const errors = [...pluginErrors, ...warnings, ...catalog.warnings, ...derivation.warnings];
+      const providerModels: Record<string, string[]> | undefined =
+        catalog.available ? derivation.providerModels : undefined;
+      const modelOverlaps: ModelOverlap[] | undefined =
+        catalog.available ? derivation.overlaps : undefined;
       for (const d of drift) {
         await deps.logActivity(`cliproxy-connector drift [${d.kind}] ${d.provider}: ${d.detail}`, {
           companyId: deps.companyId,
@@ -244,6 +295,8 @@ export async function runSync(deps: SyncDeps, inFlight: { running: boolean }): P
         rowsWritten: Object.keys(rows).length,
         drift,
         errors,
+        providerModels,
+        modelOverlaps,
       });
       await deps.saveSync(rows, result);
       // A success clears the last failure so the page stops showing it.
@@ -267,6 +320,71 @@ export async function runSync(deps: SyncDeps, inFlight: { running: boolean }): P
     }
   } finally {
     inFlight.running = false;
+  }
+}
+
+/**
+ * Fetch the served-model catalog for model → provider derivation. Always
+ * best-effort: any failure (or a missing client secret) returns `available:
+ * false` with a warning, and the sync proceeds without derivation. Client-key
+ * auth failures never reach the management strike budget.
+ */
+async function fetchModelCatalog(
+  deps: SyncDeps,
+): Promise<{ served: ServedModel[]; warnings: string[]; available: boolean }> {
+  const ref = deps.config.clientApiKeySecretRef;
+  if (ref === undefined || ref === null) {
+    return {
+      served: [],
+      warnings: [
+        "clientApiKeySecretRef is not set: skipping /v1/models; model → provider derivation and overlap detection stay off this run.",
+      ],
+      available: false,
+    };
+  }
+  let clientKey: string;
+  try {
+    clientKey = await deps.resolveClientSecret(ref);
+  } catch (err) {
+    return {
+      served: [],
+      warnings: [
+        `could not resolve the CLIProxy client API secret: ${err instanceof Error ? err.message : "unknown error"}; skipping /v1/models this run.`,
+      ],
+      available: false,
+    };
+  }
+  if (!clientKey) {
+    return {
+      served: [],
+      warnings: ["CLIProxy client API secret resolved empty; skipping /v1/models this run."],
+      available: false,
+    };
+  }
+  try {
+    const modelsClient = new CliproxyClientApiClient({
+      baseUrl: deps.config.cliproxyBaseUrl,
+      key: clientKey,
+      fetchImpl: deps.fetchImpl,
+    });
+    const payload = await modelsClient.getModels();
+    const parsed = parseModelsPayload(payload);
+    return {
+      served: parsed.models,
+      warnings: parsed.warnings.map((w) => `/v1/models: ${w}`),
+      available: true,
+    };
+  } catch (err) {
+    return {
+      served: [],
+      warnings: [
+        `/v1/models unavailable (${err instanceof Error ? err.message : "fetch failed"}); model → provider derivation skipped this run.`,
+      ],
+      available: false,
+    };
+  } finally {
+    // Drop the only in-memory reference to resolved client-key material.
+    clientKey = "";
   }
 }
 

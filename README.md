@@ -14,7 +14,11 @@ v1 per-account design.
 - **Sync job** (`cliproxy-sync`, cron `*/5 * * * *` + on-demand action): reads the CLIProxy
   account list (`auth-files`) grouped by provider, plus per-provider quota (plugin
   normalized `QuotaFetchResponse` routes), through the §4 safe path, and normalises them
-  into per-account rows in the plugin's own state namespace. No core changes, no fork.
+  into the plugin's own state namespace — one provider aggregate per `providers[]` row,
+  with discovered accounts kept as informational detail underneath. Each sync also fetches
+  the served model list (`GET /v1/models`, with the separate client API key) and derives
+  every provider's proven model ids from it together with the auth-file list. No core
+  changes, no fork.
   Config-key credentials (`claude-api-key`, `codex-api-key`, openai-compatibility, vertex)
   are invisible to `auth-files` — see `completeInventory` below.
 - **Router** (`ai.connections.route`): pure function over the cache. Each pool member
@@ -33,7 +37,17 @@ v1 per-account design.
   The page shows "wait/resume off: inventory not confirmed complete" until the operator
   confirms.
 
-## Setup (operator only, five lines of config)
+## Setup (operator only)
+
+The plugin works on a **stock** CLIProxy with no aliases or prefixes: it derives each
+provider's model list at every sync from the live served-model list plus the auth-file
+list. A connection's model list is its provider's stock ids — bare for Claude,
+Codex/OpenAI, Antigravity and Meta; `devin/…` for Devin (built into CLIProxy); the fixed
+plugin namespaces `synthetic/…`, `nvidia/…`, `cloudflare/…`, `zai/…`, `opencode-go/…`;
+`opencode-zen-free` (openai-compat) is bare unless its entry sets the stock `prefix`
+field. If one served id maps to more than one provider (likely `opencode-zen-free`'s
+bare ids), the page flags the overlap and the id counts as no provider's proven model;
+setting that openai-compat entry's `prefix` field is an optional operator-side fix.
 
 Agents must never call the CLIProxy management API; every key-bearing step below is run by
 the operator. You read redacted output only.
@@ -43,13 +57,18 @@ the operator. You read redacted output only.
    and `plugin.state.*` capabilities the manifest declares.
 2. Create a board Paperclip secret holding the CLIProxy **management** key (loopback only —
    the plugin validates this). Note its `secret_ref`.
-3. Create one Paperclip connection per CLIProxy provider family (unprefixed models), one
-   single-member pool per provider, and configure the company (plugin settings page):
+3. Create a second board secret holding a CLIProxy **client** (non-management) API key and
+   note its `secret_ref`. The plugin uses it only for `GET /v1/models`; the management key
+   is never sent to `/v1` paths. (Without it the sync still runs, but model → provider
+   derivation and overlap detection stay off.)
+4. Create one Paperclip connection per CLIProxy provider family (stock model ids, one
+   single-member pool per provider), and configure the company (plugin settings page):
    ```json
    {
      "cliproxyBaseUrl": "http://127.0.0.1:8317",
      "managementKeyHeader": "X-Management-Key",
      "managementSecretRef": { "uid": "<board secret uid>" },
+     "clientApiKeySecretRef": { "uid": "<board client-key secret uid>" },
      "providers": [{ "provider": "claude", "connectionId": "<connection-id>", "completeInventory": true }],
      "audienceConfirmed": true
    }
@@ -59,12 +78,12 @@ the operator. You read redacted output only.
    credentials (default `false`: the provider can only be `allowed`/`unknown`, never
    `exhausted`). `audienceConfirmed` acknowledges the page shows upstream account quota
    state (proposal §4.4).
-4. Add optional per-provider plugin quota routes (`pluginQuotaIds: { "claude": "<plugin id>" }`)
+5. Add optional per-provider plugin quota routes (`pluginQuotaIds: { "claude": "<plugin id>" }`)
    for the five quota plugins (Synthetic, NIM, Cloudflare, z.ai, opencode-go); without one,
    the provider routes on passive signals (or unknown).
-5. Confirm the sync ran (plugin page shows one card per provider), then run traffic — an
-   all-cooling provider shows `exhausted` with the earliest reset as `retryAt`, and core
-   wait/resume fires automatically.
+6. Confirm the sync ran (plugin page shows one card per provider with its proven models),
+   then run traffic — an all-cooling provider shows `exhausted` with the earliest reset as
+   `retryAt`, and core wait/resume fires automatically.
 
 ## Host contract (read honestly)
 
@@ -82,6 +101,7 @@ the operator. You read redacted output only.
 | `cliproxyBaseUrl` | — (required) | Loopback only (`localhost`, `127.0.0.1`, `::1`). |
 | `managementKeyHeader` | — (required) | Exact header name CLIProxy expects. No default. |
 | `managementSecretRef` | — (required) | `secret_ref` object. Never persisted, never leaves the worker. |
+| `clientApiKeySecretRef` | — (warns when missing) | `secret_ref` object for the client API key (`GET /v1/models`). Same never-persisted rule. Missing → derivation + overlap detection off. |
 | `syncIntervalMinutes` | `5` | The cron runs every 5 min; larger values make runs skip. Range 1–60. |
 | `reservePercent` | `10` | Default reserve; per-pool `thresholdPercent` derives `100 − t`. |
 | `perPoolReservePercent` | `{}` | Per-pool override, wins over everything. |
@@ -96,16 +116,20 @@ the operator. You read redacted output only.
 
 The management paths are pinned in code (`/v0/management/auth-files` and
 `/v0/management/plugins/<segment>/quota`) — there are deliberately no config knobs for
-them, and the key is never sent to `/v1` paths. If your CLIProxy build differs, change the
-pinned constants in `src/cliproxy.ts` — everything else follows.
+them, and the management key is never sent to `/v1` paths. The served-model list has its
+own pinned path (`/v1/models`, `MODELS_PATH`) fetched with the separate client API key
+(Bearer auth) under the same guarded-fetch rules (loopback, manual redirects, timeouts,
+caps, no key leaks); neither key can travel to the other's paths. If your CLIProxy build
+differs, change the pinned constants in `src/cliproxy.ts` — everything else follows.
 Exact live management JSON is still operator-captured (spike §8 item 8); parsers are
 defensive by design: unknown shapes become warnings + quota-blind rows, never headroom.
 The redacted `auth-files` fixture in tests mirrors the public CLIProxyAPI source shapes.
 
 ## Security properties (all tested)
 
-- Management key: resolved per sync run from `secret_ref`, in memory only, never persisted,
-  never in UI/agent/log surfaces (redaction tests prove it).
+- Management key and client API key: each resolved per sync run from its own `secret_ref`,
+  in memory only, never persisted, never in UI/agent/log surfaces (redaction tests prove
+  it). Client-key 401/403s never spend the management strike budget.
 - Safe path only: loopback base URL, key header attached after origin validation, GET-only
   allow-list, `api-call` excluded and un-admittable, manual redirects with revalidation
   (max 2, same-origin loopback), 15 s timeouts, 2 MB caps, schema-checked JSON.
@@ -128,10 +152,14 @@ npm run check   # typecheck + vitest + build (worker + UI bundle)
 ```
 
 Test files mirror the sources: `aggregate.test.ts` (truth table: allowed/unknown/exhausted,
-all-cooling earliest reset, mixed, stale, completeInventory gating, per-model),
-`router.test.ts` (1- and 2-member pools, pinned, earliest retryAt, missing-connection
-notes, host-contract shape), `sync.test.ts` (strike budget + `loopback:<port>` migration,
-drift, single-flight, best-effort plugin fetch, redaction), `parsers.test.ts` (header-map
-signals, model quotas, window gating, redacted auth-files fixture), `cliproxy.test.ts`
-(allow-list, redirects, caps, redaction), `config.test.ts`, `ui-data.test.ts`,
+all-cooling earliest reset, mixed, stale, completeInventory gating, per-model incl.
+namespaced/bare equivalence), `router.test.ts` (1- and 2-member pools, pinned, earliest
+retryAt, missing-connection notes, host-contract shape), `sync.test.ts` (strike budget +
+`loopback:<port>` migration, drift incl. `model-overlap`, single-flight, best-effort plugin
+fetch, best-effort `/v1/models` fetch that never spends strikes, redaction),
+`parsers.test.ts` (header-map signals, model quotas, window gating, redacted auth-files
+fixture, Devin quota grouped by auth-file provider), `models.test.ts` (served-list parsing,
+namespace-first attribution, Devin `owned_by: anthropic` case, colliding bare-id overlap),
+`cliproxy.test.ts` (management + client allow-lists, redirects, caps, redaction),
+`config.test.ts` (incl. the optional client-key `secret_ref`), `ui-data.test.ts`,
 `plugin.test.ts` (harness: job, data, actions, API routes).

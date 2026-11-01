@@ -21,6 +21,7 @@ const COMPANY_CONFIG = {
   cliproxyBaseUrl: "http://127.0.0.1:8317",
   managementKeyHeader: "X-Test-Key",
   managementSecretRef: { uid: "secret-1" },
+  clientApiKeySecretRef: { uid: "secret-client-1" },
   providers: [{ provider: "claude", connectionId: "conn-a1", completeInventory: true }],
   audienceConfirmed: true,
 };
@@ -54,6 +55,9 @@ function mockFetch() {
           },
         },
       ]);
+    }
+    if (url.pathname === "/v1/models") {
+      return jsonResponse(200, { data: [{ id: "claude-opus-4-5", owned_by: "anthropic" }] });
     }
     return new Response("not found", { status: 404 });
   });
