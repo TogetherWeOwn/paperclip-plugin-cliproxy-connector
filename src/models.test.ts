@@ -42,6 +42,16 @@ describe("parseModelsPayload", () => {
     expect(models).toEqual([]);
     expect(warnings).toEqual([]);
   });
+
+  it("still warns on an unrecognised shape even for per-file served-set fetches", () => {
+    // emptyIsValid suppresses the warning only when a list was found and is
+    // empty — a changed endpoint shape must never count silently as evidence.
+    for (const payload of [{}, null, "oops", { error: "boom" }]) {
+      const { models, warnings } = parseModelsPayload(payload, { emptyIsValid: true });
+      expect(models).toEqual([]);
+      expect(warnings).toHaveLength(1);
+    }
+  });
 });
 
 describe("namespaceOfModelId", () => {

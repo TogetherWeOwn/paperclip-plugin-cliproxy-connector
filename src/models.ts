@@ -77,15 +77,26 @@ export function parseModelsPayload(
   const warnings: string[] = [];
   const models: ServedModel[] = [];
   const root = asObj(payload);
-  const entries: unknown[] = Array.isArray(payload)
+  const list: unknown[] | undefined = Array.isArray(payload)
     ? payload
     : root
-      ? (["data", "models", "items", "results"]
+      ? ((["data", "models", "items", "results"]
           .map((k) => (root as Json)[k])
-          .find((v) => Array.isArray(v)) as unknown[]) ?? []
-      : [];
+          .find((v) => Array.isArray(v)) as unknown[] | undefined) ?? undefined)
+      : undefined;
+  const entries: unknown[] = list ?? [];
   if (entries.length === 0) {
-    if (!opts?.emptyIsValid) {
+    // Suppress the warning only when a list was actually found and is empty.
+    // An unrecognised shape (no list under data/models/items/results, or a
+    // non-object payload) still warns — with per-file wording when the caller
+    // opted into empty-is-valid — so a changed endpoint shape or a 200 with
+    // `{"error":...}` never counts silently as evidence.
+    if (list !== undefined && opts?.emptyIsValid) {
+      return { models, warnings };
+    }
+    if (opts?.emptyIsValid) {
+      warnings.push("served-set payload has no recognisable model list; no served evidence from this file this run.");
+    } else {
       warnings.push("models payload holds no entries; no provider has proven models this run.");
     }
     return { models, warnings };
