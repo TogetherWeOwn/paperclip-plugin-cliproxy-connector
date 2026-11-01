@@ -13,6 +13,7 @@ import type {
   PluginContext,
 } from "@paperclipai/plugin-sdk";
 import { parseConfig, stripTrailingSlashes, type ConnectorConfig } from "./config.js";
+import { createLoopbackFetch } from "./loopback-fetch.js";
 import {
   LAST_ERROR_STATE_KEY,
   LAST_SYNC_STATE_KEY,
@@ -318,7 +319,13 @@ async function runCompanySync(
       // Same per-run, never-persisted rule as the management key: both
       // secrets resolve inside the sync run and live in memory only.
       resolveClientSecret: (ref) => ctx.secrets.resolve(ref as never, { companyId }),
-      fetchImpl: ctx.http.fetch.bind(ctx.http),
+      // Worker-local loopback transport, not `ctx.http.fetch`: the host runs
+      // every plugin fetch through its SSRF guard, which refuses loopback —
+      // but this plugin requires a loopback `cliproxyBaseUrl`, so the host
+      // client can never reach it (TWO-749). The SDK allows direct Node fetch;
+      // the transport re-guards it (loopback-only, exact origin, GET-only,
+      // no auto-redirects) and every §4 rule above it is unchanged.
+      fetchImpl: createLoopbackFetch(config.cliproxyBaseUrl),
       loadStrike: () => loadStrike(ctx, companyId, origin, legacyOrigin),
       saveStrike: (s) => saveStrike(ctx, origin, s),
       loadRows: () => loadRows(ctx, companyId),

@@ -75,8 +75,8 @@ the operator. You read redacted output only.
    {
      "cliproxyBaseUrl": "http://127.0.0.1:8317",
      "managementKeyHeader": "X-Management-Key",
-     "managementSecretRef": { "uid": "<board secret uid>" },
-     "clientApiKeySecretRef": { "uid": "<board client-key secret uid>" },
+     "managementSecretRef": { "type": "secret_ref", "secretId": "<board secret id>", "version": "latest" },
+     "clientApiKeySecretRef": { "type": "secret_ref", "secretId": "<board client-key secret id>", "version": "latest" },
      "providers": [{ "provider": "claude", "connectionId": "<connection-id>", "completeInventory": true }],
      "audienceConfirmed": true
    }
@@ -108,8 +108,8 @@ the operator. You read redacted output only.
 |---|---|---|
 | `cliproxyBaseUrl` | — (required) | Loopback only (`localhost`, `127.0.0.1`, `::1`). |
 | `managementKeyHeader` | — (required) | Exact header name CLIProxy expects. No default. |
-| `managementSecretRef` | — (required) | `secret_ref` object. Never persisted, never leaves the worker. |
-| `clientApiKeySecretRef` | — (warns when missing) | `secret_ref` object for the client API key (`GET /v1/models`). Same never-persisted rule. Missing → derivation + overlap detection off. |
+| `managementSecretRef` | — (required) | `secret_ref` object (`{ "type": "secret_ref", "secretId": "…", "version": "latest" }`). Never persisted, never leaves the worker. |
+| `clientApiKeySecretRef` | — (warns when missing) | `secret_ref` object (same shape) for the client API key (`GET /v1/models`). Same never-persisted rule. Missing → derivation + overlap detection off. |
 | `syncIntervalMinutes` | `5` | The cron runs every 5 min; larger values make runs skip. Range 1–60. |
 | `reservePercent` | `10` | Default reserve; per-pool `thresholdPercent` derives `100 − t`. |
 | `perPoolReservePercent` | `{}` | Per-pool override, wins over everything. |
@@ -141,7 +141,10 @@ The redacted `auth-files` fixture in tests mirrors the public CLIProxyAPI source
   it). Client-key 401/403s never spend the management strike budget.
 - Safe path only: loopback base URL, key header attached after origin validation, GET-only
   allow-list, `api-call` excluded and un-admittable, manual redirects with revalidation
-  (max 2, same-origin loopback), 15 s timeouts, 2 MB caps, schema-checked JSON.
+  (max 2, same-origin loopback), 15 s timeouts, 2 MB caps, schema-checked JSON. The worker
+  fetches through its own guarded loopback transport (Node fetch, never the host client —
+  the host SSRF guard refuses loopback); the transport re-checks loopback-only, exact
+  origin, GET-only and no auto-redirects per request.
 - Strike budget (host-wide): first 401/403 stops the run and marks the secret bad; sync
   never re-probes while the secret is marked bad. A 2nd auth failure per rolling 30 min
   hard-disables sync until explicit board re-enable (`reenable` route/action, board users
@@ -170,5 +173,7 @@ fetch, best-effort `/v1/models` fetch that never spends strikes, redaction),
 fixture, Devin quota grouped by auth-file provider), `models.test.ts` (served-list parsing,
 namespace-first attribution, Devin `owned_by: anthropic` case, colliding bare-id overlap),
 `cliproxy.test.ts` (management + client allow-lists, redirects, caps, redaction),
+`loopback-fetch.test.ts` (worker-local loopback transport: off-loopback/off-origin/non-GET
+refused, no auto-redirects, composition with the client),
 `config.test.ts` (incl. the optional client-key `secret_ref`), `ui-data.test.ts`,
 `plugin.test.ts` (harness: job, data, actions, API routes).

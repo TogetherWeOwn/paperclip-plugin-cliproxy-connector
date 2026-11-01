@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { createTestHarness } from "@paperclipai/plugin-sdk/testing";
 import manifest, {
   LAST_SYNC_STATE_KEY,
@@ -68,14 +68,27 @@ async function setup(config: Record<string, unknown> = COMPANY_CONFIG) {
   harness.seed({ companies: [{ id: COMPANY }] as never });
   await plugin.definition.setup(harness.ctx);
   harness.ctx.secrets.resolve = (async () => KEY) as never;
-  harness.ctx.http.fetch = mockFetch() as never;
-  return harness;
+  // TWO-749: the worker syncs through the worker-local loopback transport
+  // (Node global fetch, guarded in loopback-fetch.ts), never through
+  // `ctx.http.fetch` — so the harness stubs the global instead.
+  const fetchMock = mockFetch();
+  vi.stubGlobal("fetch", fetchMock);
+  return { harness, fetchMock };
 }
+
+afterEach(() => {
+  vi.unstubAllGlobals();
+});
 
 describe("sync job", () => {
   it("writes usage rows keyed acct-<hash> and a sync summary to plugin state", async () => {
-    const harness = await setup();
+    const { harness, fetchMock } = await setup();
     await harness.runJob(SYNC_JOB_KEY);
+    // The worker reaches the loopback origin through the worker-local
+    // transport (TWO-749), never through the host SSRF-guarded client.
+    expect(String((fetchMock.mock.calls[0] as unknown[])[0])).toBe(
+      "http://127.0.0.1:8317/v0/management/auth-files",
+    );
     const rows = harness.getState(stateKey(ROWS_STATE_KEY)) as Record<string, AccountUsageRow>;
     const keys = Object.keys(rows);
     expect(keys).toHaveLength(1);
@@ -87,14 +100,13 @@ describe("sync job", () => {
   });
 
   it("skips without probing when the company config is invalid", async () => {
-    const harness = await setup({ cliproxyBaseUrl: "https://x.example" });
-    const fetch = harness.ctx.http.fetch as unknown as ReturnType<typeof mockFetch>;
+    const { harness, fetchMock } = await setup({ cliproxyBaseUrl: "https://x.example" });
     await harness.runJob(SYNC_JOB_KEY);
-    expect(fetch).not.toHaveBeenCalled();
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 
   it("persists the skipped summary so the page surfaces the config error", async () => {
-    const harness = await setup({ cliproxyBaseUrl: "https://x.example" });
+    const { harness } = await setup({ cliproxyBaseUrl: "https://x.example" });
     await harness.runJob(SYNC_JOB_KEY);
     const summary = harness.getState(stateKey(LAST_SYNC_STATE_KEY)) as { skipped: boolean; errors: string[] };
     expect(summary.skipped).toBe(true);
@@ -102,7 +114,7 @@ describe("sync job", () => {
   });
 
   it("serves page and widget data from the cache", async () => {
-    const harness = await setup();
+    const { harness } = await setup();
     await harness.runJob(SYNC_JOB_KEY);
     const page = await harness.getData<{ providers: Array<{ provider: string }> }>(PAGE_DATA_KEY, {
       companyId: COMPANY,
@@ -113,7 +125,7 @@ describe("sync job", () => {
   });
 
   it("resync action re-runs the sync; re-enable action clears strikes", async () => {
-    const harness = await setup();
+    const { harness } = await setup();
     const summary = await harness.performAction<{ skipped: boolean }>(
       RESYNC_ACTION_KEY,
       {},
@@ -129,7 +141,7 @@ describe("sync job", () => {
   });
 
   it("re-enable action rejects non-board actors (M3)", async () => {
-    const harness = await setup();
+    const { harness } = await setup();
     for (const actor of [
       { type: "agent", agentId: "a-1" },
       { type: "system" },
@@ -144,8 +156,8 @@ describe("sync job", () => {
   });
 
   it("a 401 during the job writes the budget to the instance-scoped loopback bucket (M1)", async () => {
-    const harness = await setup();
-    harness.ctx.http.fetch = (async () => new Response("nope", { status: 401 })) as never;
+    const { harness } = await setup();
+    vi.stubGlobal("fetch", (async () => new Response("nope", { status: 401 })) as never);
     await harness.runJob(SYNC_JOB_KEY);
     const strike = harness.getState(instanceStrikeKey()) as { failures: string[]; secretBad: boolean } | null;
     expect(strike).not.toBeNull();
@@ -156,7 +168,7 @@ describe("sync job", () => {
 
 describe("config validation and health", () => {
   it("accepts the connector config and rejects insecure ones", async () => {
-    const harness = await setup();
+    const { harness } = await setup();
     void harness;
     expect(await plugin.definition.onValidateConfig!(COMPANY_CONFIG)).toMatchObject({ ok: true });
     const bad = await plugin.definition.onValidateConfig!({
@@ -175,7 +187,7 @@ describe("config validation and health", () => {
 
 describe("board re-enable API route", () => {
   it("clears a spent strike budget and rejects unknown routes", async () => {
-    const harness = await setup();
+    const { harness } = await setup();
     // Legacy company-scoped key: the route adopts it into the instance-scoped
     // loopback bucket once, then deletes the legacy key.
     const strikeKey = { ...stateKey(STRIKE_STATE_KEY), namespace: "cliproxy-connector" };
@@ -229,7 +241,7 @@ describe("strike keying on loopback:<port> (Security Engineer nit)", () => {
   });
 
   it("adopts the pre-port-migration origin-format key without resetting the budget", async () => {
-    const harness = await setup();
+    const { harness, fetchMock } = await setup();
     // Legacy origin-format bucket from before the port-keying migration.
     const legacyKey = {
       scopeKind: "instance" as const,
@@ -245,7 +257,7 @@ describe("strike keying on loopback:<port> (Security Engineer nit)", () => {
     } as never);
     await harness.runJob(SYNC_JOB_KEY);
     // Spent budget carried forward — the sync still refuses to probe.
-    expect(harness.ctx.http.fetch).not.toHaveBeenCalled();
+    expect(fetchMock).not.toHaveBeenCalled();
     expect(harness.getState(legacyKey)).toBeUndefined();
     const adopted = harness.getState(instanceStrikeKey()) as { disabled: boolean } | null;
     expect(adopted?.disabled).toBe(true);
