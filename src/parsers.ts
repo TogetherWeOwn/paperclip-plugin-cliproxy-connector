@@ -95,10 +95,10 @@ export function toIsoTimestamp(v: unknown): string | null {
  * Emails become `[redacted-email]`; any whitespace-delimited token that
  * looks credential-like — a 20+ word-char run, or 8+ chars mixing letters
  * with digits (short API keys, session ids) — becomes `[redacted]`. Tokens
- * with operational shapes (timestamps, versions, `k=v` pairs, lowercase
- * hyphenated slugs like model ids) pass through so the page keeps reset
- * times and model names. The note is capped at 120 chars. Plain notes
- * ("ok", "429 rate limited") pass through unchanged.
+ * with operational shapes (timestamps, versions, benign `k=v` pairs like
+ * `error=429`, lowercase hyphenated slugs like model ids) pass through so
+ * the page keeps reset times and model names. The note is capped at
+ * 120 chars. Plain notes ("ok", "429 rate limited") pass through unchanged.
  */
 export function sanitizeStatusMessage(raw: string | null): string | null {
   if (!raw) return null;
@@ -114,9 +114,7 @@ export function sanitizeStatusMessage(raw: string | null): string | null {
       // periods ("for gpt-4o-mini, retry"), which must not defeat the
       // operational-shape exemption.
       const core = tok.replace(/^[^A-Za-z0-9]+/, "").replace(/[^A-Za-z0-9]+$/, "");
-      if (core.length >= 8 && /[A-Za-z]/.test(core) && /[0-9]/.test(core) && !isOperationalToken(core)) {
-        return "[redacted]";
-      }
+      if (isCredentialCore(core)) return "[redacted]";
       return tok;
     })
     .join(" ");
@@ -126,14 +124,46 @@ export function sanitizeStatusMessage(raw: string | null): string | null {
 
 /**
  * A letter+digit token that is operational, not a credential: timestamps,
- * versions, URLs and `k=v` pairs (punctuation that bare keys/session ids
- * almost never contain), and lowercase hyphenated slugs with only isolated
- * digits (`gpt-4o-mini`, `claude-sonnet-4-5` model ids). `sk-live-abc123`
- * still redacts: its `123` run breaks the slug shape.
+ * versions and URLs (punctuation bare keys/session ids almost never
+ * contain), `k=v` pairs whose value is not itself credential-shaped
+ * (`error=429` keeps; `token=ab12cd34ef` redacts), and lowercase hyphenated
+ * slugs without credential tells (`gpt-4o-mini`, `claude-sonnet-4-5` model
+ * ids pass; `sk-live-abc123` and `sk-live-a1b2c3d4` still redact).
  */
 function isOperationalToken(tok: string): boolean {
-  if (/[/:=\.]/.test(tok)) return true;
-  return /^[a-z]+(-[a-z0-9]+)+$/.test(tok) && !/\d{2,}/.test(tok);
+  const eq = tok.lastIndexOf("=");
+  if (eq >= 0) return !isCredentialCore(tok.slice(eq + 1));
+  if (/[/:.]/.test(tok)) return true;
+  return isSlugLike(tok);
+}
+
+/** 8+ chars mixing letters with digits: a short key/session id shape. */
+function isCredentialCore(core: string): boolean {
+  return (
+    core.length >= 8 &&
+    /[A-Za-z]/.test(core) &&
+    /[0-9]/.test(core) &&
+    !isOperationalToken(core)
+  );
+}
+
+/**
+ * Lowercase hyphenated slug (`gpt-4o-mini`) that is not credential-shaped.
+ * Credentials hide in slugs two ways: a trailing digit run (`abc123`) and
+ * interleaved alphanumerics (`a1b2c3d4`, three or more letter/digit flips).
+ * Model ids have neither (single isolated digits: `4o`, `70b`, `4`, `5`).
+ */
+function isSlugLike(core: string): boolean {
+  if (!/^[a-z]+(-[a-z0-9]+)+$/.test(core)) return false;
+  if (/\d{2,}$/.test(core)) return false;
+  let flips = 0;
+  const cls = (c: string) => (/[A-Za-z]/.test(c) ? "L" : /[0-9]/.test(c) ? "D" : "O");
+  for (let i = 1; i < core.length; i++) {
+    const a = cls(core[i - 1] as string);
+    const b = cls(core[i] as string);
+    if ((a === "L" && b === "D") || (a === "D" && b === "L")) flips += 1;
+  }
+  return flips < 3;
 }
 
 /** Opaque sha256 of an upstream account identity. Null when there is nothing to hash. */

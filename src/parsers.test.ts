@@ -544,6 +544,14 @@ describe("sanitizeStatusMessage", () => {
     expect(scrubbed).not.toContain("sk-live-abc123");
     expect(scrubbed).toContain("[redacted]");
   });
+
+  it("redacts credential-shaped k=v values and interleaved-alphanumeric slugs", () => {
+    const scrubbed = sanitizeStatusMessage("retry token=ab12cd34ef with sk-live-a1b2c3d4 for llama-3-3-70b") ?? "";
+    expect(scrubbed).not.toContain("token=ab12cd34ef");
+    expect(scrubbed).not.toContain("sk-live-a1b2c3d4");
+    expect(scrubbed).toContain("llama-3-3-70b");
+    expect(scrubbed).toContain("[redacted]");
+  });
 });
 
 describe("hashIdentity redaction", () => {
