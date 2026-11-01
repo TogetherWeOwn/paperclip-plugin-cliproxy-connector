@@ -996,3 +996,96 @@ describe("auth-file name hygiene (TWO-689)", () => {
     assertNoKeyLeak(s);
   });
 });
+
+describe("auth-file name hygiene, redirects (TWO-689 cross-review)", () => {
+  const EMAIL = "antigravity-user@example.com.json";
+  // A hostile same-origin Location whose pathname smuggles the auth-file name.
+  const hostileLocation = `/v0/management/auth-files/${EMAIL}`;
+
+  function configOneProvider() {
+    return parseConfig({
+      ...baseConfigRaw(),
+      providers: [{ provider: "antigravity", connectionId: "conn-ag", completeInventory: true }],
+      pluginQuotaIds: {},
+    }).config;
+  }
+
+  it("a hostile served-set redirect cannot smuggle the file name into warnings", async () => {
+    const fetchRedirect = vi.fn(async (input: string | URL | Request): Promise<Response> => {
+      const url = new URL(String(input));
+      if (url.pathname === "/v0/management/auth-files") {
+        return jsonResponse(200, [{ id: "ag-1", name: EMAIL, provider: "antigravity" }]);
+      }
+      if (url.pathname === "/v0/management/auth-files/models") {
+        return new Response(null, { status: 302, headers: { location: hostileLocation } });
+      }
+      return new Response("not found", { status: 404 });
+    });
+    const s = store();
+    const d = deps(s, fetchRedirect as unknown as typeof fetch);
+    d.config = configOneProvider();
+    const summary = await runSync(d, { running: false });
+    expect(summary.skipped).toBe(false); // best-effort per-file warning
+    expect(summary.errors.some((e) => e.includes("refusing to follow"))).toBe(true);
+    const rows = s.savedRows as Record<string, AccountUsageRow>;
+    const page = buildPageData({
+      now: NOW,
+      config: d.config,
+      rows,
+      lastSync: summary,
+      strike: s.strike,
+      lastFailure: s.failure,
+    });
+    const widget = buildWidgetData({
+      now: NOW,
+      config: d.config,
+      rows,
+      lastSync: summary,
+      strike: s.strike,
+      lastFailure: s.failure,
+    });
+    const blob = JSON.stringify([summary, s.activity, rows, page, widget]);
+    expect(blob).not.toContain(EMAIL);
+    expect(blob).not.toContain("example.com");
+    expect(blob).toMatch(/target sha256:[0-9a-f]{16}/);
+    assertNoKeyLeak(s);
+  });
+
+  it("a hostile redirect on the auth-files fetch stays out of failure surfaces", async () => {
+    const fetchRedirect = vi.fn(async (input: string | URL | Request): Promise<Response> => {
+      const url = new URL(String(input));
+      if (url.pathname === "/v0/management/auth-files") {
+        return new Response(null, { status: 302, headers: { location: hostileLocation } });
+      }
+      return new Response("not found", { status: 404 });
+    });
+    const s = store();
+    const d = deps(s, fetchRedirect as unknown as typeof fetch);
+    d.config = configOneProvider();
+    const summary = await runSync(d, { running: false });
+    expect(summary.skipped).toBe(true);
+    expect(s.failure?.message).toMatch(/refusing to follow/);
+    expect(s.activity.some((a) => a.message.includes("refusing to follow"))).toBe(true);
+    const page = buildPageData({
+      now: NOW,
+      config: d.config,
+      rows: {},
+      lastSync: null,
+      strike: s.strike,
+      lastFailure: s.failure,
+    });
+    const widget = buildWidgetData({
+      now: NOW,
+      config: d.config,
+      rows: {},
+      lastSync: null,
+      strike: s.strike,
+      lastFailure: s.failure,
+    });
+    const blob = JSON.stringify([summary, s.failure, s.activity, page, widget]);
+    expect(blob).not.toContain(EMAIL);
+    expect(blob).not.toContain("example.com");
+    expect(blob).toMatch(/target sha256:[0-9a-f]{16}/);
+    assertNoKeyLeak(s);
+  });
+});
