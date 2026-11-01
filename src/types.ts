@@ -1,10 +1,14 @@
 /**
- * Domain types for plugin-cliproxy-connector.
+ * Domain types for plugin-cliproxy-connector v2 (per-provider).
  *
- * Field names on the cached usage rows deliberately mirror
- * `shared/ai-connection-usage.d.ts` (`AiConnectionUsage` / `AiConnectionUsageLimit`)
- * so serving them through the eventual upstream core hook (proposal §5, push or
- * pull shape) is a format no-op.
+ * The sync discovers CLIProxy accounts from `auth-files` and stores one
+ * informational row per account. Routing aggregates those rows per provider
+ * (and per requested model where CLIProxy reports per-model state) into a
+ * single `allowed | exhausted | unknown` verdict. Field names on the cached
+ * quota rows deliberately mirror `shared/ai-connection-usage.d.ts`
+ * (`AiConnectionUsage` / `AiConnectionUsageLimit`) so serving them through
+ * the eventual upstream core hook (proposal §5, push or pull shape) is a
+ * format no-op.
  */
 
 /** One normalized quota window on a cached per-account row. */
@@ -38,6 +42,12 @@ export interface UsageLimitRow {
    * (fail-open candidate), never as proof of health or exhaustion.
    */
   observedAt?: string | null;
+  /**
+   * Lowercased model names this window's signal applies to, or `null` when the
+   * signal is account-level and applies to every model. Sourced from
+   * CLIProxy's per-model quota observations (`model_quotas` keyed by model).
+   */
+  models?: string[] | null;
 }
 
 /**
@@ -47,22 +57,32 @@ export interface UsageLimitRow {
  */
 export type Freshness = "fresh" | "stale" | "expired" | "missing";
 
-/** Cached per-account usage row, one per CLIProxy prefix. */
+/** Per-account lifecycle state as reconciled by CLIProxy (informational). */
+export type AccountStatus = "active" | "cooling" | "error" | "disabled";
+
+/** Cached per-account usage row, one per discovered CLIProxy account. */
 export interface AccountUsageRow {
-  /** CLIProxy per-credential prefix, e.g. `acct-claude-2`. Also the map key. */
-  prefix: string;
-  /** Paperclip connection id from the operator-maintained map. */
-  connectionId: string | null;
-  /** Provider family for parser selection, e.g. `claude`, `synthetic`. */
+  /**
+   * Stable row key: `acct-<sha256[0..16]>` over the entry's stable identity
+   * (`id`, else `path`, else provider+label+email). Never a raw identifier.
+   */
+  key: string;
+  /** CLIProxy provider string, normalized lowercase, e.g. `claude`. */
   provider: string;
-  /** Protocol family pool this account joins: `messages` | `responses`. */
-  poolFamily: "messages" | "responses" | "unknown";
+  /** Raw provider word from the entry, for UI labels. */
+  channel: string;
+  /** Lifecycle state; `disabled` rows are excluded from aggregation. */
+  status: AccountStatus;
+  /** CLIProxy `status_message`, when present (operational note, never a key). */
+  statusMessage: string | null;
+  /** Account priority from the entry (`priority`), when exposed. */
+  priority: number | null;
   limits: UsageLimitRow[];
   /** Plan label from the provider payload, when present (display only). */
   planType: string | null;
   /**
    * ISO time the sync fetched this row (cache age). Drives the bounded
-   * fail-open / fail-closed when sync dies. Per-window observation age lives
+   * fail-open / then-unknown when sync dies. Per-window observation age lives
    * on each limit's `observedAt` — an idle account's passive observation can
    * be hours old while its cache row is minutes old.
    */
@@ -77,11 +97,14 @@ export interface AccountUsageRow {
   accountHash: string | null;
   /** Last error for this account (fetch/parse), if any. Never holds the key. */
   lastError: string | null;
-  /** True when a 429/cooldown state was observed for this account. */
+  /** True when an unavailable/cooldown state was observed for this account. */
   coolingDown: boolean;
-  /** ISO time a 429-driven cooldown lifts, when the provider reports one. */
+  /** ISO time a cooldown lifts, when the provider reports one. */
   cooldownUntil: string | null;
 }
+
+/** Aggregate routing state for one provider (and requested model). */
+export type ProviderState = "allowed" | "exhausted" | "unknown";
 
 /** Strike-budget state. Persisted in plugin state, never derived from config. */
 export interface StrikeBudgetState {
@@ -97,14 +120,22 @@ export interface StrikeBudgetState {
   secretBad: boolean;
 }
 
-/** Drift finding from one sync run. */
+/** One served model id claimed by more than one provider (lowercased). */
+export interface ModelOverlap {
+  id: string;
+  /** Sorted provider words that all plausibly serve it. */
+  providers: string[];
+}
+
+/** Drift finding from one sync run (per provider, never per account). */
 export interface DriftFinding {
   kind:
-    | "unmapped-account"
-    | "mapped-but-missing"
-    | "duplicate-prefix"
-    | "unkeyed-observation";
-  prefix: string;
+    | "unconfigured-provider"
+    | "missing-connection"
+    | "no-enabled-accounts"
+    | "model-overlap";
+  /** Provider the finding is about (normalized lowercase). */
+  provider: string;
   detail: string;
 }
 
@@ -131,4 +162,13 @@ export interface SyncSummary {
   errors: string[];
   skipped: boolean;
   skipReason: string | null;
+  /**
+   * Proven served-model ids per provider from this run's `/v1/models` +
+   * auth-file derivation (lowercased). Absent when the catalog was
+   * unavailable (missing client key or failed fetch); the page then says
+   * overlap detection is off instead of showing stale lists.
+   */
+  providerModels?: Record<string, string[]>;
+  /** Overlapping served ids from this run (excluded from every proven list). */
+  modelOverlaps?: ModelOverlap[];
 }

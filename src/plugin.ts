@@ -12,7 +12,7 @@ import type {
   PluginApiResponse,
   PluginContext,
 } from "@paperclipai/plugin-sdk";
-import { parseConfig, type ConnectorConfig } from "./config.js";
+import { parseConfig, stripTrailingSlashes, type ConnectorConfig } from "./config.js";
 import {
   LAST_ERROR_STATE_KEY,
   LAST_SYNC_STATE_KEY,
@@ -41,20 +41,30 @@ function key(companyId: string, stateKey: string): CompanyStateKey {
 }
 
 /**
- * Normalise a CLIProxy base URL to its origin for strike-budget keying.
- * The CLIProxy lockout (5 bad keys = 30 min ban) is host-wide per origin,
- * so every company pointing at the same origin draws from ONE budget.
+ * Normalise a CLIProxy base URL to its loopback port for strike-budget keying.
+ * The CLIProxy lockout (5 bad keys = 30 min ban) is host-wide per origin, so
+ * every company pointing at the same CLIProxy draws from ONE budget — and
+ * every loopback spelling of that CLIProxy (`127.0.0.1`, `localhost`, `::1`)
+ * must share it. Keying on the effective port (not the host string) gives one
+ * bucket per local CLIProxy whatever the spelling.
  */
 export function normaliseStrikeOrigin(cliproxyBaseUrl: string): string {
   try {
-    return new URL(cliproxyBaseUrl).origin;
+    const url = new URL(cliproxyBaseUrl);
+    const port = url.port || (url.protocol === "https:" ? "443" : "80");
+    return `loopback:${port}`;
   } catch {
-    return cliproxyBaseUrl.trim().replace(/\/+$/, "");
+    return `loopback:${stripTrailingSlashes(cliproxyBaseUrl.trim())}`;
   }
 }
 
-function strikeKey(origin: string): InstanceStateKey {
+/** Pre-port-migration key format (`https://host:port` origin strings). Adopted once, then deleted. */
+function legacyOriginKey(origin: string): InstanceStateKey {
   return { scopeKind: "instance", namespace: STATE_NAMESPACE, stateKey: `${STRIKE_STATE_KEY}:${origin}` };
+}
+
+function strikeKey(bucket: string): InstanceStateKey {
+  return { scopeKind: "instance", namespace: STATE_NAMESPACE, stateKey: `${STRIKE_STATE_KEY}:${bucket}` };
 }
 
 function isStrikeBudget(raw: unknown): raw is StrikeBudgetState {
@@ -64,16 +74,29 @@ function isStrikeBudget(raw: unknown): raw is StrikeBudgetState {
 async function loadStrike(
   ctx: PluginContext,
   companyId: string,
+  bucket: string,
   origin: string,
 ): Promise<StrikeBudgetState> {
-  const raw = await ctx.state.get(strikeKey(origin));
+  const raw = await ctx.state.get(strikeKey(bucket));
   if (isStrikeBudget(raw)) return raw;
-  // One-time adoption of the pre-host-wide-budget company-scoped key: carry a
-  // spent budget forward so upgrading the plugin cannot reset it and allow
-  // extra probes. The legacy key is deleted after adoption.
+  // One-time adoption of the pre-port-key origin-format key: carry a spent
+  // budget forward so the keying migration cannot reset it and allow extra
+  // probes. The legacy key is deleted after adoption.
+  const legacyOrigin = await ctx.state.get(legacyOriginKey(origin));
+  if (isStrikeBudget(legacyOrigin)) {
+    await ctx.state.set(strikeKey(bucket), legacyOrigin);
+    try {
+      await ctx.state.delete(legacyOriginKey(origin));
+    } catch {
+      /* best-effort: the legacy key is never read again once adopted */
+    }
+    return legacyOrigin;
+  }
+  // One-time adoption of the pre-host-wide-budget company-scoped key: same
+  // carry-forward, then delete.
   const legacy = await ctx.state.get(key(companyId, STRIKE_STATE_KEY));
   if (isStrikeBudget(legacy)) {
-    await ctx.state.set(strikeKey(origin), legacy);
+    await ctx.state.set(strikeKey(bucket), legacy);
     try {
       await ctx.state.delete(key(companyId, STRIKE_STATE_KEY));
     } catch {
@@ -90,6 +113,15 @@ async function saveStrike(ctx: PluginContext, origin: string, s: StrikeBudgetSta
 
 function strikeOriginFor(config: ConnectorConfig): string {
   return normaliseStrikeOrigin(config.cliproxyBaseUrl);
+}
+
+/** Pre-port-migration origin string for one-time key adoption. */
+function legacyOriginFor(config: ConnectorConfig): string {
+  try {
+    return new URL(config.cliproxyBaseUrl).origin;
+  } catch {
+    return stripTrailingSlashes(config.cliproxyBaseUrl.trim());
+  }
 }
 
 async function loadRows(ctx: PluginContext, companyId: string): Promise<Record<string, AccountUsageRow>> {
@@ -158,10 +190,11 @@ const plugin = definePlugin({
       const companyId = String((params as Record<string, unknown>).companyId ?? "");
       const config = await resolveCompany(ctx, companyId).then((r) => r.config);
       const origin = strikeOriginFor(config);
+      const legacyOrigin = legacyOriginFor(config);
       const [rows, lastSync, strike, lastFailure] = await Promise.all([
         loadRows(ctx, companyId),
         loadLastSync(ctx, companyId),
-        loadStrike(ctx, companyId, origin),
+        loadStrike(ctx, companyId, origin, legacyOrigin),
         loadLastFailure(ctx, companyId),
       ]);
       return buildWidgetData({ now: new Date().toISOString(), config, rows, lastSync, strike, lastFailure });
@@ -187,8 +220,9 @@ const plugin = definePlugin({
       const userId = context?.actor?.userId ?? "unknown";
       const { config } = await resolveCompany(ctx, companyId);
       const origin = strikeOriginFor(config);
+      const legacyOrigin = legacyOriginFor(config);
       const next = await reenableAfterStrike(
-        () => loadStrike(ctx, companyId, origin),
+        () => loadStrike(ctx, companyId, origin, legacyOrigin),
         (s) => saveStrike(ctx, origin, s),
         new Date().toISOString(),
       );
@@ -219,8 +253,9 @@ const plugin = definePlugin({
       const ctx = boundCtx;
       const { config } = await resolveCompany(ctx, companyId);
       const origin = strikeOriginFor(config);
+      const legacyOrigin = legacyOriginFor(config);
       const next = await reenableAfterStrike(
-        () => loadStrike(ctx, companyId, origin),
+        () => loadStrike(ctx, companyId, origin, legacyOrigin),
         (s) => saveStrike(ctx, origin, s),
         new Date().toISOString(),
       );
@@ -273,14 +308,18 @@ async function runCompanySync(
   // Host-wide budget: every company targeting the same CLIProxy origin draws
   // from one instance-scoped bucket (the CLIProxy lockout bans the host).
   const origin = strikeOriginFor(config);
+  const legacyOrigin = legacyOriginFor(config);
   return runSync(
     {
       config,
       companyId,
       now,
       resolveSecret: (ref) => ctx.secrets.resolve(ref as never, { companyId }),
+      // Same per-run, never-persisted rule as the management key: both
+      // secrets resolve inside the sync run and live in memory only.
+      resolveClientSecret: (ref) => ctx.secrets.resolve(ref as never, { companyId }),
       fetchImpl: ctx.http.fetch.bind(ctx.http),
-      loadStrike: () => loadStrike(ctx, companyId, origin),
+      loadStrike: () => loadStrike(ctx, companyId, origin, legacyOrigin),
       saveStrike: (s) => saveStrike(ctx, origin, s),
       loadRows: () => loadRows(ctx, companyId),
       loadLastSync: () => loadLastSync(ctx, companyId),
@@ -300,10 +339,11 @@ async function runCompanySync(
 async function pageData(ctx: PluginContext, companyId: string, now: string) {
   const config = await resolveCompany(ctx, companyId).then((r) => r.config);
   const origin = strikeOriginFor(config);
+  const legacyOrigin = legacyOriginFor(config);
   const [rows, lastSync, strike, lastFailure] = await Promise.all([
     loadRows(ctx, companyId),
     loadLastSync(ctx, companyId),
-    loadStrike(ctx, companyId, origin),
+    loadStrike(ctx, companyId, origin, legacyOrigin),
     loadLastFailure(ctx, companyId),
   ]);
   return buildPageData({ now, config, rows, lastSync, strike, lastFailure });
@@ -324,9 +364,14 @@ export function toRouterCandidates(
       binding?: { connectionId?: string };
     };
     const binding = (member.binding ?? {}) as { connectionId?: string };
+    const runtime = (c.runtimeConfig ?? {}) as { model?: unknown };
+    // Requested model: the task's runtime model wins (per-model quota where
+    // CLIProxy reports it), falling back to the member profile model.
+    const requested =
+      typeof runtime.model === "string" && runtime.model ? runtime.model : member.profile?.model;
     return {
       memberId: String(member.id ?? ""),
-      model: String(member.profile?.model ?? ""),
+      model: typeof requested === "string" ? requested : "",
       connectionId:
         typeof binding.connectionId === "string" && binding.connectionId ? binding.connectionId : null,
     };
@@ -344,7 +389,7 @@ export async function routeWithCache(
   params: AiConnectionRouterRequest,
 ): Promise<AiConnectionRouterResult> {
   const { config } = await resolveCompany(ctx, params.companyId);
-  const rows = new Map<string, AccountUsageRow>(Object.entries(await loadRows(ctx, params.companyId)));
+  const rows = Object.values(await loadRows(ctx, params.companyId));
   const { candidates, poolId, poolMode, poolThresholdPercent } = toRouterCandidates(params);
   return route({
     now: params.now,

@@ -1,21 +1,53 @@
 import { describe, expect, it } from "vitest";
 import { parseConfig } from "./config.js";
-import { buildPageData, buildWidgetData, resetIn } from "./ui-data.js";
-import type { AccountUsageRow, StrikeBudgetState, SyncSummary } from "./types.js";
+import { buildPageData, buildWidgetData } from "./ui-data.js";
+import { emptyStrikeBudget } from "./sync.js";
+import type { AccountUsageRow } from "./types.js";
 
 const NOW = "2026-11-01T12:00:00.000Z";
 
-function row(over: Partial<AccountUsageRow> & { prefix: string }): AccountUsageRow {
+function testConfig() {
+  const { config, validation } = parseConfig({
+    cliproxyBaseUrl: "http://127.0.0.1:8317",
+    managementKeyHeader: "X-Test-Key",
+    managementSecretRef: { uid: "secret-1" },
+    providers: [
+      { provider: "claude", connectionId: "conn-claude", completeInventory: true },
+      { provider: "codex", connectionId: "conn-codex", completeInventory: false },
+    ],
+    audienceConfirmed: true,
+  });
+  expect(validation.ok).toBe(true);
+  return config;
+}
+
+function row(over: Partial<AccountUsageRow> = {}): AccountUsageRow {
   return {
-    connectionId: `conn-${over.prefix}`,
+    key: "acct-aaa",
     provider: "claude",
-    poolFamily: "unknown",
-    limits: [],
+    channel: "claude",
+    status: "active",
+    statusMessage: null,
+    priority: null,
+    limits: [
+      {
+        id: "claude:5h",
+        label: "Claude unified 5h",
+        usedPercent: 20,
+        remainingPercent: 80,
+        resetsAt: null,
+        limitReached: false,
+        allowed: true,
+        gating: true,
+        observedAt: NOW,
+        models: null,
+      },
+    ],
     planType: null,
     checkedAt: NOW,
     source: "plugin:cliproxy-connector",
     quotaBlind: false,
-    accountHash: "hash",
+    accountHash: "hash-aaa",
     lastError: null,
     coolingDown: false,
     cooldownUntil: null,
@@ -23,187 +55,148 @@ function row(over: Partial<AccountUsageRow> & { prefix: string }): AccountUsageR
   };
 }
 
-function args(over: Record<string, unknown> = {}) {
-  const { config } = parseConfig({
-    cliproxyBaseUrl: "http://127.0.0.1:8317",
-    managementKeyHeader: "X-K",
-    managementSecretRef: { uid: "secret-ref-uid-do-not-leak" },
-    prefixMap: {},
-    audienceConfirmed: true,
-  });
-  return {
-    now: NOW,
-    config,
-    rows: {} as Record<string, AccountUsageRow>,
-    lastSync: null as SyncSummary | null,
-    strike: {
-      failures: [],
-      disabled: false,
-      disabledAt: null,
-      disabledReason: null,
-      secretBad: false,
-    } as StrikeBudgetState,
-    ...over,
-  };
-}
+const LAST_SYNC = {
+  startedAt: NOW,
+  finishedAt: NOW,
+  accountsSeen: 1,
+  rowsWritten: 1,
+  drift: [],
+  errors: [],
+  skipped: false,
+  skipReason: null,
+};
 
-describe("resetIn", () => {
-  it("formats countdowns", () => {
-    expect(resetIn(null, 0)).toBeNull();
-    expect(resetIn("2026-11-01T12:05:00.000Z", Date.parse(NOW))).toBe("5m");
-    expect(resetIn("2026-11-01T14:30:00.000Z", Date.parse(NOW))).toBe("2h 30m");
-    expect(resetIn("2026-11-01T11:00:00.000Z", Date.parse(NOW))).toBe("now");
-  });
-});
-
-describe("buildPageData", () => {
-  it("classifies freshness and surfaces the earliest reset", () => {
-    const page = buildPageData(
-      args({
-        rows: {
-          a: row({
-            prefix: "a",
-            checkedAt: NOW,
-            limits: [
-              {
-                id: "w",
-                label: "w",
-                usedPercent: 20,
-                remainingPercent: 80,
-                resetsAt: "2026-11-01T13:00:00.000Z",
-                limitReached: false,
-                allowed: true,
-                gating: true,
-              },
-            ],
-          }),
-          b: row({ prefix: "b", checkedAt: "2026-11-01T11:40:00.000Z" }), // 20 min: stale
-          c: row({ prefix: "c", checkedAt: "2026-11-01T10:00:00.000Z" }), // expired
-          d: row({ prefix: "d", checkedAt: "not-a-date" }), // missing
-        },
-      }),
-    );
-    const byId = Object.fromEntries(page.accounts.map((a) => [a.prefix, a]));
-    expect(byId.a.freshness).toBe("fresh");
-    expect(byId.b.freshness).toBe("stale");
-    expect(byId.c.freshness).toBe("expired");
-    expect(byId.d.freshness).toBe("missing");
-    expect(byId.a.limits[0].resetIn).toBe("1h 0m");
-    expect(byId.b.limits).toEqual([]);
-    expect(page.earliestReset).toBe("2026-11-01T13:00:00.000Z");
-  });
-
-  it("emits copy-paste snippets and suggested profile models without key material", () => {
-    const page = buildPageData(args({ rows: { a: row({ prefix: "a" }) } }));
-    expect(page.accounts[0].suggestedProfileModel).toBe("a/<model-id-as-listed>");
-    expect(page.accounts[0].connectionSnippet).toContain("a/<model-id-as-listed>");
-    // The management secret_ref must never reach page data; only the boolean
-    // secretBad flag is exposed. ("secret" as a word is fine — the flag and
-    // audience notice use it; the ref value must not appear.)
-    const blob = JSON.stringify(page);
-    expect(blob).not.toContain("secret-ref-uid");
-    expect(typeof page.strike.secretBad).toBe("boolean");
-  });
-
-  it("exposes waitUntil while the rolling window is full", () => {
-    const t1 = new Date(Date.parse(NOW) - 5 * 60_000).toISOString();
-    const t0 = new Date(Date.parse(NOW) - 10 * 60_000).toISOString();
-    const full = buildPageData(
-      args({
-        strike: { failures: [t0, t1], disabled: true, disabledAt: t1, disabledReason: "spent", secretBad: false },
-      }),
-    );
-    expect(full.strike.waitUntil).toBe(new Date(Date.parse(t0) + 30 * 60_000).toISOString());
-
-    const room = buildPageData(
-      args({
-        strike: { failures: [t1], disabled: false, disabledAt: null, disabledReason: null, secretBad: true },
-      }),
-    );
-    expect(room.strike.waitUntil).toBeNull();
-  });
-
-  it("keeps the audience notice until the operator confirms", () => {
-    const unconfirmed = parseConfig({
-      cliproxyBaseUrl: "http://127.0.0.1:8317",
-      managementKeyHeader: "X-K",
-      managementSecretRef: { uid: "s" },
-      prefixMap: {},
+describe("page data (per-provider)", () => {
+  it("renders one card per providers[] row with aggregate state, connection, and inventory flag", () => {
+    const page = buildPageData({
+      now: NOW,
+      config: testConfig(),
+      rows: { "acct-aaa": row() },
+      lastSync: LAST_SYNC,
+      strike: emptyStrikeBudget(),
     });
-    const page = buildPageData(args({ config: unconfirmed.config }));
+    expect(page.providers.map((p) => p.provider)).toEqual(["claude", "codex"]);
+    const claude = page.providers[0];
+    expect(claude).toMatchObject({
+      connectionId: "conn-claude",
+      completeInventory: true,
+      state: "allowed",
+      retryAt: null,
+      waitResumeOff: false,
+      enabledAccounts: 1,
+      headroomAccounts: 1,
+    });
+    expect(claude.accounts).toHaveLength(1);
+    expect(claude.accounts[0]?.key).toBe("acct-aaa");
+    // No row: codex aggregates unknown without headroom.
+    expect(page.providers[1]).toMatchObject({ state: "unknown", enabledAccounts: 0, waitResumeOff: true });
+    expect(page.providers[1]?.reason).toMatch(/wait\/resume is off/i);
+  });
+
+  it("surfaces drift from the last sync and earliest retryAt across providers", () => {
+    const page = buildPageData({
+      now: NOW,
+      config: testConfig(),
+      rows: {},
+      lastSync: {
+        ...LAST_SYNC,
+        drift: [{ kind: "unconfigured-provider", provider: "kimi", detail: "no row for kimi" }],
+      },
+      strike: emptyStrikeBudget(),
+    });
+    expect(page.drift).toHaveLength(1);
+    expect(page.drift[0]?.provider).toBe("kimi");
+    expect(page.earliestReset).toBeNull();
+  });
+
+  it("surfaces proven models, overlaps, and the catalog note", () => {
+    const page = buildPageData({
+      now: NOW,
+      config: testConfig(),
+      rows: { "acct-aaa": row() },
+      lastSync: {
+        ...LAST_SYNC,
+        providerModels: { claude: ["claude-opus-4-5"] },
+        modelOverlaps: [{ id: "shared-bare-model", providers: ["claude", "codex"] }],
+      },
+      strike: emptyStrikeBudget(),
+    });
+    expect(page.providers[0]).toMatchObject({ provider: "claude", models: ["claude-opus-4-5"] });
+    expect(page.providers[1]).toMatchObject({ provider: "codex", models: [] });
+    expect(page.modelOverlaps).toEqual([{ id: "shared-bare-model", providers: ["claude", "codex"] }]);
+    expect(page.modelsNote).toBeNull(); // catalog ran: derivation is on
+    const widget = buildWidgetData({
+      now: NOW,
+      config: testConfig(),
+      rows: { "acct-aaa": row() },
+      lastSync: {
+        ...LAST_SYNC,
+        providerModels: { claude: ["claude-opus-4-5"] },
+        modelOverlaps: [{ id: "shared-bare-model", providers: ["claude", "codex"] }],
+        drift: [{ kind: "model-overlap", provider: "claude", detail: "overlap" }],
+      },
+      strike: emptyStrikeBudget(),
+    });
+    expect(widget.modelOverlapCount).toBe(1);
+    expect(widget.status).toMatch(/drift finding/); // overlap drift is health-visible
+  });
+
+  it("notes when the model catalog is unavailable", () => {
+    const page = buildPageData({
+      now: NOW,
+      config: testConfig(),
+      rows: { "acct-aaa": row() },
+      lastSync: { ...LAST_SYNC, errors: ["clientApiKeySecretRef is not set: skipping /v1/models"] },
+      strike: emptyStrikeBudget(),
+    });
+    expect(page.providerModels).toEqual({});
+    expect(page.modelOverlaps).toEqual([]);
+    expect(page.modelsNote).toMatch(/clientApiKeySecretRef/);
+  });
+
+  it("shows the audience notice until confirmed", () => {
+    const unconfirmed = { ...testConfig(), audienceConfirmed: false };
+    const page = buildPageData({
+      now: NOW,
+      config: unconfirmed,
+      rows: {},
+      lastSync: null,
+      strike: emptyStrikeBudget(),
+    });
     expect(page.audienceConfirmed).toBe(false);
-    expect(page.audienceNotice).toMatch(/Confirm which company roles/);
+    expect(page.audienceNotice).toMatch(/proposal §4 point 4/);
   });
 });
 
-describe("buildWidgetData", () => {
-  it("reports healthy, drift, empty and disabled states", () => {
-    const healthy = buildWidgetData(args({ rows: { a: row({ prefix: "a" }) } }));
-    expect(healthy).toMatchObject({ ok: true, status: "healthy", accounts: 1 });
-
-    const lastSync = {
-      accountsSeen: 0,
-      rowsWritten: 0,
-      drift: [{ kind: "unmapped-account", prefix: "x", detail: "d" }],
-      errors: [],
-      skipped: false,
-      skipReason: null,
-      startedAt: NOW,
-      finishedAt: NOW,
-    } as SyncSummary;
-    const drifted = buildWidgetData(args({ lastSync }));
-    expect(drifted.status).toMatch(/1 drift finding/);
-
-    const empty = buildWidgetData(args({}));
-    expect(empty.status).toBe("no accounts synced yet");
-
-    const disabled = buildWidgetData(
-      args({
-        strike: { failures: [], disabled: true, disabledAt: NOW, disabledReason: "spent", secretBad: true },
-      }),
-    );
-    expect(disabled).toMatchObject({ ok: false, status: "disabled (strike budget spent)" });
+describe("widget data", () => {
+  it("counts providers by state with drift and wait/resume flags", () => {
+    const widget = buildWidgetData({
+      now: NOW,
+      config: testConfig(),
+      rows: { "acct-aaa": row() },
+      lastSync: LAST_SYNC,
+      strike: emptyStrikeBudget(),
+    });
+    expect(widget).toMatchObject({
+      ok: true,
+      providers: 2,
+      allowed: 1,
+      unknownProviders: 1,
+      waitResumeOff: 1,
+      driftCount: 0,
+    });
+    expect(widget.status).toBe("healthy");
   });
 
-  it("counts quota-blind and stale accounts", () => {
-    const w = buildWidgetData(
-      args({
-        rows: {
-          a: row({ prefix: "a", quotaBlind: true }),
-          b: row({ prefix: "b", checkedAt: "2026-11-01T11:40:00.000Z" }),
-        },
-      }),
-    );
-    expect(w.quotaBlind).toBe(1);
-    expect(w.staleCount).toBe(1);
-  });
-
-  it("surfaces a failure newer than the last success without moving ranAt", () => {
-    const lastSync = {
-      accountsSeen: 1,
-      rowsWritten: 1,
-      drift: [],
-      errors: [],
-      skipped: false,
-      skipReason: null,
-      startedAt: "2026-11-01T11:00:00.000Z",
-      finishedAt: "2026-11-01T11:00:30.000Z",
-    } as SyncSummary;
-    const failed = buildPageData(
-      args({ lastSync, lastFailure: { attemptedAt: NOW, message: "sync failed: boom" } }),
-    );
-    expect(failed.sync.ranAt).toBe("2026-11-01T11:00:30.000Z");
-    expect(failed.sync.lastError).toBe("sync failed: boom");
-    expect(failed.sync.lastAttemptAt).toBe(NOW);
-
-    const widget = buildWidgetData(args({ lastSync, lastFailure: { attemptedAt: NOW, message: "boom" } }));
-    expect(widget.status).toMatch(/last sync failed/);
-
-    // A failure older than the last success stays recorded but is not shown as current.
-    const cleared = buildPageData(
-      args({ lastSync, lastFailure: { attemptedAt: "2026-11-01T10:00:00.000Z", message: "old" } }),
-    );
-    expect(cleared.sync.lastError).toBeNull();
-    expect(cleared.sync.lastAttemptAt).toBeNull();
+  it("reports strike-disabled status", () => {
+    const widget = buildWidgetData({
+      now: NOW,
+      config: testConfig(),
+      rows: {},
+      lastSync: null,
+      strike: { ...emptyStrikeBudget(), disabled: true, disabledReason: "spent" },
+    });
+    expect(widget.ok).toBe(false);
+    expect(widget.status).toMatch(/disabled/);
   });
 });

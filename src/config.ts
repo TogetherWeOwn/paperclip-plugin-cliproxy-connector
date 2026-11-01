@@ -1,11 +1,31 @@
 /**
  * Company-level connector configuration: parsing, validation and defaults.
  *
+ * v2 is per-provider: the operator enters one row per CLIProxy provider
+ * family (`providers: [{ provider, connectionId, completeInventory }]`), once.
+ * Accounts added, removed or disabled in CLIProxy appear in or vanish from
+ * the sync cache with zero config change (auto-discovery).
+ *
  * The host carries company config opaquely (`ctx.config.get(companyId)`), so
  * this module is the single place that turns it into a typed, validated
  * `ConnectorConfig`. Anything security-relevant (loopback base URL, explicit
  * key header, secret_ref shape) fails validation loudly here.
  */
+
+export interface ProviderEntry {
+  /** CLIProxy provider string, normalized lowercase (e.g. `claude`). */
+  provider: string;
+  /** Paperclip connection id for this provider family (stock model ids). */
+  connectionId: string;
+  /**
+   * The operator confirms this provider has no hidden config-key credentials
+   * (CLIProxy omits `claude-api-key`, `codex-api-key` incl. MetaKey/XAIKey
+   * aliases, `openai-compatibility` and vertex from `auth-files`). Defaults
+   * to false: a provider with unconfirmed inventory can only reach `allowed`
+   * or `unknown`, never `exhausted` (fail open, never wait).
+   */
+  completeInventory: boolean;
+}
 
 export interface ConnectorConfig {
   /** Loopback-only CLIProxy base URL, e.g. `http://127.0.0.1:8317`. */
@@ -14,9 +34,18 @@ export interface ConnectorConfig {
   managementKeyHeader: string;
   /** Paperclip `secret_ref` object for the management key. Never persisted. */
   managementSecretRef: unknown;
+  /**
+   * Board `secret_ref` for the CLIProxy *client* (non-management) API key,
+   * used only for `GET /v1/models` (served-model list for model → provider
+   * derivation). Resolved per run and never persisted, under the same
+   * loopback and `redirect:"manual"` rules as the management path. Optional
+   * for validation (missing → derivation and overlap detection stay off with
+   * a warning; quota aggregation still runs), required for full function.
+   */
+  clientApiKeySecretRef?: unknown;
   /** Sync cadence in minutes. The cron job runs every 5; larger values skip. */
   syncIntervalMinutes: number;
-  /** Default reserve: members at or below this remaining % are skipped. */
+  /** Default reserve: providers at or below this remaining % are not headroom. */
   reservePercent: number;
   /** Per-pool reserve overrides keyed by pool id. */
   perPoolReservePercent: Record<string, number>;
@@ -28,11 +57,11 @@ export interface ConnectorConfig {
   graceMultiplier: number;
   /** Tolerance for `checkedAt` slightly in the future. */
   futureSkewSeconds: number;
-  /** Operator map: CLIProxy prefix → Paperclip connection id. */
-  prefixMap: Record<string, string>;
+  /** One row per provider family, never per account. */
+  providers: ProviderEntry[];
   /** Per-provider gating-window allow-list (lowercased substring match). */
   providerWindows: Record<string, string[]>;
-  /** CLIProxy plugin id per prefix for quota fetch (our five plugins). */
+  /** CLIProxy plugin id per provider for quota fetch (our five plugins). */
   pluginQuotaIds: Record<string, string>;
   /** Operator confirms the page audience exposure is intended (proposal §4.4). */
   audienceConfirmed: boolean;
@@ -67,6 +96,17 @@ export const DEFAULT_PROVIDER_WINDOWS: Record<string, string[]> = {
 /** Single path segment: no slashes, no dots, no encoding tricks. Shared with the management client. */
 export const SINGLE_SEGMENT = /^[A-Za-z0-9][A-Za-z0-9_-]*$/;
 
+/**
+ * Strip trailing slashes without a regex. The `/\/+$/` form trips CodeQL
+ * `js/polynomial-redos` (low risk here — the value is operator config that
+ * passes loopback validation — but a high must not merge open).
+ */
+export function stripTrailingSlashes(value: string): string {
+  let end = value.length;
+  while (end > 0 && value[end - 1] === "/") end -= 1;
+  return value.slice(0, end);
+}
+
 export function isLoopbackUrl(raw: string): boolean {
   let url: URL;
   try {
@@ -87,16 +127,20 @@ export interface ConfigValidation {
   errors: string[];
 }
 
+function isPlainObject(v: unknown): v is Record<string, unknown> {
+  return typeof v === "object" && v !== null && !Array.isArray(v);
+}
+
 export function parseConfig(raw: unknown): { config: ConnectorConfig; validation: ConfigValidation } {
   const warnings: string[] = [];
   const errors: string[] = [];
-  const r = (typeof raw === "object" && raw !== null ? raw : {}) as Record<string, unknown>;
+  const r = (isPlainObject(raw) ? raw : {}) as Record<string, unknown>;
 
   const str = (v: unknown) => (typeof v === "string" ? v : "");
   const num = (v: unknown, fallback: number) =>
     typeof v === "number" && Number.isFinite(v) ? v : fallback;
 
-  const cliproxyBaseUrl = str(r.cliproxyBaseUrl).trim().replace(/\/+$/, "");
+  const cliproxyBaseUrl = stripTrailingSlashes(str(r.cliproxyBaseUrl).trim());
   const managementKeyHeader = str(r.managementKeyHeader).trim();
 
   if (!cliproxyBaseUrl) {
@@ -116,6 +160,13 @@ export function parseConfig(raw: unknown): { config: ConnectorConfig; validation
   } else if (typeof r.managementSecretRef !== "object") {
     errors.push("managementSecretRef must be the secret_ref object shape; legacy string UUIDs fail closed.");
   }
+  if (r.clientApiKeySecretRef === undefined || r.clientApiKeySecretRef === null) {
+    warnings.push(
+      "clientApiKeySecretRef is not set: the plugin cannot fetch /v1/models, so model → provider derivation and overlap detection stay off (quota aggregation still runs). Add the board secret_ref for the CLIProxy client API key for full function.",
+    );
+  } else if (typeof r.clientApiKeySecretRef !== "object") {
+    errors.push("clientApiKeySecretRef must be the secret_ref object shape; legacy string UUIDs fail closed.");
+  }
 
   const reservePercent = num(r.reservePercent, DEFAULTS.reservePercent);
   if (!(reservePercent > 0 && reservePercent < 50)) {
@@ -126,39 +177,61 @@ export function parseConfig(raw: unknown): { config: ConnectorConfig; validation
     errors.push(`syncIntervalMinutes must be within [1, 60]; got ${syncIntervalMinutes}.`);
   }
 
-  const prefixMapIn = (r.prefixMap ?? {}) as Record<string, unknown>;
-  const prefixMap: Record<string, string> = {};
+  // v2 provider rows. Any non-empty provider string is accepted as-is
+  // (raw auth-file word, trimmed and lowercased): future providers such as
+  // `openrouter` need no code change, and `cloudflare-workers-ai` matches its
+  // accounts exactly. A typo'd row simply matches no accounts and drift-warns
+  // as having zero enabled accounts instead of failing the sync closed.
+  const providers: ProviderEntry[] = [];
+  const providersIn = r.providers ?? [];
+  const seenProviders = new Set<string>();
   const seenConnections = new Map<string, string>();
-  if (typeof prefixMapIn !== "object" || prefixMapIn === null || Array.isArray(prefixMapIn)) {
-    errors.push("prefixMap must be an object of CLIProxy prefix → Paperclip connection id.");
+  if (!Array.isArray(providersIn)) {
+    errors.push("providers must be a list of { provider, connectionId, completeInventory } rows.");
   } else {
-    for (const [prefix, connectionId] of Object.entries(prefixMapIn)) {
-      if (!SINGLE_SEGMENT.test(prefix)) {
-        errors.push(`prefixMap key ${JSON.stringify(prefix)} is not a single path segment (no "/", must match [A-Za-z0-9_-]+).`);
+    for (const [index, entryRaw] of providersIn.entries()) {
+      const where = `providers[${index}]`;
+      if (!isPlainObject(entryRaw)) {
+        errors.push(`${where} must be an object with provider and connectionId.`);
         continue;
       }
-      if (typeof connectionId !== "string" || !connectionId) {
-        errors.push(`prefixMap[${prefix}] must be a non-empty connection id.`);
+      const provider = str(entryRaw.provider).trim().toLowerCase();
+      const connectionId = str(entryRaw.connectionId).trim();
+      if (!provider) {
+        errors.push(`${where}.provider is required: the CLIProxy provider string from auth-files (e.g. claude, codex, meta).`);
         continue;
       }
-      prefixMap[prefix] = connectionId;
+      if (seenProviders.has(provider)) {
+        errors.push(`${where}: duplicate provider row for ${JSON.stringify(provider)}; keep one row per provider.`);
+        continue;
+      }
+      seenProviders.add(provider);
+      if (!connectionId) {
+        errors.push(`${where} for ${JSON.stringify(provider)}: connectionId must be a non-empty Paperclip connection id.`);
+        continue;
+      }
       const prev = seenConnections.get(connectionId);
-      if (prev !== undefined && prev !== prefix) {
+      if (prev !== undefined && prev !== provider) {
         warnings.push(
-          `prefixMap: connection ${connectionId} is mapped from both ${prev} and ${prefix}; quota rows may be attributed ambiguously.`,
+          `providers: connection ${connectionId} is mapped from both ${prev} and ${provider}; per-provider aggregates may attribute the same connection twice.`,
         );
       } else {
-        seenConnections.set(connectionId, prefix);
+        seenConnections.set(connectionId, provider);
       }
+      providers.push({
+        provider,
+        connectionId,
+        completeInventory: entryRaw.completeInventory === true,
+      });
     }
   }
-  if (Object.keys(prefixMap).length === 0) {
-    warnings.push("prefixMap is empty: every CLIProxy account will drift-warn as unmapped until the operator fills the map.");
+  if (providers.length === 0) {
+    warnings.push("providers is empty: every discovered CLIProxy provider will drift-warn as unconfigured and no pool will route quota-aware.");
   }
 
   const providerWindows: Record<string, string[]> = { ...DEFAULT_PROVIDER_WINDOWS };
-  const providerWindowsIn = (r.providerWindows ?? {}) as Record<string, unknown>;
-  if (typeof providerWindowsIn === "object" && providerWindowsIn !== null) {
+  const providerWindowsIn = r.providerWindows ?? {};
+  if (isPlainObject(providerWindowsIn)) {
     for (const [provider, list] of Object.entries(providerWindowsIn)) {
       if (!Array.isArray(list) || !list.every((s) => typeof s === "string" && s)) {
         errors.push(`providerWindows[${provider}] must be a list of non-empty window substrings.`);
@@ -174,21 +247,28 @@ export function parseConfig(raw: unknown): { config: ConnectorConfig; validation
     }
   }
 
+  // v2: one plugin quota route per provider (not per account). The fetched
+  // windows are attached to every enabled account row of that provider with
+  // the sync fetch time as their observation.
   const pluginQuotaIds: Record<string, string> = {};
   const pluginQuotaIdsIn = (r.pluginQuotaIds ?? {}) as Record<string, unknown>;
-  if (typeof pluginQuotaIdsIn === "object" && pluginQuotaIdsIn !== null) {
-    for (const [prefix, pluginId] of Object.entries(pluginQuotaIdsIn)) {
+  if (isPlainObject(pluginQuotaIdsIn)) {
+    for (const [provider, pluginId] of Object.entries(pluginQuotaIdsIn)) {
       if (typeof pluginId !== "string" || !pluginId) {
-        errors.push(`pluginQuotaIds[${prefix}] must be a non-empty CLIProxy plugin id.`);
+        errors.push(`pluginQuotaIds[${provider}] must be a non-empty CLIProxy plugin id.`);
         continue;
       }
-      pluginQuotaIds[prefix] = pluginId;
+      if (!SINGLE_SEGMENT.test(pluginId)) {
+        errors.push(`pluginQuotaIds[${provider}] must be a single path segment; got ${JSON.stringify(pluginId)}.`);
+        continue;
+      }
+      pluginQuotaIds[provider.toLowerCase()] = pluginId;
     }
   }
 
   const perPoolReservePercent: Record<string, number> = {};
   const perPoolIn = (r.perPoolReservePercent ?? {}) as Record<string, unknown>;
-  if (typeof perPoolIn === "object" && perPoolIn !== null) {
+  if (isPlainObject(perPoolIn)) {
     for (const [poolId, value] of Object.entries(perPoolIn)) {
       if (typeof value !== "number" || !(value > 0 && value < 50)) {
         errors.push(`perPoolReservePercent[${poolId}] must be within (0, 50).`);
@@ -200,18 +280,26 @@ export function parseConfig(raw: unknown): { config: ConnectorConfig; validation
 
   if (r.audienceConfirmed !== true) {
     warnings.push(
-      "audienceConfirmed is not set: the plugin page shows upstream account identity (emails/labels). Confirm which company roles may view plugin pages and that the exposure is intended (proposal §4 point 4), then set audienceConfirmed: true.",
+      "audienceConfirmed is not set: the plugin page shows upstream account quota state (providers, plan labels, per-account status). Confirm which company roles may view plugin pages and that the exposure is intended (proposal §4 point 4), then set audienceConfirmed: true.",
     );
   }
 
-  // NOTE: the management client uses pinned paths (see cliproxy.ts
+  // The management client uses pinned paths (see cliproxy.ts
   // AUTH_FILES_PATH / pluginQuotaPath) — there are deliberately no config
-  // knobs for them. Unknown keys (including the removed authFilesPath /
-  // pluginQuotaPathTemplate / modelsPath) are ignored, never honoured.
+  // knobs for them. Unknown keys (including the removed v1 prefixMap,
+  // authFilesPath / pluginQuotaPathTemplate / modelsPath) are ignored, never
+  // honoured. A leftover v1 prefixMap errors loudly so the operator migrates
+  // instead of running a dead map.
+  if (r.prefixMap !== undefined) {
+    errors.push(
+      "prefixMap was removed in v2 (per-provider config replaces the per-account map). Delete prefixMap and add one providers[] row per CLIProxy provider instead.",
+    );
+  }
   const config: ConnectorConfig = {
     cliproxyBaseUrl,
     managementKeyHeader,
     managementSecretRef: r.managementSecretRef,
+    clientApiKeySecretRef: r.clientApiKeySecretRef ?? null,
     syncIntervalMinutes,
     reservePercent,
     perPoolReservePercent,
@@ -219,12 +307,38 @@ export function parseConfig(raw: unknown): { config: ConnectorConfig; validation
     maxAgeMultiplier: num(r.maxAgeMultiplier, DEFAULTS.maxAgeMultiplier),
     graceMultiplier: num(r.graceMultiplier, DEFAULTS.graceMultiplier),
     futureSkewSeconds: num(r.futureSkewSeconds, DEFAULTS.futureSkewSeconds),
-    prefixMap,
+    providers,
     providerWindows,
     pluginQuotaIds,
     audienceConfirmed: r.audienceConfirmed === true,
   };
   return { config, validation: { ok: errors.length === 0, warnings, errors } };
+}
+
+/**
+ * Provider words with a dedicated quota parser (informational only — config
+ * rows accept any provider string). Unknown words use the generic parser and
+ * stay quota-blind. Kept exported for the plugin page's provider labels.
+ */
+const KNOWN_PROVIDER_WORDS = new Set([
+  "claude",
+  "codex",
+  "devin",
+  "meta",
+  "antigravity",
+  "xai",
+  "kimi",
+  "compat",
+  "synthetic",
+  "nvidia-nim",
+  "cloudflare",
+  "cloudflare-workers-ai",
+  "zai",
+  "opencode-go",
+]);
+
+export function isKnownProviderWord(provider: string): boolean {
+  return KNOWN_PROVIDER_WORDS.has(provider.toLowerCase());
 }
 
 /**

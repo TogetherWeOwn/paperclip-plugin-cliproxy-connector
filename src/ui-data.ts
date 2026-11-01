@@ -1,25 +1,56 @@
 /**
- * Plugin page + dashboard widget data (proposal §3 UI).
+ * Plugin page + dashboard widget data (TWO-679 v2, per-provider).
  *
  * Served worker-side via `ctx.data` (`page`, `widget`); the React bundle in
  * `ui/` renders it. Everything here is derived from the plugin's own cache —
- * never upstream account identity beyond the operator-chosen display labels
- * and opaque hashes.
+ * never upstream account identity beyond opaque hashes and the operator's own
+ * connection ids.
  *
- * Audience (proposal §4 point 4): this page shows upstream account identity
- * (provider, plan labels, per-account quota state). The operator confirms
- * which company roles may view plugin pages via `audienceConfirmed` before
- * relying on this page; until then the audience notice below stays on screen.
+ * Each `providers[]` row gets one provider card: the aggregate verdict
+ * (provider level, no requested model), its `retryAt`, freshness, the
+ * `completeInventory` flag that gates wait/resume, and the mapped connection.
+ * Discovered accounts render as informational detail under their provider —
+ * they are never addressed, keyed, or provisioned by this UI.
+ *
+ * Audience (proposal §4 point 4): this page shows upstream account quota state
+ * (providers, plan labels, per-account status). The operator confirms which
+ * company roles may view plugin pages via `audienceConfirmed` before relying
+ * on this page; until then the audience notice below stays on screen.
  */
 
+import { aggregateProvider } from "./aggregate.js";
 import { graceMs, maxAgeMs, type ConnectorConfig } from "./config.js";
 import { strikeWaitUntil } from "./sync.js";
-import type { AccountUsageRow, DriftFinding, StrikeBudgetState, SyncFailure, SyncSummary } from "./types.js";
+import type {
+  AccountUsageRow,
+  DriftFinding,
+  Freshness,
+  ProviderState,
+  StrikeBudgetState,
+  SyncFailure,
+  SyncSummary,
+} from "./types.js";
 
 export const AUDIENCE_NOTICE =
-  "Audience: this page shows upstream AI account identity (providers, plan labels, per-account quota state). " +
+  "Audience: this page shows upstream AI account quota state (providers, plan labels, per-account status). " +
   "Confirm which company roles may view plugin pages and that this exposure is intended (proposal §4 point 4), " +
   "then set audienceConfirmed: true in the company config.";
+
+export interface ProviderAccountDetail {
+  /** Stable row key (`acct-<hash>`); never a raw identifier. */
+  key: string;
+  status: string;
+  statusMessage: string | null;
+  priority: number | null;
+  planType: string | null;
+  quotaBlind: boolean;
+  freshness: Freshness;
+  checkedAt: string;
+  limits: AccountCardLimit[];
+  lastError: string | null;
+  coolingDown: boolean;
+  cooldownUntil: string | null;
+}
 
 export interface AccountCardLimit {
   id: string;
@@ -32,25 +63,24 @@ export interface AccountCardLimit {
   allowed: boolean | null;
   gating: boolean;
   stale: boolean;
+  models: string[] | null;
 }
 
-export interface AccountCard {
-  prefix: string;
-  connectionId: string | null;
-  mapped: boolean;
+export interface ProviderCard {
   provider: string;
-  planType: string | null;
-  quotaBlind: boolean;
-  freshness: "fresh" | "stale" | "expired" | "missing";
-  checkedAt: string;
-  limits: AccountCardLimit[];
-  lastError: string | null;
-  coolingDown: boolean;
-  cooldownUntil: string | null;
-  /** Copy-paste-ready connection snippet for the operator runbook. */
-  connectionSnippet: string;
-  /** Suggested member profile.model for the pool member. */
-  suggestedProfileModel: string;
+  connectionId: string;
+  completeInventory: boolean;
+  state: ProviderState;
+  retryAt: string | null;
+  retryIn: string | null;
+  freshness: Freshness;
+  waitResumeOff: boolean;
+  enabledAccounts: number;
+  headroomAccounts: number;
+  reason: string;
+  /** Proven served-model ids for this provider (stock ids), or [] when unknown. */
+  models: string[];
+  accounts: ProviderAccountDetail[];
 }
 
 export interface PageData {
@@ -83,20 +113,33 @@ export interface PageData {
     waitUntil: string | null;
   };
   drift: DriftFinding[];
-  accounts: AccountCard[];
+  providers: ProviderCard[];
   earliestReset: string | null;
+  /** Proven served-model ids per provider from the latest sync (stock ids). */
+  providerModels: Record<string, string[]>;
+  /** Served ids claimed by more than one provider (proven for nobody). */
+  modelOverlaps: Array<{ id: string; providers: string[] }>;
+  /**
+   * Why the catalog is unavailable (missing client key, failed fetch), or
+   * null when derivation ran. Overlap detection is off while this is set.
+   */
+  modelsNote: string | null;
 }
 
 export interface WidgetData {
   generatedAt: string;
   ok: boolean;
   status: string;
-  accounts: number;
-  quotaBlind: number;
+  providers: number;
+  allowed: number;
+  exhausted: number;
+  unknownProviders: number;
+  waitResumeOff: number;
   driftCount: number;
+  /** Served ids claimed by more than one provider (also counted in drift). */
+  modelOverlapCount: number;
   earliestReset: string | null;
   earliestResetIn: string | null;
-  staleCount: number;
 }
 
 export function resetIn(resetAt: string | null, nowMs: number): string | null {
@@ -112,36 +155,6 @@ export function resetIn(resetAt: string | null, nowMs: number): string | null {
   return `${Math.floor(hours / 24)}d ${hours % 24}h`;
 }
 
-function suggestedProtocol(provider: string): "messages" | "responses" {
-  switch (provider) {
-    case "codex":
-    case "xai":
-    case "devin":
-      return "responses";
-    default:
-      return "messages";
-  }
-}
-
-export function buildConnectionSnippet(prefix: string, provider: string, baseUrl: string): string {
-  const protocol = suggestedProtocol(provider);
-  return JSON.stringify(
-    {
-      method: "api_key",
-      routing: {
-        kind: "local",
-        protocol,
-        baseUrl,
-        auth: "bearer",
-        models: [`${prefix}/<model-id-as-listed>`],
-      },
-      note: "credential = a CLIProxy client key, never upstream material",
-    },
-    null,
-    2,
-  );
-}
-
 export function buildPageData(args: {
   now: string;
   config: ConnectorConfig;
@@ -152,51 +165,66 @@ export function buildPageData(args: {
 }): PageData {
   const { now, config, rows, lastSync, strike, lastFailure } = args;
   const nowMs = Date.parse(now);
-  const maxAge = maxAgeMs(config);
-  const grace = graceMs(config);
+  const allRows = Object.values(rows);
+  const providerModels = lastSync?.providerModels ?? {};
+  const modelOverlaps = lastSync?.modelOverlaps ?? [];
+  const catalogError =
+    lastSync === null
+      ? null
+      : (lastSync.errors.find((e) => e.includes("/v1/models") || e.includes("clientApiKeySecretRef")) ?? null);
+  const modelsNote =
+    lastSync === null
+      ? "no sync has run yet; model → provider derivation has no catalog."
+      : lastSync.providerModels === undefined
+        ? (catalogError ?? "model catalog unavailable this run; overlap detection is off.")
+        : null;
 
-  const accounts: AccountCard[] = Object.values(rows)
-    .sort((a, b) => a.prefix.localeCompare(b.prefix))
-    .map((row) => {
-      const at = Date.parse(row.checkedAt);
-      const age = Number.isNaN(at) ? Infinity : nowMs - Math.min(at, nowMs);
-      const freshness =
-        !Number.isFinite(age) || age < 0 ? "missing" : age <= maxAge ? "fresh" : age <= grace ? "stale" : "expired";
-      const stale = freshness !== "fresh";
+  const providers: ProviderCard[] = [...config.providers]
+    .sort((a, b) => a.provider.localeCompare(b.provider))
+    .map((entry) => {
+      const verdict = aggregateProvider({
+        provider: entry.provider,
+        model: null,
+        rows: allRows,
+        completeInventory: entry.completeInventory,
+        config,
+        now,
+        poolId: undefined,
+        poolThresholdPercent: undefined,
+      });
+      const providerRows = allRows
+        .filter((r) => r.provider === entry.provider)
+        .sort((a, b) => a.key.localeCompare(b.key));
       return {
-        prefix: row.prefix,
-        connectionId: row.connectionId,
-        mapped: row.connectionId !== null,
-        provider: row.provider,
-        planType: row.planType,
-        quotaBlind: row.quotaBlind,
-        freshness,
-        checkedAt: row.checkedAt,
-        limits: row.limits.map((l) => ({
-          id: l.id,
-          label: l.label,
-          usedPercent: l.usedPercent,
-          remainingPercent: l.remainingPercent,
-          resetsAt: l.resetsAt,
-          resetIn: resetIn(l.resetsAt, nowMs),
-          limitReached: l.limitReached,
-          allowed: l.allowed,
-          gating: l.gating,
-          stale,
-        })),
-        lastError: row.lastError,
-        coolingDown: row.coolingDown,
-        cooldownUntil: row.cooldownUntil,
-        connectionSnippet: buildConnectionSnippet(row.prefix, row.provider, config.cliproxyBaseUrl),
-        suggestedProfileModel: `${row.prefix}/<model-id-as-listed>`,
+        provider: entry.provider,
+        connectionId: entry.connectionId,
+        completeInventory: entry.completeInventory,
+        state: verdict.state,
+        retryAt: verdict.retryAt,
+        retryIn: resetIn(verdict.retryAt, nowMs),
+        freshness: verdict.freshness,
+        waitResumeOff: verdict.waitResumeOff,
+        enabledAccounts: verdict.enabledAccounts,
+        headroomAccounts: verdict.headroomAccounts,
+        reason: verdict.waitResumeOff
+          ? `${verdict.reason} Wait/resume is off for this provider: inventory is not confirmed complete.`
+          : verdict.reason,
+        models: providerModels[entry.provider] ?? [],
+        accounts: providerRows.map((row) => toAccountDetail(row, nowMs, maxAgeMs(config), graceMs(config))),
       };
     });
 
-  const resets = accounts
-    .flatMap((a) => a.limits.map((l) => l.resetsAt))
+  const resets = providers
+    .map((p) => p.retryAt)
     .filter((r): r is string => r !== null && !Number.isNaN(Date.parse(r)));
   const earliestReset =
     resets.length > 0 ? new Date(Math.min(...resets.map((r) => Date.parse(r)))).toISOString() : null;
+
+  const showFailure =
+    lastFailure &&
+    (!lastSync ||
+      Number.isNaN(Date.parse(lastSync.finishedAt)) ||
+      Date.parse(lastFailure.attemptedAt) > Date.parse(lastSync.finishedAt));
 
   return {
     audienceNotice: AUDIENCE_NOTICE,
@@ -213,20 +241,8 @@ export function buildPageData(args: {
       // the page never silently presents stale success as current state. An
       // older failure stays recorded but shows neither message nor attempt
       // time next to the newer success.
-      lastError:
-        lastFailure &&
-        (!lastSync ||
-          Number.isNaN(Date.parse(lastSync.finishedAt)) ||
-          Date.parse(lastFailure.attemptedAt) > Date.parse(lastSync.finishedAt))
-          ? lastFailure.message
-          : null,
-      lastAttemptAt:
-        lastFailure &&
-        (!lastSync ||
-          Number.isNaN(Date.parse(lastSync.finishedAt)) ||
-          Date.parse(lastFailure.attemptedAt) > Date.parse(lastSync.finishedAt))
-          ? lastFailure.attemptedAt
-          : null,
+      lastError: showFailure ? (lastFailure as SyncFailure).message : null,
+      lastAttemptAt: showFailure ? (lastFailure as SyncFailure).attemptedAt : null,
     },
     strike: {
       disabled: strike.disabled,
@@ -237,8 +253,58 @@ export function buildPageData(args: {
       waitUntil: strikeWaitUntil(strike.failures, nowMs),
     },
     drift: lastSync?.drift ?? [],
-    accounts,
+    providers,
     earliestReset,
+    providerModels,
+    modelOverlaps,
+    modelsNote,
+  };
+}
+
+function toAccountDetail(
+  row: AccountUsageRow,
+  nowMs: number,
+  maxAge: number,
+  grace: number,
+): ProviderAccountDetail {
+  const at = Date.parse(row.checkedAt);
+  const age = Number.isNaN(at) ? Infinity : nowMs - Math.min(at, nowMs);
+  // Row-level freshness is informational only; the aggregate verdict owns the
+  // routing freshness. Same sync-relative bounds as the router.
+  const freshness: Freshness =
+    !Number.isFinite(age) || age < 0
+      ? "missing"
+      : age <= maxAge
+        ? "fresh"
+        : age <= grace
+          ? "stale"
+          : "expired";
+  const stale = freshness !== "fresh";
+  return {
+    key: row.key,
+    status: row.status,
+    statusMessage: row.statusMessage,
+    priority: row.priority,
+    planType: row.planType,
+    quotaBlind: row.quotaBlind,
+    freshness,
+    checkedAt: row.checkedAt,
+    limits: row.limits.map((l) => ({
+      id: l.id,
+      label: l.label,
+      usedPercent: l.usedPercent,
+      remainingPercent: l.remainingPercent,
+      resetsAt: l.resetsAt,
+      resetIn: resetIn(l.resetsAt, nowMs),
+      limitReached: l.limitReached,
+      allowed: l.allowed,
+      gating: l.gating,
+      stale,
+      models: l.models ?? null,
+    })),
+    lastError: row.lastError,
+    coolingDown: row.coolingDown,
+    cooldownUntil: row.cooldownUntil,
   };
 }
 
@@ -252,25 +318,35 @@ export function buildWidgetData(args: {
 }): WidgetData {
   const page = buildPageData(args);
   const nowMs = Date.parse(args.now);
-  const staleCount = page.accounts.filter((a) => a.freshness === "stale" || a.freshness === "expired").length;
+  const allowed = page.providers.filter((p) => p.state === "allowed").length;
+  const exhausted = page.providers.filter((p) => p.state === "exhausted").length;
+  const unknownProviders = page.providers.filter((p) => p.state === "unknown").length;
+  const waitResumeOff = page.providers.filter((p) => p.waitResumeOff).length;
   const status = args.strike.disabled
     ? "disabled (strike budget spent)"
     : page.sync.lastError
       ? `last sync failed: ${page.sync.lastError}`
       : page.drift.length > 0
         ? `${page.drift.length} drift finding${page.drift.length === 1 ? "" : "s"}`
-        : page.accounts.length === 0
-          ? "no accounts synced yet"
-          : "healthy";
+        : page.providers.length === 0
+          ? "no providers configured yet"
+          : exhausted > 0 && allowed === 0
+            ? `all routed providers exhausted (retry ${page.earliestReset ?? "unknown"})`
+            : page.modelOverlaps.length > 0
+              ? `healthy (${page.modelOverlaps.length} overlapping model${page.modelOverlaps.length === 1 ? "" : "s"} excluded from proven models)`
+              : "healthy";
   return {
     generatedAt: args.now,
     ok: !args.strike.disabled,
     status,
-    accounts: page.accounts.length,
-    quotaBlind: page.accounts.filter((a) => a.quotaBlind).length,
+    providers: page.providers.length,
+    allowed,
+    exhausted,
+    unknownProviders,
+    waitResumeOff,
     driftCount: page.drift.length,
+    modelOverlapCount: page.modelOverlaps.length,
     earliestReset: page.earliestReset,
     earliestResetIn: resetIn(page.earliestReset, nowMs),
-    staleCount,
   };
 }

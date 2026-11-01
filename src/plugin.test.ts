@@ -21,7 +21,8 @@ const COMPANY_CONFIG = {
   cliproxyBaseUrl: "http://127.0.0.1:8317",
   managementKeyHeader: "X-Test-Key",
   managementSecretRef: { uid: "secret-1" },
-  prefixMap: { "acct-claude-1": "conn-a1" },
+  clientApiKeySecretRef: { uid: "secret-client-1" },
+  providers: [{ provider: "claude", connectionId: "conn-a1", completeInventory: true }],
   audienceConfirmed: true,
 };
 
@@ -29,10 +30,8 @@ function stateKey(stateKey: string) {
   return { scopeKind: "company" as const, scopeId: COMPANY, namespace: STATE_NAMESPACE, stateKey };
 }
 
-const ORIGIN = "http://127.0.0.1:8317";
-
 function instanceStrikeKey() {
-  return { scopeKind: "instance" as const, namespace: STATE_NAMESPACE, stateKey: `${STRIKE_STATE_KEY}:${ORIGIN}` };
+  return { scopeKind: "instance" as const, namespace: STATE_NAMESPACE, stateKey: `${STRIKE_STATE_KEY}:loopback:8317` };
 }
 
 function jsonResponse(status: number, body: unknown): Response {
@@ -48,14 +47,17 @@ function mockFetch() {
     if (url.pathname === "/v0/management/auth-files") {
       return jsonResponse(200, [
         {
-          prefix: "acct-claude-1",
-          channel: "claude",
+          id: "harness-claude-1",
+          provider: "claude",
           quota: {
             observed_at: "2026-11-01T12:00:00.000Z",
-            signals: [{ window: "5h", usedPercent: 20 }],
+            signals: { "anthropic-ratelimit-unified-5h-utilization": "0.2" },
           },
         },
       ]);
+    }
+    if (url.pathname === "/v1/models") {
+      return jsonResponse(200, { data: [{ id: "claude-opus-4-5", owned_by: "anthropic" }] });
     }
     return new Response("not found", { status: 404 });
   });
@@ -71,12 +73,15 @@ async function setup(config: Record<string, unknown> = COMPANY_CONFIG) {
 }
 
 describe("sync job", () => {
-  it("writes usage rows and a sync summary to plugin state", async () => {
+  it("writes usage rows keyed acct-<hash> and a sync summary to plugin state", async () => {
     const harness = await setup();
     await harness.runJob(SYNC_JOB_KEY);
     const rows = harness.getState(stateKey(ROWS_STATE_KEY)) as Record<string, AccountUsageRow>;
-    expect(rows["acct-claude-1"].quotaBlind).toBe(false);
-    expect(rows["acct-claude-1"].connectionId).toBe("conn-a1");
+    const keys = Object.keys(rows);
+    expect(keys).toHaveLength(1);
+    expect(keys[0]).toMatch(/^acct-[0-9a-f]{16}$/);
+    expect(rows[keys[0] as string]?.provider).toBe("claude");
+    expect(rows[keys[0] as string]?.quotaBlind).toBe(false);
     const summary = harness.getState(stateKey(LAST_SYNC_STATE_KEY)) as { skipped: boolean };
     expect(summary.skipped).toBe(false);
   });
@@ -99,10 +104,10 @@ describe("sync job", () => {
   it("serves page and widget data from the cache", async () => {
     const harness = await setup();
     await harness.runJob(SYNC_JOB_KEY);
-    const page = await harness.getData<{ accounts: Array<{ prefix: string }> }>(PAGE_DATA_KEY, {
+    const page = await harness.getData<{ providers: Array<{ provider: string }> }>(PAGE_DATA_KEY, {
       companyId: COMPANY,
     });
-    expect(page.accounts.map((a) => a.prefix)).toEqual(["acct-claude-1"]);
+    expect(page.providers.map((p) => p.provider)).toEqual(["claude"]);
     const widget = await harness.getData<{ status: string }>(WIDGET_DATA_KEY, { companyId: COMPANY });
     expect(widget.status).toBe("healthy");
   });
@@ -138,7 +143,7 @@ describe("sync job", () => {
     expect(harness.getState(instanceStrikeKey())).toBeUndefined();
   });
 
-  it("a 401 during the job writes the budget to the instance-scoped origin key (M1)", async () => {
+  it("a 401 during the job writes the budget to the instance-scoped loopback bucket (M1)", async () => {
     const harness = await setup();
     harness.ctx.http.fetch = (async () => new Response("nope", { status: 401 })) as never;
     await harness.runJob(SYNC_JOB_KEY);
@@ -172,7 +177,7 @@ describe("board re-enable API route", () => {
   it("clears a spent strike budget and rejects unknown routes", async () => {
     const harness = await setup();
     // Legacy company-scoped key: the route adopts it into the instance-scoped
-    // origin bucket once, then deletes the legacy key.
+    // loopback bucket once, then deletes the legacy key.
     const strikeKey = { ...stateKey(STRIKE_STATE_KEY), namespace: "cliproxy-connector" };
     harness.ctx.state.set(strikeKey as never, {
       failures: ["2026-01-01T00:00:00.000Z"],
@@ -194,7 +199,7 @@ describe("board re-enable API route", () => {
     });
     expect(res.status).toBe(200);
     expect((res.body as { strike: { disabled: boolean } }).strike.disabled).toBe(false);
-    // Adopted into the instance-scoped origin bucket; the legacy key is gone.
+    // Adopted into the instance-scoped loopback bucket; the legacy key is gone.
     const adopted = harness.getState(instanceStrikeKey()) as { disabled: boolean } | null;
     expect(adopted?.disabled).toBe(false);
     expect(harness.getState(strikeKey)).toBeUndefined();
@@ -214,16 +219,41 @@ describe("board re-enable API route", () => {
   });
 });
 
-describe("strike origin keying (M1)", () => {
-  it("normalises base URLs to their origin for the shared budget", () => {
-    expect(normaliseStrikeOrigin("http://127.0.0.1:8317")).toBe("http://127.0.0.1:8317");
-    expect(normaliseStrikeOrigin("http://127.0.0.1:8317/")).toBe("http://127.0.0.1:8317");
-    expect(normaliseStrikeOrigin("http://localhost:8317/api")).toBe("http://localhost:8317");
+describe("strike keying on loopback:<port> (Security Engineer nit)", () => {
+  it("every loopback spelling of one CLIProxy shares one bucket", () => {
+    expect(normaliseStrikeOrigin("http://127.0.0.1:8317")).toBe("loopback:8317");
+    expect(normaliseStrikeOrigin("http://127.0.0.1:8317/")).toBe("loopback:8317");
+    expect(normaliseStrikeOrigin("http://localhost:8317/api")).toBe("loopback:8317");
+    expect(normaliseStrikeOrigin("http://[::1]:8317")).toBe("loopback:8317");
+    expect(normaliseStrikeOrigin("http://127.0.0.1:9999")).toBe("loopback:9999");
+  });
+
+  it("adopts the pre-port-migration origin-format key without resetting the budget", async () => {
+    const harness = await setup();
+    // Legacy origin-format bucket from before the port-keying migration.
+    const legacyKey = {
+      scopeKind: "instance" as const,
+      namespace: STATE_NAMESPACE,
+      stateKey: `${STRIKE_STATE_KEY}:http://127.0.0.1:8317`,
+    };
+    harness.ctx.state.set(legacyKey as never, {
+      failures: ["2026-11-01T11:55:00.000Z"],
+      disabled: true,
+      disabledAt: "2026-11-01T11:55:00.000Z",
+      disabledReason: "spent",
+      secretBad: true,
+    } as never);
+    await harness.runJob(SYNC_JOB_KEY);
+    // Spent budget carried forward — the sync still refuses to probe.
+    expect(harness.ctx.http.fetch).not.toHaveBeenCalled();
+    expect(harness.getState(legacyKey)).toBeUndefined();
+    const adopted = harness.getState(instanceStrikeKey()) as { disabled: boolean } | null;
+    expect(adopted?.disabled).toBe(true);
   });
 });
 
 describe("router glue", () => {
-  it("maps host pool candidates to pinned candidates", () => {
+  it("maps host pool candidates to provider candidates with the requested model", () => {
     const { candidates, poolId, poolMode, poolThresholdPercent } = toRouterCandidates({
       companyId: COMPANY,
       pool: { id: "pool-1", mode: "usage_aware", thresholdPercent: 90 },
@@ -231,29 +261,44 @@ describe("router glue", () => {
         {
           member: {
             id: "m-a",
-            profile: { model: "acct-claude-1/claude-sonnet-5" },
+            profile: { model: "profile-model" },
             binding: { connectionId: "conn-a1" },
           },
+          runtimeConfig: { model: "requested-model" },
         },
       ],
     } as never);
     expect(poolId).toBe("pool-1");
     expect(poolMode).toBe("usage_aware");
     expect(poolThresholdPercent).toBe(90);
-    expect(candidates).toEqual([{ memberId: "m-a", model: "acct-claude-1/claude-sonnet-5", connectionId: "conn-a1" }]);
+    // runtimeConfig.model wins over the member profile model.
+    expect(candidates).toEqual([{ memberId: "m-a", model: "requested-model", connectionId: "conn-a1" }]);
   });
 
-  it("routeWithCache selects a healthy member from cached rows", async () => {
+  it("falls back to the member profile model when the task names none", () => {
+    const { candidates } = toRouterCandidates({
+      companyId: COMPANY,
+      pool: { id: "pool-1", mode: "usage_aware" },
+      candidates: [
+        { member: { id: "m-a", profile: { model: "profile-model" }, binding: { connectionId: "conn-a1" } } },
+      ],
+    } as never);
+    expect(candidates).toEqual([{ memberId: "m-a", model: "profile-model", connectionId: "conn-a1" }]);
+  });
+
+  it("routeWithCache selects a member with provider headroom from cached rows", async () => {
     const ctx = {
       config: { get: async () => COMPANY_CONFIG },
       state: {
         get: async () =>
           ({
-            "acct-claude-1": {
-              prefix: "acct-claude-1",
-              connectionId: "conn-a1",
+            "acct-aaa": {
+              key: "acct-aaa",
               provider: "claude",
-              poolFamily: "unknown",
+              channel: "claude",
+              status: "active",
+              statusMessage: null,
+              priority: null,
               limits: [
                 {
                   id: "claude:5h",
@@ -264,6 +309,8 @@ describe("router glue", () => {
                   limitReached: false,
                   allowed: true,
                   gating: true,
+                  observedAt: "2026-11-01T12:00:00.000Z",
+                  models: null,
                 },
               ],
               planType: null,
@@ -286,7 +333,7 @@ describe("router glue", () => {
         {
           member: {
             id: "m-a",
-            profile: { model: "acct-claude-1/claude-sonnet-5" },
+            profile: { model: "model-a" },
             binding: { connectionId: "conn-a1" },
           },
         },

@@ -6,7 +6,7 @@ import {
   runSync,
   type SyncDeps,
 } from "./sync.js";
-import type { StrikeBudgetState, SyncFailure, SyncSummary } from "./types.js";
+import type { AccountUsageRow, StrikeBudgetState, SyncFailure, SyncSummary } from "./types.js";
 
 const NOW = "2026-11-01T12:00:00.000Z";
 const KEY = "SECRET-KEY-MATERIAL-abc123";
@@ -16,8 +16,12 @@ function baseConfigRaw() {
     cliproxyBaseUrl: "http://127.0.0.1:8317",
     managementKeyHeader: "X-Test-Key",
     managementSecretRef: { uid: "secret-1" },
-    prefixMap: { "acct-claude-1": "conn-a1", "acct-meta-1": "conn-m1", "acct-ghost-1": "conn-g1" },
-    pluginQuotaIds: { "acct-claude-1": "claude-quota" },
+    clientApiKeySecretRef: { uid: "secret-client-1" },
+    providers: [
+      { provider: "claude", connectionId: "conn-claude", completeInventory: true },
+      { provider: "meta", connectionId: "conn-meta", completeInventory: false },
+    ],
+    pluginQuotaIds: { claude: "claude-quota" },
     audienceConfirmed: true,
   };
 }
@@ -32,28 +36,45 @@ function jsonResponse(status: number, body: unknown): Response {
 function authFilesBody() {
   return [
     {
-      prefix: "acct-claude-1",
-      channel: "claude",
+      id: "claude-acct-1",
+      provider: "claude",
       quota: {
         observed_at: NOW,
-        signals: [{ window: "5h", usedPercent: 20, resetAt: "2026-11-01T17:00:00Z" }],
+        signals: {
+          "anthropic-ratelimit-unified-5h-utilization": "0.2",
+          "anthropic-ratelimit-unified-5h-status": "allowed",
+        },
       },
     },
-    { prefix: "acct-meta-1", channel: "meta" },
+    { id: "meta-acct-1", provider: "meta" },
+    { id: "ghost-acct-1", provider: "kimi" },
   ];
 }
 
 function pluginQuotaBody() {
-  return { Groups: [{ Buckets: [{ Window: "5h", RemainingFraction: 0.8 }] }] };
+  return { Groups: [{ Buckets: [{ Window: "weekly", RemainingFraction: 0.8 }] }] };
+}
+
+function modelsBody() {
+  return {
+    data: [
+      { id: "claude-opus-4-5", owned_by: "anthropic" },
+      { id: "devin/claude-opus-4-5", owned_by: "anthropic" },
+    ],
+  };
 }
 
 /** Fetch mock routing by pathname. `overrides` may force statuses per route. */
-function mockFetch(overrides?: { authFilesStatus?: number; pluginStatus?: number }) {
+function mockFetch(overrides?: { authFilesStatus?: number; pluginStatus?: number; modelsStatus?: number }) {
   return vi.fn(async (input: string | URL | Request): Promise<Response> => {
     const url = new URL(String(input));
     if (url.pathname === "/v0/management/auth-files") {
       if (overrides?.authFilesStatus) return new Response("nope", { status: overrides.authFilesStatus });
       return jsonResponse(200, authFilesBody());
+    }
+    if (url.pathname === "/v1/models") {
+      if (overrides?.modelsStatus) return new Response("nope", { status: overrides.modelsStatus });
+      return jsonResponse(200, modelsBody());
     }
     if (url.pathname.includes("/plugins/")) {
       if (overrides?.pluginStatus === 401) return new Response("nope", { status: 401 });
@@ -67,7 +88,7 @@ function mockFetch(overrides?: { authFilesStatus?: number; pluginStatus?: number
 interface Store {
   strike: StrikeBudgetState;
   rows: Record<string, never>;
-  savedRows: Record<string, never> | null;
+  savedRows: Record<string, AccountUsageRow> | null;
   lastSync: SyncSummary | null;
   savedSummary: SyncSummary | null;
   failure: SyncFailure | null;
@@ -94,6 +115,7 @@ function deps(s: Store, fetchImpl?: typeof fetch): SyncDeps {
     companyId: "co-1",
     now: NOW,
     resolveSecret: async () => KEY,
+    resolveClientSecret: async () => `${KEY}-client`,
     fetchImpl,
     loadStrike: async () => s.strike,
     saveStrike: async (next) => {
@@ -102,7 +124,7 @@ function deps(s: Store, fetchImpl?: typeof fetch): SyncDeps {
     loadRows: async () => ({}) as never,
     loadLastSync: async () => s.lastSync,
     saveSync: async (rows, summary) => {
-      s.savedRows = rows as never;
+      s.savedRows = rows;
       s.savedSummary = summary;
     },
     recordFailure: async (failure) => {
@@ -120,21 +142,52 @@ function assertNoKeyLeak(s: Store) {
 }
 
 describe("happy path", () => {
-  it("writes one row per account, keeps quota-blind accounts unknown, and surfaces drift", async () => {
+  it("writes one row per account keyed acct-<hash>, keeps blind providers unknown, and surfaces drift", async () => {
     const s = store();
     const summary = await runSync(deps(s, mockFetch() as unknown as typeof fetch), { running: false });
     expect(summary.skipped).toBe(false);
-    expect(summary.accountsSeen).toBe(2);
-    expect(summary.rowsWritten).toBe(2);
+    expect(summary.accountsSeen).toBe(3);
+    expect(summary.rowsWritten).toBe(3);
 
-    const rows = s.savedRows as unknown as Record<string, { quotaBlind: boolean; connectionId: string | null }>;
-    expect(rows["acct-claude-1"].quotaBlind).toBe(false);
-    expect(rows["acct-meta-1"].quotaBlind).toBe(true); // unknown, never headroom
-    expect(rows["acct-claude-1"].connectionId).toBe("conn-a1");
+    const rows = s.savedRows as Record<string, AccountUsageRow>;
+    const keys = Object.keys(rows);
+    expect(keys.every((k) => /^acct-[0-9a-f]{16}$/.test(k))).toBe(true);
+    const byProvider = Object.fromEntries(Object.values(rows).map((r) => [r.provider, r]));
+    expect(byProvider.claude.quotaBlind).toBe(false);
+    expect(byProvider.claude.status).toBe("active");
+    expect(byProvider.meta.quotaBlind).toBe(true); // unknown, never headroom
+    expect(byProvider.claude.accountHash).toMatch(/^[0-9a-f]{64}$/);
+    expect(JSON.stringify(rows)).not.toContain("claude-acct-1"); // no raw identifiers
 
-    const kinds = (summary.drift ?? []).map((d) => d.kind);
-    expect(kinds).toContain("mapped-but-missing"); // acct-ghost-1 in map, absent upstream
+    const drift = summary.drift ?? [];
+    expect(drift.map((d) => d.kind)).toContain("unconfigured-provider"); // kimi has no row
+    expect(drift.find((d) => d.kind === "unconfigured-provider")?.provider).toBe("kimi");
     assertNoKeyLeak(s);
+  });
+
+  it("flags configured providers with zero enabled accounts", async () => {
+    const fetchClaudeOnly = vi.fn(async (input: string | URL | Request): Promise<Response> => {
+      const url = new URL(String(input));
+      if (url.pathname === "/v0/management/auth-files") {
+        return jsonResponse(200, [{ id: "claude-acct-1", provider: "claude" }]);
+      }
+      if (url.pathname.includes("/plugins/")) return jsonResponse(200, pluginQuotaBody());
+      return new Response("not found", { status: 404 });
+    });
+    const s = store();
+    const summary = await runSync(deps(s, fetchClaudeOnly as unknown as typeof fetch), { running: false });
+    expect(summary.drift.find((d) => d.kind === "no-enabled-accounts")?.provider).toBe("meta");
+  });
+
+  it("attaches the per-provider plugin quota to every enabled account of that provider", async () => {
+    const s = store();
+    await runSync(deps(s, mockFetch() as unknown as typeof fetch), { running: false });
+    const rows = s.savedRows as Record<string, AccountUsageRow>;
+    const claudeRows = Object.values(rows).filter((r) => r.provider === "claude");
+    expect(claudeRows.length).toBeGreaterThan(0);
+    for (const r of claudeRows) {
+      expect(r.limits.some((l) => l.id === "claude:weekly")).toBe(true);
+    }
   });
 
   it("treats a failing plugin route as best-effort: passive signals survive", async () => {
@@ -144,30 +197,350 @@ describe("happy path", () => {
       { running: false },
     );
     expect(summary.skipped).toBe(false);
-    expect(summary.errors.some((e) => e.includes("acct-claude-1"))).toBe(true);
-    const rows = s.savedRows as unknown as Record<string, { limits: unknown[] }>;
-    // Passive auth-files signal still present for acct-claude-1.
-    expect(rows["acct-claude-1"].limits.length).toBeGreaterThan(0);
+    expect(summary.errors.some((e) => e.includes("claude"))).toBe(true);
+    const rows = s.savedRows as Record<string, AccountUsageRow>;
+    const claude = Object.values(rows).find((r) => r.provider === "claude") as AccountUsageRow;
+    // Passive auth-files signal still present for the claude account.
+    expect(claude.limits.length).toBeGreaterThan(0);
     assertNoKeyLeak(s);
   });
 
-  it("flags duplicates and unkeyed entries as drift", async () => {
+  it("flags duplicates and unkeyed entries with warnings, keying stably across syncs", async () => {
     const fetchDup = vi.fn(async (input: string | URL | Request): Promise<Response> => {
       const url = new URL(String(input));
       if (url.pathname === "/v0/management/auth-files") {
         return jsonResponse(200, [
-          { prefix: "acct-claude-1", channel: "claude", quota: { observed_at: NOW, signals: [] } },
-          { prefix: "acct-claude-1", channel: "claude", quota: { observed_at: NOW, signals: [] } },
-          { channel: "claude" },
+          { id: "dup-1", provider: "claude" },
+          { id: "dup-1", provider: "claude" },
+          { provider: "claude" },
         ]);
       }
       return new Response("not found", { status: 404 });
     });
     const s = store();
-    const summary = await runSync(deps(s, fetchDup as unknown as typeof fetch), { running: false });
-    const kinds = (summary.drift ?? []).map((d) => d.kind);
-    expect(kinds).toContain("duplicate-prefix");
-    expect(kinds).toContain("unkeyed-observation");
+    const d = deps(s, fetchDup as unknown as typeof fetch);
+    // Avoid the plugin quota fetch (no pluginQuotaIds match needed) — keep focused.
+    d.config = parseConfig({ ...baseConfigRaw(), pluginQuotaIds: {} }).config;
+    const summary = await runSync(d, { running: false });
+    expect(summary.rowsWritten).toBe(1); // first dup kept, repeat + unkeyed ignored
+    expect(summary.errors.some((e) => e.includes("duplicate"))).toBe(true);
+    expect(summary.errors.some((e) => e.includes("without a stable id"))).toBe(true);
+    const keys = Object.keys(s.savedRows as Record<string, AccountUsageRow>);
+    expect(keys).toHaveLength(1);
+    // Stable across syncs: same identity → same key.
+    const s2 = store();
+    const d2 = deps(s2, fetchDup as unknown as typeof fetch);
+    d2.config = d.config;
+    await runSync(d2, { running: false });
+    expect(Object.keys(s2.savedRows as Record<string, AccountUsageRow>)).toEqual(keys);
+  });
+});
+
+describe("served-model catalog (/v1/models + auth-files)", () => {
+  it("derives proven models and persists them on the summary", async () => {
+    const s = store();
+    const d = deps(s, mockFetch() as unknown as typeof fetch);
+    // Devin is in scope via the config row (no devin account discovered):
+    // the namespaced id still attributes by namespace despite owned_by.
+    d.config = parseConfig({
+      ...baseConfigRaw(),
+      providers: [
+        ...baseConfigRaw().providers,
+        { provider: "devin", connectionId: "conn-devin", completeInventory: true },
+      ],
+    }).config;
+    const summary = await runSync(d, { running: false });
+    expect(summary.skipped).toBe(false);
+    // Bare id via owned_by fallback (no model_quotas in this fixture), and the
+    // Devin namespaced id despite owned_by: anthropic.
+    expect(summary.providerModels?.claude).toContain("claude-opus-4-5");
+    expect(summary.providerModels?.devin).toEqual(["devin/claude-opus-4-5"]);
+    expect(summary.modelOverlaps).toEqual([]);
+    assertNoKeyLeak(s);
+  });
+
+  it("a missing client secret skips the catalog with a warning, sync still succeeds", async () => {
+    const s = store();
+    const d = deps(s, mockFetch() as unknown as typeof fetch);
+    const { config } = parseConfig({ ...baseConfigRaw(), clientApiKeySecretRef: undefined });
+    d.config = config;
+    const summary = await runSync(d, { running: false });
+    expect(summary.skipped).toBe(false);
+    expect(summary.errors.some((e) => e.includes("clientApiKeySecretRef"))).toBe(true);
+    expect(summary.providerModels).toBeUndefined();
+    expect(summary.modelOverlaps).toBeUndefined();
+  });
+
+  it("a 401 from /v1/models never spends the management strike budget", async () => {
+    const s = store();
+    const summary = await runSync(
+      deps(s, mockFetch({ modelsStatus: 401 }) as unknown as typeof fetch),
+      { running: false },
+    );
+    expect(summary.skipped).toBe(false); // best-effort: quota aggregation proceeds
+    expect(summary.errors.some((e) => e.includes("/v1/models"))).toBe(true);
+    expect(s.strike.failures).toHaveLength(0);
+    expect(s.strike.secretBad).toBe(false);
+    expect(s.strike.disabled).toBe(false);
+    assertNoKeyLeak(s);
+  });
+
+  it("a colliding bare id becomes model-overlap drift, proven for nobody", async () => {
+    const fetchOverlap = vi.fn(async (input: string | URL | Request): Promise<Response> => {
+      const url = new URL(String(input));
+      if (url.pathname === "/v0/management/auth-files") {
+        return jsonResponse(200, [
+          {
+            id: "claude-1",
+            provider: "claude",
+            model_quotas: {
+              "shared-bare-model": {
+                observed_at: NOW,
+                signals: { "anthropic-ratelimit-unified-5h-utilization": "0.2" },
+              },
+            },
+          },
+          {
+            id: "codex-1",
+            provider: "codex",
+            model_quotas: {
+              "shared-bare-model": {
+                observed_at: NOW,
+                signals: { "x-codex-primary-used-percent": "10" },
+              },
+            },
+          },
+        ]);
+      }
+      if (url.pathname === "/v1/models") {
+        return jsonResponse(200, { data: [{ id: "shared-bare-model", owned_by: "openai" }] });
+      }
+      return new Response("not found", { status: 404 });
+    });
+    const s = store();
+    const d = deps(s, fetchOverlap as unknown as typeof fetch);
+    d.config = parseConfig({
+      ...baseConfigRaw(),
+      providers: [
+        { provider: "claude", connectionId: "conn-claude", completeInventory: true },
+        { provider: "codex", connectionId: "conn-codex", completeInventory: true },
+      ],
+      pluginQuotaIds: {},
+    }).config;
+    const summary = await runSync(d, { running: false });
+    expect(summary.skipped).toBe(false);
+    expect(summary.modelOverlaps).toEqual([{ id: "shared-bare-model", providers: ["claude", "codex"] }]);
+    expect(summary.providerModels?.claude ?? []).not.toContain("shared-bare-model");
+    expect(summary.providerModels?.codex ?? []).not.toContain("shared-bare-model");
+    const overlapDrift = (summary.drift ?? []).filter((f) => f.kind === "model-overlap");
+    expect(overlapDrift.map((f) => f.provider).sort()).toEqual(["claude", "codex"]);
+    expect(summary.errors.some((e) => e.includes("shared-bare-model"))).toBe(true);
+  });
+
+  it("flags the canonical overlap from the live served set when antigravity reports no model_quotas", async () => {
+    // Stock `claude-sonnet-4-6` is served by both claude and antigravity;
+    // antigravity's auth file carries no per-model state for it, so only the
+    // per-credential served set reveals the second claim.
+    const servedByFile: Record<string, string[]> = {
+      "claude-file": ["claude-sonnet-4-6"],
+      "antigravity-file": ["claude-sonnet-4-6"],
+    };
+    const fetchServed = vi.fn(async (input: string | URL | Request): Promise<Response> => {
+      const url = new URL(String(input));
+      if (url.pathname === "/v0/management/auth-files") {
+        return jsonResponse(200, [
+          {
+            id: "claude-1",
+            name: "claude-file",
+            provider: "claude",
+            model_quotas: {
+              "claude-sonnet-4-6": {
+                observed_at: NOW,
+                signals: { "anthropic-ratelimit-unified-5h-utilization": "0.2" },
+              },
+            },
+          },
+          { id: "antigravity-1", name: "antigravity-file", provider: "antigravity" },
+        ]);
+      }
+      if (url.pathname === "/v0/management/auth-files/models") {
+        const name = url.searchParams.get("name") ?? "";
+        if (!(name in servedByFile)) return new Response("no such file", { status: 404 });
+        return jsonResponse(200, { data: servedByFile[name].map((id) => ({ id })) });
+      }
+      if (url.pathname === "/v1/models") {
+        return jsonResponse(200, { data: [{ id: "claude-sonnet-4-6" }] });
+      }
+      return new Response("not found", { status: 404 });
+    });
+    const s = store();
+    const d = deps(s, fetchServed as unknown as typeof fetch);
+    d.config = parseConfig({
+      ...baseConfigRaw(),
+      providers: [
+        { provider: "claude", connectionId: "conn-claude", completeInventory: true },
+        { provider: "antigravity", connectionId: "conn-antigravity", completeInventory: true },
+      ],
+      pluginQuotaIds: {},
+    }).config;
+    const summary = await runSync(d, { running: false });
+    expect(summary.skipped).toBe(false);
+    expect(summary.modelOverlaps).toEqual([
+      { id: "claude-sonnet-4-6", providers: ["antigravity", "claude"] },
+    ]);
+    expect(summary.providerModels?.claude ?? []).not.toContain("claude-sonnet-4-6");
+    expect(summary.providerModels?.antigravity ?? []).not.toContain("claude-sonnet-4-6");
+    const overlapDrift = (summary.drift ?? []).filter((f) => f.kind === "model-overlap");
+    expect(overlapDrift.map((f) => f.provider).sort()).toEqual(["antigravity", "claude"]);
+    assertNoKeyLeak(s);
+  });
+
+  it("a live served set supersedes a stale model_quotas claim (no false overlap)", async () => {
+    // Claude's auth file still carries a `model_quotas` key for
+    // `shared-live-model`, but Claude's live served set excludes it while
+    // antigravity's live set includes it. Live has spoken for both files, so
+    // the stale quota key — and the stale `owned_by: anthropic` fallback —
+    // must not fabricate a Claude/antigravity overlap.
+    const servedByFile: Record<string, string[]> = {
+      "claude-file": ["claude-opus-4-5"],
+      "antigravity-file": ["shared-live-model"],
+    };
+    const fetchSupersede = vi.fn(async (input: string | URL | Request): Promise<Response> => {
+      const url = new URL(String(input));
+      if (url.pathname === "/v0/management/auth-files") {
+        return jsonResponse(200, [
+          {
+            id: "claude-1",
+            name: "claude-file",
+            provider: "claude",
+            model_quotas: {
+              "claude-opus-4-5": {
+                observed_at: NOW,
+                signals: { "anthropic-ratelimit-unified-5h-utilization": "0.2" },
+              },
+              "shared-live-model": {
+                observed_at: NOW,
+                signals: { "anthropic-ratelimit-unified-5h-utilization": "0.2" },
+              },
+            },
+          },
+          { id: "antigravity-1", name: "antigravity-file", provider: "antigravity" },
+        ]);
+      }
+      if (url.pathname === "/v0/management/auth-files/models") {
+        const name = url.searchParams.get("name") ?? "";
+        if (!(name in servedByFile)) return new Response("no such file", { status: 404 });
+        return jsonResponse(200, { data: servedByFile[name].map((id) => ({ id })) });
+      }
+      if (url.pathname === "/v1/models") {
+        return jsonResponse(200, {
+          data: [
+            { id: "claude-opus-4-5", owned_by: "anthropic" },
+            { id: "shared-live-model", owned_by: "anthropic" },
+          ],
+        });
+      }
+      return new Response("not found", { status: 404 });
+    });
+    const s = store();
+    const d = deps(s, fetchSupersede as unknown as typeof fetch);
+    d.config = parseConfig({
+      ...baseConfigRaw(),
+      providers: [
+        { provider: "claude", connectionId: "conn-claude", completeInventory: true },
+        { provider: "antigravity", connectionId: "conn-antigravity", completeInventory: true },
+      ],
+      pluginQuotaIds: {},
+    }).config;
+    const summary = await runSync(d, { running: false });
+    expect(summary.skipped).toBe(false);
+    expect(summary.modelOverlaps).toEqual([]);
+    expect(summary.providerModels?.antigravity).toEqual(["shared-live-model"]);
+    expect(summary.providerModels?.claude).toEqual(["claude-opus-4-5"]);
+    const overlapDrift = (summary.drift ?? []).filter((f) => f.kind === "model-overlap");
+    expect(overlapDrift).toEqual([]);
+    assertNoKeyLeak(s);
+  });
+
+  it("a disabled account's model_quotas cannot fabricate an overlap", async () => {
+    // The old Claude credential is disabled but still carries a quota key for
+    // the id antigravity live-serves. Disabling the credential must clear its
+    // claims: no overlap, antigravity proven.
+    const fetchDisabled = vi.fn(async (input: string | URL | Request): Promise<Response> => {
+      const url = new URL(String(input));
+      if (url.pathname === "/v0/management/auth-files") {
+        return jsonResponse(200, [
+          {
+            id: "claude-1",
+            provider: "claude",
+            disabled: true,
+            model_quotas: {
+              "shared-live-model": {
+                observed_at: NOW,
+                signals: { "anthropic-ratelimit-unified-5h-utilization": "0.2" },
+              },
+            },
+          },
+          { id: "antigravity-1", name: "antigravity-file", provider: "antigravity" },
+        ]);
+      }
+      if (url.pathname === "/v0/management/auth-files/models") {
+        if (url.searchParams.get("name") !== "antigravity-file") {
+          return new Response("no such file", { status: 404 });
+        }
+        return jsonResponse(200, { data: [{ id: "shared-live-model" }] });
+      }
+      if (url.pathname === "/v1/models") {
+        return jsonResponse(200, { data: [{ id: "shared-live-model" }] });
+      }
+      return new Response("not found", { status: 404 });
+    });
+    const s = store();
+    const d = deps(s, fetchDisabled as unknown as typeof fetch);
+    d.config = parseConfig({
+      ...baseConfigRaw(),
+      providers: [
+        { provider: "claude", connectionId: "conn-claude", completeInventory: true },
+        { provider: "antigravity", connectionId: "conn-antigravity", completeInventory: true },
+      ],
+      pluginQuotaIds: {},
+    }).config;
+    const summary = await runSync(d, { running: false });
+    expect(summary.skipped).toBe(false);
+    expect(summary.modelOverlaps).toEqual([]);
+    expect(summary.providerModels?.antigravity).toEqual(["shared-live-model"]);
+    const overlapDrift = (summary.drift ?? []).filter((f) => f.kind === "model-overlap");
+    expect(overlapDrift).toEqual([]);
+    assertNoKeyLeak(s);
+  });
+
+  it("a 404 served-set endpoint on every file degrades to the heuristic with a warning", async () => {
+    const fetchNoServedSet = vi.fn(async (input: string | URL | Request): Promise<Response> => {
+      const url = new URL(String(input));
+      if (url.pathname === "/v0/management/auth-files") {
+        return jsonResponse(200, [
+          { id: "claude-1", name: "claude-file", provider: "claude" },
+        ]);
+      }
+      if (url.pathname === "/v0/management/auth-files/models") {
+        return new Response("no such endpoint", { status: 404 });
+      }
+      if (url.pathname === "/v1/models") {
+        return jsonResponse(200, { data: [{ id: "claude-opus-4-5", owned_by: "anthropic" }] });
+      }
+      return new Response("not found", { status: 404 });
+    });
+    const s = store();
+    const summary = await runSync(deps(s, fetchNoServedSet as unknown as typeof fetch), {
+      running: false,
+    });
+    expect(summary.skipped).toBe(false);
+    // Heuristic still proves the id via owned_by; no strike spent on the 404.
+    expect(summary.providerModels?.claude).toContain("claude-opus-4-5");
+    expect(summary.modelOverlaps).toEqual([]);
+    expect(summary.errors.some((e) => e.includes("falls back to the model_quotas"))).toBe(true);
+    expect(s.strike.failures).toHaveLength(0);
+    assertNoKeyLeak(s);
   });
 });
 
@@ -237,12 +610,12 @@ describe("strike budget (TWO-378 lesson)", () => {
         secretBad: true,
       },
     });
-    // "Edited" config: different intervals, different map — budget must persist.
+    // "Edited" config: different intervals, different rows — budget must persist.
     const edited = parseConfig({
       ...baseConfigRaw(),
       syncIntervalMinutes: 2,
       reservePercent: 20,
-      prefixMap: { "acct-claude-1": "conn-a1" },
+      providers: [{ provider: "claude", connectionId: "conn-claude" }],
     }).config;
     const d = deps(s, mockFetch() as unknown as typeof fetch);
     d.config = edited;
@@ -422,7 +795,7 @@ describe("run guards", () => {
       },
     });
     const fetchMock = mockFetch() as unknown as typeof fetch;
-    const summary = await runSync(deps(s, fetch), { running: false });
+    const summary = await runSync(deps(s, fetchMock), { running: false });
     expect(summary.skipped).toBe(true);
     expect(summary.skipReason).toMatch(/minimum sync interval/);
     expect(fetchMock).not.toHaveBeenCalled();

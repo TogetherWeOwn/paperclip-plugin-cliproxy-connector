@@ -2,8 +2,9 @@
  * Sync job (cron 2–5 min + on-demand): CLIProxy → plugin cache.
  *
  * Reads the CLIProxy account list + per-provider quota through the proposal
- * §4 safe path (GET-only allow-list, `api-call` excluded) and normalises into
- * `AiConnectionUsage`-shaped rows in the plugin's own namespace.
+ * §4 safe path (GET-only allow-list, `api-call` excluded), groups accounts by
+ * provider, and normalises into `AiConnectionUsage`-shaped rows in the
+ * plugin's own namespace. No core changes, no fork.
  *
  * Security properties (all tested):
  * - the management key is resolved per run and kept in memory only;
@@ -15,12 +16,25 @@
  * - single-flight + minimum interval between runs.
  */
 
-import { CliproxyAuthError, CliproxyManagementClient, type ManagementFetch } from "./cliproxy.js";
-import type { ConnectorConfig } from "./config.js";
+import {
+  CliproxyAuthError,
+  CliproxyClientApiClient,
+  CliproxyManagementClient,
+  CliproxyNotFoundError,
+  type ManagementFetch,
+} from "./cliproxy.js";
+import type { ConnectorConfig, ProviderEntry } from "./config.js";
+import {
+  deriveProviderModels,
+  observedModelKeysByProvider,
+  parseModelsPayload,
+  type ServedModel,
+} from "./models.js";
 import { parseAuthFiles, type ParsedAccount } from "./parsers.js";
 import type {
   AccountUsageRow,
   DriftFinding,
+  ModelOverlap,
   StrikeBudgetState,
   SyncFailure,
   SyncSummary,
@@ -62,6 +76,11 @@ export interface SyncDeps {
   now: string;
   /** Resolve the management key from the secret_ref. Per run, memory only. */
   resolveSecret: (ref: unknown) => Promise<string>;
+  /**
+   * Resolve the client (non-management) API key from its secret_ref, for
+   * `GET /v1/models` only. Per run, memory only, same as the management key.
+   */
+  resolveClientSecret: (ref: unknown) => Promise<string>;
   fetchImpl?: ManagementFetch;
   loadStrike: () => Promise<StrikeBudgetState>;
   saveStrike: (s: StrikeBudgetState) => Promise<void>;
@@ -187,40 +206,106 @@ export async function runSync(deps: SyncDeps, inFlight: { running: boolean }): P
         throw err;
       });
 
-      // Per-plugin quota fetch is best-effort: a failing plugin route leaves
-      // the account on its passive signals (or unknown), never headroom.
-      // Raw payloads ride along by prefix; parseAuthFiles parses each with
-      // its owning account's provider + allow-list.
-      const pluginPayloadByPrefix = new Map<string, unknown>();
+      // Per-provider plugin quota fetch is best-effort: a failing plugin
+      // route leaves the provider's accounts on their passive signals (or
+      // unknown), never headroom. One fetch per configured provider; raw
+      // payloads ride along by provider and are attached to every enabled
+      // account row of that provider at parse time.
+      const pluginPayloadByProvider = new Map<string, unknown>();
       const pluginErrors: string[] = [];
-      for (const [prefix, pluginId] of Object.entries(deps.config.pluginQuotaIds)) {
+      const fetchedPluginIds = new Map<string, string>();
+      for (const entry of deps.config.providers) {
+        const pluginId = deps.config.pluginQuotaIds[entry.provider];
+        if (!pluginId) continue;
+        if (fetchedPluginIds.has(pluginId)) {
+          const first = fetchedPluginIds.get(pluginId) as string;
+          const prior = pluginPayloadByProvider.get(first);
+          if (prior !== undefined) pluginPayloadByProvider.set(entry.provider, prior);
+          continue;
+        }
         try {
-          pluginPayloadByPrefix.set(prefix, await client.getPluginQuota(pluginId));
+          const payload = await client.getPluginQuota(pluginId);
+          fetchedPluginIds.set(pluginId, entry.provider);
+          pluginPayloadByProvider.set(entry.provider, payload);
         } catch (err) {
           if (err instanceof CliproxyAuthError) throw err; // stop after first rejected key
-          pluginErrors.push(`${prefix} (plugin ${pluginId}): ${err instanceof Error ? err.message : "fetch failed"}`);
+          pluginErrors.push(`${entry.provider} (plugin ${pluginId}): ${err instanceof Error ? err.message : "fetch failed"}`);
         }
       }
 
       const { accounts, unkeyed, warnings } = parseAuthFiles(authFiles, {
         now: deps.now,
         allowLists: deps.config.providerWindows,
-        pluginPayloadByPrefix,
+        pluginPayloadByProvider,
       });
 
-      // Group by prefix: duplicates defeat pinning (spike G-K1) and alarm loudly.
-      const byPrefix = new Map<string, typeof accounts>();
+      // Group by stable row key: duplicates defeat keying (spike G-K1) and
+      // alarm loudly. The parser already drops repeats; a repeated key here
+      // means two entries hashed alike — keep the first.
+      const byKey = new Map<string, ParsedAccount>();
       for (const a of accounts) {
-        const list = byPrefix.get(a.prefix) ?? [];
-        list.push(a);
-        byPrefix.set(a.prefix, list);
+        if (!byKey.has(a.key)) byKey.set(a.key, a);
       }
 
-      const { rows, drift } = accountsToRows(byPrefix, unkeyed, deps.config.prefixMap);
+      const { rows, drift } = accountsToRows(byKey, deps.config.providers, unkeyed);
 
-      const errors = [...pluginErrors, ...warnings];
+      // Per-credential live served sets (best-effort): one pinned
+      // `GET auth-files/models?name=<file>` per enabled auth file, grouped by
+      // auth-file provider. A missing endpoint (404 on every file, e.g. an
+      // older CLIProxy) degrades to the `model_quotas` heuristic with a
+      // warning; auth failures propagate to the strike budget like every
+      // other management GET.
+      const servedSets = await fetchServedSets(client, accounts);
+
+      // Served-model catalog (best-effort): live `/v1/models` with the
+      // *client* key, intersected with the auth-file list. A failed or
+      // unconfigured catalog only disables derivation + overlap detection
+      // for this run — quota aggregation still proceeds. Client-key 401/403s
+      // are ordinary fetch failures here: they never touch the management
+      // strike budget (different key, no host lockout).
+      const catalog = await fetchModelCatalog(deps);
+      // Live served sets supersede the heuristic per credential: an account
+      // whose file answered successfully claims models only through its live
+      // set, so a stale `model_quotas` key cannot fabricate an overlap.
+      // Accounts with no usable file name (or a failed fetch) keep the
+      // heuristic — that is the fallback. Disabled accounts are excluded
+      // everywhere else (quota aggregation, served-set fetching); they are
+      // excluded here too, so disabling a credential clears its claims.
+      const quotaAccounts = accounts.filter(
+        (a) => a.status !== "disabled" && !(a.fileName && servedSets.okFiles.has(a.fileName)),
+      );
+      const derivation = deriveProviderModels(catalog.served, {
+        authProviders: [
+          ...new Set([
+            ...accounts.map((a) => a.provider),
+            ...deps.config.providers.map((p) => p.provider),
+          ]),
+        ],
+        observedKeysByProvider: observedModelKeysByProvider(quotaAccounts),
+        servedByProvider: servedSets.byProvider,
+        liveOkProviders: [...servedSets.okProviders],
+      });
+      for (const overlap of derivation.overlaps) {
+        for (const provider of overlap.providers) {
+          drift.push({
+            kind: "model-overlap",
+            provider,
+            detail:
+              `model ${JSON.stringify(overlap.id)} is served by CLIProxy and maps to more than one provider ` +
+              `(${overlap.providers.join(", ")}); it is not counted as ${provider}'s proven model. ` +
+              `Quota still groups by auth-file provider. If this id comes from an openai-compat entry, ` +
+              `setting that entry's stock prefix field disambiguates it (optional).`,
+          });
+        }
+      }
+
+      const errors = [...pluginErrors, ...warnings, ...servedSets.warnings, ...catalog.warnings, ...derivation.warnings];
+      const providerModels: Record<string, string[]> | undefined =
+        catalog.available ? derivation.providerModels : undefined;
+      const modelOverlaps: ModelOverlap[] | undefined =
+        catalog.available ? derivation.overlaps : undefined;
       for (const d of drift) {
-        await deps.logActivity(`cliproxy-connector drift [${d.kind}] ${d.prefix}: ${d.detail}`, {
+        await deps.logActivity(`cliproxy-connector drift [${d.kind}] ${d.provider}: ${d.detail}`, {
           companyId: deps.companyId,
         });
       }
@@ -231,6 +316,8 @@ export async function runSync(deps: SyncDeps, inFlight: { running: boolean }): P
         rowsWritten: Object.keys(rows).length,
         drift,
         errors,
+        providerModels,
+        modelOverlaps,
       });
       await deps.saveSync(rows, result);
       // A success clears the last failure so the page stops showing it.
@@ -258,62 +345,229 @@ export async function runSync(deps: SyncDeps, inFlight: { running: boolean }): P
 }
 
 /**
- * Turn parsed accounts (grouped by prefix) into cache rows + drift findings.
- * Exported so route-level regression tests run the real sync mapping instead
- * of hand-built rows.
+ * Fetch the live per-credential served sets for model → provider derivation.
+ * One pinned `GET auth-files/models?name=<file>` per enabled auth file with
+ * a usable entry `name` (deduplicated by name), grouped by auth-file
+ * provider — intra-family sharing is one claim, not ambiguity. Successfully
+ * fetched file names are reported in `okFiles` (empty answers included) so
+ * the caller can let live membership supersede those credentials'
+ * `model_quotas` keys; files without a usable name are skipped with a warning
+ * (their `model_quotas` evidence still counts). Always best-effort except
+ * auth: a 401/403 rethrows to the
+ * strike budget; a 404 on *every* file means the endpoint is missing on this
+ * CLIProxy build and derivation degrades to the heuristic with one warning;
+ * any other per-file failure warns for that file and keeps the rest.
+ */
+async function fetchServedSets(
+  client: CliproxyManagementClient,
+  accounts: ParsedAccount[],
+): Promise<{
+  byProvider: Map<string, Set<string>>;
+  /** File names whose served set answered successfully (empty sets included). */
+  okFiles: Set<string>;
+  /** Providers with at least one successfully fetched file. */
+  okProviders: Set<string>;
+  warnings: string[];
+}> {
+  const warnings: string[] = [];
+  const byProvider = new Map<string, Set<string>>();
+  const okFiles = new Set<string>();
+  const okProviders = new Set<string>();
+  // Enabled files only; group names so one GET serves every entry sharing it.
+  const providersByName = new Map<string, Set<string>>();
+  for (const a of accounts) {
+    if (a.status === "disabled") continue;
+    if (!a.fileName) {
+      warnings.push(
+        `${a.provider}: auth file for row ${a.key} carries no name; skipping its served-set fetch (model_quotas evidence still counts).`,
+      );
+      continue;
+    }
+    let set = providersByName.get(a.fileName);
+    if (!set) {
+      set = new Set<string>();
+      providersByName.set(a.fileName, set);
+    }
+    set.add(a.provider);
+  }
+  if (providersByName.size === 0) {
+    warnings.push(
+      "no enabled auth file exposes a name; skipping the served-set fetch this run (model_quotas heuristic still applies).",
+    );
+    return { byProvider, okFiles, okProviders, warnings };
+  }
+  let ok = 0;
+  let notFound = 0;
+  for (const [name, providers] of [...providersByName.entries()].sort()) {
+    let payload: unknown;
+    try {
+      payload = await client.getAuthFileModels(name);
+    } catch (err) {
+      if (err instanceof CliproxyAuthError) throw err;
+      if (err instanceof CliproxyNotFoundError) {
+        notFound += 1;
+        warnings.push(
+          `${[...providers].sort().join(", ")}: served-set fetch for auth file ${JSON.stringify(name)} returned 404; no served evidence from this file this run.`,
+        );
+        continue;
+      }
+      warnings.push(
+        `${[...providers].sort().join(", ")}: served-set fetch for auth file ${JSON.stringify(name)} failed (${err instanceof Error ? err.message : "fetch failed"}); no served evidence from this file this run.`,
+      );
+      continue;
+    }
+    const parsed = parseModelsPayload(payload);
+    ok += 1;
+    // A successful answer — even an empty set — is evidence: this file's live
+    // membership supersedes its historical model_quotas keys (see the call
+    // site), so a stale quota key cannot fabricate an overlap.
+    okFiles.add(name);
+    for (const provider of providers) okProviders.add(provider);
+    for (const w of parsed.warnings) {
+      warnings.push(`${[...providers].sort().join(", ")} served set (${JSON.stringify(name)}): ${w}`);
+    }
+    for (const m of parsed.models) {
+      for (const provider of providers) {
+        let set = byProvider.get(provider);
+        if (!set) {
+          set = new Set<string>();
+          byProvider.set(provider, set);
+        }
+        set.add(m.id);
+      }
+    }
+  }
+  if (ok === 0 && notFound > 0 && warnings.length > 0) {
+    warnings.push(
+      "the served-set endpoint returned 404 for every enabled auth file (older CLIProxy builds lack it); overlap detection falls back to the model_quotas + owned_by heuristic this run.",
+    );
+  }
+  return { byProvider, okFiles, okProviders, warnings };
+}
+
+/**
+ * Fetch the served-model catalog for model → provider derivation. Always
+ * best-effort: any failure (or a missing client secret) returns `available:
+ * false` with a warning, and the sync proceeds without derivation. Client-key
+ * auth failures never reach the management strike budget.
+ */
+async function fetchModelCatalog(
+  deps: SyncDeps,
+): Promise<{ served: ServedModel[]; warnings: string[]; available: boolean }> {
+  const ref = deps.config.clientApiKeySecretRef;
+  if (ref === undefined || ref === null) {
+    return {
+      served: [],
+      warnings: [
+        "clientApiKeySecretRef is not set: skipping /v1/models; model → provider derivation and overlap detection stay off this run.",
+      ],
+      available: false,
+    };
+  }
+  let clientKey: string;
+  try {
+    clientKey = await deps.resolveClientSecret(ref);
+  } catch (err) {
+    return {
+      served: [],
+      warnings: [
+        `could not resolve the CLIProxy client API secret: ${err instanceof Error ? err.message : "unknown error"}; skipping /v1/models this run.`,
+      ],
+      available: false,
+    };
+  }
+  if (!clientKey) {
+    return {
+      served: [],
+      warnings: ["CLIProxy client API secret resolved empty; skipping /v1/models this run."],
+      available: false,
+    };
+  }
+  try {
+    const modelsClient = new CliproxyClientApiClient({
+      baseUrl: deps.config.cliproxyBaseUrl,
+      key: clientKey,
+      fetchImpl: deps.fetchImpl,
+    });
+    const payload = await modelsClient.getModels();
+    const parsed = parseModelsPayload(payload);
+    return {
+      served: parsed.models,
+      warnings: parsed.warnings.map((w) => `/v1/models: ${w}`),
+      available: true,
+    };
+  } catch (err) {
+    return {
+      served: [],
+      warnings: [
+        `/v1/models unavailable (${err instanceof Error ? err.message : "fetch failed"}); model → provider derivation skipped this run.`,
+      ],
+      available: false,
+    };
+  } finally {
+    // Drop the only in-memory reference to resolved client-key material.
+    clientKey = "";
+  }
+}
+
+/**
+ * Turn parsed accounts (keyed by stable row key) into cache rows + per-
+ * provider drift findings. Exported so route-level regression tests run the
+ * real sync mapping instead of hand-built rows.
  */
 export function accountsToRows(
-  byPrefix: Map<string, ParsedAccount[]>,
+  byKey: Map<string, ParsedAccount>,
+  providers: ProviderEntry[],
   unkeyed: number,
-  prefixMap: Record<string, string>,
 ): { rows: Record<string, AccountUsageRow>; drift: DriftFinding[] } {
   const rows: Record<string, AccountUsageRow> = {};
   const drift: DriftFinding[] = [];
-  for (const [prefix, list] of byPrefix) {
-    if (list.length > 1) {
-      drift.push({
-        kind: "duplicate-prefix",
-        prefix,
-        detail: `${list.length} CLIProxy accounts share prefix ${prefix}; pinning is ambiguous. Keeping the first row only — give every account a unique prefix.`,
-      });
+  const configured = new Map(providers.map((p) => [p.provider, p]));
+  const enabledByProvider = new Map<string, number>();
+  const discovered = new Set<string>();
+
+  for (const [rowKey, a] of byKey) {
+    discovered.add(a.provider);
+    if (a.status !== "disabled") {
+      enabledByProvider.set(a.provider, (enabledByProvider.get(a.provider) ?? 0) + 1);
     }
-    const first = list[0] as ParsedAccount;
-    rows[prefix] = {
-      prefix,
-      connectionId: prefixMap[prefix] ?? null,
-      provider: first.provider,
-      poolFamily: "unknown",
-      limits: first.limits,
-      planType: first.planType,
-      checkedAt: first.checkedAt,
+    rows[rowKey] = {
+      key: rowKey,
+      provider: a.provider,
+      channel: a.channel,
+      status: a.status,
+      statusMessage: a.statusMessage,
+      priority: a.priority,
+      limits: a.limits,
+      planType: a.planType,
+      checkedAt: a.checkedAt,
       source: "plugin:cliproxy-connector",
-      quotaBlind: first.quotaBlind,
-      accountHash: first.accountHash,
-      lastError: first.parseWarnings.length > 0 ? first.parseWarnings.join(" | ") : null,
-      coolingDown: first.coolingDown,
-      cooldownUntil: first.cooldownUntil,
+      quotaBlind: a.quotaBlind,
+      accountHash: a.accountHash,
+      lastError: a.parseWarnings.length > 0 ? a.parseWarnings.join(" | ") : null,
+      coolingDown: a.coolingDown,
+      cooldownUntil: a.cooldownUntil,
     };
-    if (prefixMap[prefix] === undefined) {
-      drift.push({
-        kind: "unmapped-account",
-        prefix,
-        detail: `CLIProxy account ${prefix} (${first.channel}) has no prefix → connectionId mapping; the router cannot trust its quota.`,
-      });
-    }
   }
   if (unkeyed > 0) {
-    drift.push({
-      kind: "unkeyed-observation",
-      prefix: "(unkeyed)",
-      detail: `${unkeyed} auth-files entr${unkeyed === 1 ? "y has" : "ies have"} no single-segment prefix and cannot be keyed to the map; their quota is ignored.`,
-    });
+    // Entries without a stable identity cannot be keyed across syncs and were
+    // ignored. This is a sync warning, not per-provider drift.
   }
-  for (const prefix of Object.keys(prefixMap)) {
-    if (!byPrefix.has(prefix)) {
+  for (const provider of [...discovered].sort()) {
+    if (!configured.has(provider)) {
       drift.push({
-        kind: "mapped-but-missing",
-        prefix,
-        detail: `map points ${prefix} at a connection, but CLIProxy reports no such account; the router decides on missing telemetry for this member.`,
+        kind: "unconfigured-provider",
+        provider,
+        detail: `CLIProxy reports ${provider} accounts but no providers[] row maps it to a connection; the router cannot trust quota for ${provider} and treats it as unknown.`,
+      });
+    }
+  }
+  for (const entry of [...providers].sort((a, b) => a.provider.localeCompare(b.provider))) {
+    if ((enabledByProvider.get(entry.provider) ?? 0) === 0) {
+      drift.push({
+        kind: "no-enabled-accounts",
+        provider: entry.provider,
+        detail: `providers[] maps ${entry.provider} to a connection, but CLIProxy reports zero enabled accounts for it; the provider routes as unknown until accounts appear.`,
       });
     }
   }
@@ -371,23 +625,24 @@ export async function reenableAfterStrike(
   const nowMs = Date.parse(nowIso);
   const kept = pruneFailures(strike.failures, Number.isNaN(nowMs) ? Date.now() : nowMs);
   const waitUntil = strikeWaitUntil(kept, Number.isNaN(nowMs) ? Date.now() : nowMs);
-  const next: StrikeBudgetState = waitUntil
-    ? {
-        failures: kept,
-        disabled: true,
-        disabledAt: nowIso,
-        disabledReason:
-          `strike budget still full (${kept.length}/${STRIKE_LIMIT} auth failures in 30 min); ` +
-          `wait until ${waitUntil} before probing again. No probe was sent.`,
-        secretBad: false,
-      }
-    : {
-        failures: kept,
-        disabled: false,
-        disabledAt: null,
-        disabledReason: null,
-        secretBad: false,
-      };
+  const next: StrikeBudgetState =
+    waitUntil
+      ? {
+          failures: kept,
+          disabled: true,
+          disabledAt: nowIso,
+          disabledReason:
+            `strike budget still full (${kept.length}/${STRIKE_LIMIT} auth failures in 30 min); ` +
+            `wait until ${waitUntil} before probing again. No probe was sent.`,
+          secretBad: false,
+        }
+      : {
+          failures: kept,
+          disabled: false,
+          disabledAt: null,
+          disabledReason: null,
+          secretBad: false,
+        };
   await saveStrike(next);
   return next;
 }
