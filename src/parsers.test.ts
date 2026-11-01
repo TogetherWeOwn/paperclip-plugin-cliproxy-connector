@@ -257,6 +257,25 @@ describe("parseHeaderSignals (source-mirrored header maps)", () => {
     expect(limits[0]).toMatchObject({ id: "codex:primary", usedPercent: 1, remainingPercent: 99 });
   });
 
+  it("treats codex overage above 100% as exhausted, not unknown", () => {
+    // 105% used with no explicit denial: dropping the reading would leave no
+    // limiting evidence and the account would route as unknown (selectable).
+    const { limits } = parseHeaderSignals(
+      "codex",
+      { "x-codex-primary-used-percent": "105" },
+      NOW,
+      DEFAULT_PROVIDER_WINDOWS.codex,
+    );
+    expect(limits).toHaveLength(1);
+    expect(limits[0]).toMatchObject({
+      id: "codex:primary",
+      usedPercent: 105,
+      remainingPercent: 0,
+      allowed: false,
+      limitReached: true,
+    });
+  });
+
   it("unknown signal keys are ignored with a summary warning, never headroom", () => {
     const { limits, warnings } = parseHeaderSignals("claude", { "x-something-made-up": "1" }, NOW, ["5h"]);
     expect(limits).toHaveLength(0);
@@ -507,6 +526,13 @@ describe("sanitizeStatusMessage", () => {
     expect(scrubbed).not.toContain("abcdefghijklmnopqrstu");
     expect(scrubbed).toContain("[redacted-email]");
     expect(scrubbed).toContain("[redacted]");
+  });
+
+  it("redacts short credential-like tokens but keeps hyphenated operational words", () => {
+    const scrubbed = sanitizeStatusMessage("auth failed, key ab12cd34ef, retry rate-limited soon") ?? "";
+    expect(scrubbed).not.toContain("ab12cd34ef");
+    expect(scrubbed).toContain("[redacted]");
+    expect(scrubbed).toContain("rate-limited");
   });
 });
 

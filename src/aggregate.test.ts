@@ -185,6 +185,33 @@ describe("aggregate truth table", () => {
     expect(a.retryAt).toBe(iso(NOW_MS + 5 * 3_600_000));
   });
 
+  it("exhausted: an unbounded limiting window caps retryAt at the recheck cadence", () => {
+    // One window is limiting with no usable reset (missing resetsAt); a
+    // sibling window resets 24h out. The account may recover at any time via
+    // the unbounded window, so retryAt is the 60s recheck — never tomorrow.
+    const r = row({
+      key: "acct-a",
+      limits: [
+        limit({ remainingPercent: 0, usedPercent: 100, limitReached: true, resetsAt: null }),
+        limit({
+          id: "claude:7d",
+          label: "Claude unified 7d",
+          usedPercent: 100,
+          remainingPercent: 0,
+          resetsAt: iso(NOW_MS + 24 * 3_600_000),
+          limitReached: true,
+          allowed: false,
+          gating: true,
+          observedAt: NOW,
+          models: null,
+        }),
+      ],
+    });
+    const a = assess([r]);
+    expect(a.state).toBe("exhausted");
+    expect(a.retryAt).toBe(iso(NOW_MS + 60_000)); // default recheckSeconds
+  });
+
   it("unknown: a future-dated fetch time is rejected, never trusted", () => {
     const r = row({ checkedAt: iso(NOW_MS + 3_600_000) });
     const a = assess([r]);

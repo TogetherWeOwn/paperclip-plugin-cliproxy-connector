@@ -13,7 +13,9 @@
  *   `completeInventory` is true. `retryAt` is the earliest per-account
  *   recovery bound across those accounts, where one account's bound is the
  *   latest required reset among its own limiting windows (an account with
- *   both 5h and 7d exhausted recovers only when the later clears).
+ *   both 5h and 7d exhausted recovers only when the later clears) — unless a
+ *   limiting condition has no usable reset, in which case that account
+ *   rechecks at the recheck cadence instead of sleeping past a distant reset.
  * - `unknown` otherwise, including stale data and zero visible accounts.
  *   Never claims headroom.
  *
@@ -306,6 +308,11 @@ export function aggregateProvider(args: {
       allOut = false;
     } else if (verdict.kind === "out") {
       const bounds: number[] = [];
+      // A limiting condition with no usable future reset (missing resetsAt,
+      // a passed reset the parser kept, an unbounded cooldown) may clear at
+      // any time: cap this account's next check at the recheck cadence even
+      // when another window carries a distant reset.
+      let hasUnboundedLimiting = false;
       for (const w of row.limits) {
         if (!w.gating || !windowAppliesToModel(w, model, provider)) continue;
         const resetMs = w.resetsAt ? parseTime(w.resetsAt) : null;
@@ -313,15 +320,24 @@ export function aggregateProvider(args: {
         // `allowed` is still true: the account cannot route until they clear.
         const limiting =
           w.allowed === false || w.limitReached || (w.remainingPercent !== null && w.remainingPercent <= reserve);
-        if (limiting && resetMs !== null && resetMs > nowMs) bounds.push(resetMs);
+        if (!limiting) continue;
+        if (resetMs !== null && resetMs > nowMs) bounds.push(resetMs);
+        else hasUnboundedLimiting = true;
       }
-      if (row.cooldownUntil) {
-        const untilMs = parseTime(row.cooldownUntil);
+      if (row.coolingDown) {
+        const untilMs = row.cooldownUntil ? parseTime(row.cooldownUntil) : null;
         if (untilMs !== null && untilMs > nowMs) bounds.push(untilMs);
+        else hasUnboundedLimiting = true;
       }
+      const recheckAt = nowMs + config.recheckSeconds * 1000;
+      // Unbounded limiting may clear at any time, so recheck at the cadence
+      // even when a sibling window carries a distant reset. Fully bounded
+      // accounts keep the latest reset: nothing can change before it.
       // An out account with no future bound still re-wakes at the recheck
       // cadence so exhaustion never waits forever on a missing reset.
-      perAccountBounds.push(bounds.length > 0 ? Math.max(...bounds) : nowMs + config.recheckSeconds * 1000);
+      perAccountBounds.push(
+        hasUnboundedLimiting ? recheckAt : bounds.length > 0 ? Math.max(...bounds) : recheckAt,
+      );
     } else {
       allOut = false;
     }

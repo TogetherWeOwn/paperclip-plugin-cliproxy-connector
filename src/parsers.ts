@@ -92,17 +92,27 @@ export function toIsoTimestamp(v: unknown): string | null {
 
 /**
  * Scrub an upstream `status_message` before it reaches the plugin page.
- * Emails become `[redacted-email]`, long identifier-like tokens become
- * `[redacted]`, and the note is capped at 120 chars. Short operational notes
- * ("ok", "429 rate limited") pass through unchanged.
+ * Emails become `[redacted-email]`; any whitespace-delimited token that
+ * looks credential-like — a 20+ word-char run, or 8+ chars mixing letters
+ * with digits (short API keys, session ids) — becomes `[redacted]`. The
+ * digit requirement keeps hyphenated operational words ("rate-limited")
+ * passing through. The note is capped at 120 chars. Plain notes ("ok",
+ * "429 rate limited") pass through unchanged.
  */
 export function sanitizeStatusMessage(raw: string | null): string | null {
   if (!raw) return null;
   let s = raw.trim();
   if (!s) return null;
   s = s.replace(/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g, "[redacted-email]");
-  // Long bearer/token-like runs (20+ word chars) are never operational notes.
-  s = s.replace(/[A-Za-z0-9_\-]{20,}/g, "[redacted]");
+  s = s
+    .split(/\s+/)
+    .map((tok) => {
+      if (tok === "[redacted-email]") return tok;
+      if (/[A-Za-z0-9_\-]{20,}/.test(tok)) return "[redacted]";
+      if (tok.length >= 8 && /[A-Za-z]/.test(tok) && /[0-9]/.test(tok)) return "[redacted]";
+      return tok;
+    })
+    .join(" ");
   if (s.length > 120) s = `${s.slice(0, 117)}...`;
   return s;
 }
@@ -502,9 +512,10 @@ export function parseHeaderSignals(
       if (metric === "used-percent") {
         // Codex reports 0-100 percent directly (unlike Claude's 0-1
         // utilization fraction): never route through toUsedPercent, which
-        // would turn 1% into 100%.
+        // would turn 1% into 100%. Overage readings up to 150 still count —
+        // they mean exhausted, and dropping them would read unknown instead.
         const n = Number(value);
-        const used = Number.isFinite(n) && n >= 0 && n <= 100 ? n : null;
+        const used = Number.isFinite(n) && n >= 0 && n <= 150 ? n : null;
         if (used !== null) a.used = Math.max(a.used ?? -Infinity, used);
         else ignored += 1;
       } else if (metric === "reset-at") {

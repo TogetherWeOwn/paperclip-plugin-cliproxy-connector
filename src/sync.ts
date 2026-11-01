@@ -424,8 +424,13 @@ async function fetchServedSets(
         );
         continue;
       }
+      // The client embeds the raw auth-file name in validation errors
+      // (CliproxyConfigError): scrub it before persisting, the same way the
+      // file reference above masks the name. Auth-file names can be emails.
+      const rawMessage = err instanceof Error ? err.message : "fetch failed";
+      const safeMessage = name ? rawMessage.split(name).join(fileRef) : rawMessage;
       warnings.push(
-        `${[...providers].sort().join(", ")}: served-set fetch for ${fileRef} failed (${err instanceof Error ? err.message : "fetch failed"}); no served evidence from this file this run.`,
+        `${[...providers].sort().join(", ")}: served-set fetch for ${fileRef} failed (${safeMessage}); no served evidence from this file this run.`,
       );
       continue;
     }

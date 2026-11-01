@@ -202,6 +202,28 @@ describe("happy path", () => {
     assertNoKeyLeak(s);
   });
 
+  it("scrubs invalid auth-file names out of client validation errors", async () => {
+    // A name that fails client validation throws CliproxyConfigError with
+    // the raw name embedded; the persisted warning must carry only the
+    // hashed file reference, never the name itself.
+    const evilName = "bad/name-evil";
+    const fetchInvalid = vi.fn(async (input: string | URL | Request): Promise<Response> => {
+      const url = new URL(String(input));
+      if (url.pathname === "/v0/management/auth-files") {
+        return jsonResponse(200, [{ id: "claude-1", name: evilName, provider: "claude" }]);
+      }
+      if (url.pathname.includes("/plugins/")) return jsonResponse(200, pluginQuotaBody());
+      return new Response("not found", { status: 404 });
+    });
+    const s = store();
+    const summary = await runSync(deps(s, fetchInvalid as unknown as typeof fetch), { running: false });
+    expect(summary.skipped).toBe(false);
+    const blob = JSON.stringify([summary.errors, summary.drift, s.activity]);
+    expect(blob).not.toContain(evilName);
+    expect(summary.errors.some((e) => e.includes("auth file"))).toBe(true);
+    assertNoKeyLeak(s);
+  });
+
   it("attaches the per-provider plugin quota to every enabled account of that provider", async () => {
     const s = store();
     await runSync(deps(s, mockFetch() as unknown as typeof fetch), { running: false });

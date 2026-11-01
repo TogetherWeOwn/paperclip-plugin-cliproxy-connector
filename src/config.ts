@@ -246,6 +246,18 @@ export function parseConfig(raw: unknown): { config: ConnectorConfig; validation
           `providerWindows[${provider}] is empty: this converts a gated provider to quota-blind fail-open (routes without quota knowledge). Restore the defaults if that was not intended.`,
         );
       }
+      if (provider.toLowerCase() === "codex" && lowered.length > 0) {
+        // Stock Codex headers carry bare `primary` / `secondary` windows: an
+        // operator override that only lists namespaced windows (e.g. ["5h",
+        // "weekly"]) silently stops gating stock quota. Warn so existing
+        // installations update their override instead of routing blind.
+        const gates = (id: string) => lowered.some((sub) => sub !== "" && id.includes(sub));
+        if (!gates("codex:primary") || !gates("codex:secondary")) {
+          warnings.push(
+            `providerWindows[codex] does not gate the stock primary/secondary windows; existing overrides need "primary" and "secondary" entries (or a matching substring) or stock Codex quota stops constraining routing.`,
+          );
+        }
+      }
       providerWindows[provider.toLowerCase()] = lowered;
     }
   }
