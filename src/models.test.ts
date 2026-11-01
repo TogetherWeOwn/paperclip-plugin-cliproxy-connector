@@ -240,6 +240,20 @@ describe("deriveProviderModels", () => {
     expect(overlaps).toEqual([]);
   });
 
+  it("an ineligible exact owned_by match falls through to the vendor alias", () => {
+    // `openai` configured without an account is in scope but ineligible; it
+    // must not swallow codex's fallback claim for an owned_by: openai id.
+    const served = parseModelsPayload({ data: [{ id: "gpt-5x", owned_by: "openai" }] }).models;
+    const { providerModels, overlaps } = deriveProviderModels(served, {
+      authProviders: ["openai", "codex"],
+      observedKeysByProvider: new Map(),
+      ownedByEligible: ["codex"],
+    });
+    expect(providerModels.codex).toEqual(["gpt-5x"]);
+    expect(providerModels.openai ?? []).not.toContain("gpt-5x");
+    expect(overlaps).toEqual([]);
+  });
+
   it("leaves an unattributable bare id out with a warning, never headroom", () => {
     const served = parseModelsPayload({ data: [{ id: "mystery-model" }] }).models;
     const { providerModels, overlaps, warnings } = deriveProviderModels(served, {

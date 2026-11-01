@@ -673,6 +673,15 @@ describe("sanitizeStatusMessage", () => {
     expect(scrubbed).toContain("llama-3-3-70b");
     expect(scrubbed).toContain("[redacted]");
   });
+
+  it("redacts internal-digit slugs and label:credential tokens, keeps timestamps", () => {
+    const scrubbed =
+      sanitizeStatusMessage("key sk-live-abc123def, token:ab12cd34ef seen 2026-11-01T12:00:00Z") ?? "";
+    expect(scrubbed).not.toContain("sk-live-abc123def");
+    expect(scrubbed).not.toContain("token:ab12cd34ef");
+    expect(scrubbed).toContain("2026-11-01T12:00:00Z");
+    expect(scrubbed).toContain("[redacted]");
+  });
 });
 
 describe("hashIdentity redaction", () => {

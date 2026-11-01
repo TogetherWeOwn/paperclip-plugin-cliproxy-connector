@@ -129,11 +129,16 @@ export function sanitizeStatusMessage(raw: string | null): string | null {
  * (`error=429` keeps; `token=ab12cd34ef` redacts), and lowercase hyphenated
  * slugs without credential tells (`gpt-4o-mini`, `claude-sonnet-4-5` model
  * ids pass; `sk-live-abc123` and `sk-live-a1b2c3d4` still redact).
+ * `:`/`/`/`.` tokens are operational only when no separated segment is
+ * itself credential-shaped (`error=429` and `HTTP/1.1` keep;
+ * `token:ab12cd34ef` redacts) — timestamps are exempted first so their
+ * letter/digit segments (`2026-11-01T12`) never misfire.
  */
 function isOperationalToken(tok: string): boolean {
   const eq = tok.lastIndexOf("=");
   if (eq >= 0) return !isCredentialCore(tok.slice(eq + 1));
-  if (/[/:.]/.test(tok)) return true;
+  if (/\d{2}:\d{2}:\d{2}/.test(tok)) return true;
+  if (/[/:.]/.test(tok)) return !tok.split(/[/:.]/).some((seg) => isCredentialCore(seg));
   return isSlugLike(tok);
 }
 
@@ -149,21 +154,22 @@ function isCredentialCore(core: string): boolean {
 
 /**
  * Lowercase hyphenated slug (`gpt-4o-mini`) that is not credential-shaped.
- * Credentials hide in slugs two ways: a trailing digit run (`abc123`) and
- * interleaved alphanumerics (`a1b2c3d4`, three or more letter/digit flips).
- * Model ids have neither (single isolated digits: `4o`, `70b`, `4`, `5`).
+ * Every non-initial segment must be a model-id part: a word (`mini`), a
+ * small number (`4`, `70`), a leading run plus letters (`4o`, `70b`), or a
+ * trailing single digit (`v3`, `o1`). Anything else — an internal digit run
+ * (`abc123def`), a trailing run (`abc123`), interleaved alphanumerics
+ * (`a1b2c3d4`) — reads as a credential and redacts.
  */
 function isSlugLike(core: string): boolean {
-  if (!/^[a-z]+(-[a-z0-9]+)+$/.test(core)) return false;
-  if (/\d{2,}$/.test(core)) return false;
-  let flips = 0;
-  const cls = (c: string) => (/[A-Za-z]/.test(c) ? "L" : /[0-9]/.test(c) ? "D" : "O");
-  for (let i = 1; i < core.length; i++) {
-    const a = cls(core[i - 1] as string);
-    const b = cls(core[i] as string);
-    if ((a === "L" && b === "D") || (a === "D" && b === "L")) flips += 1;
-  }
-  return flips < 3;
+  const parts = core.split("-");
+  if (parts.length < 2 || !/^[a-z]+$/.test(parts[0] as string)) return false;
+  return (parts.slice(1) as string[]).every(
+    (seg) =>
+      /^[a-z]+$/.test(seg) ||
+      /^[0-9]{1,4}$/.test(seg) ||
+      /^[0-9]+[a-z]+$/.test(seg) ||
+      /^[a-z]+[0-9]$/.test(seg),
+  );
 }
 
 /** Opaque sha256 of an upstream account identity. Null when there is nothing to hash. */

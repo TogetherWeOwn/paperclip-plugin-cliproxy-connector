@@ -86,14 +86,18 @@ describe("providers[] rows", () => {
 describe("providerWindows overrides", () => {
   it("warns when a codex override drops the stock primary/secondary windows", () => {
     // Operator overrides replace the defaults: ["5h", "weekly"] alone stops
-    // gating stock x-codex-primary-* / x-codex-secondary-* quota.
-    const { validation } = parseConfig(base({ providerWindows: { codex: ["5h", "weekly"] } }));
-    expect(validation.ok).toBe(true);
-    expect(validation.warnings.some((w) => w.includes("primary/secondary"))).toBe(true);
+    // gating stock x-codex-primary-* / x-codex-secondary-* quota. ["codex"]
+    // looks covering but gates nothing either: gating is decided on the bare
+    // window names ("primary"), which do not contain "codex".
+    for (const windows of [["5h", "weekly"], ["codex"]]) {
+      const { validation } = parseConfig(base({ providerWindows: { codex: windows } }));
+      expect(validation.ok).toBe(true);
+      expect(validation.warnings.some((w) => w.includes("primary/secondary"))).toBe(true);
+    }
   });
 
   it("stays quiet when a codex override still gates the stock windows", () => {
-    for (const windows of [["codex"], ["primary", "secondary"], ["5h", "primary", "weekly", "secondary"]]) {
+    for (const windows of [["primary", "secondary"], ["5h", "primary", "weekly", "secondary"]]) {
       const { validation } = parseConfig(base({ providerWindows: { codex: windows } }));
       expect(validation.warnings.some((w) => w.includes("primary/secondary"))).toBe(false);
     }

@@ -247,12 +247,14 @@ export function parseConfig(raw: unknown): { config: ConnectorConfig; validation
         );
       }
       if (provider.toLowerCase() === "codex" && lowered.length > 0) {
-        // Stock Codex headers carry bare `primary` / `secondary` windows: an
-        // operator override that only lists namespaced windows (e.g. ["5h",
-        // "weekly"]) silently stops gating stock quota. Warn so existing
-        // installations update their override instead of routing blind.
-        const gates = (id: string) => lowered.some((sub) => sub !== "" && id.includes(sub));
-        if (!gates("codex:primary") || !gates("codex:secondary")) {
+        // Stock Codex headers carry bare `primary` / `secondary` windows, and
+        // gating is decided on those bare window names (not the `codex:…`
+        // prefixed ids): an override of ["codex"] looks covering but gates
+        // nothing, while ["5h", "weekly"] silently stops gating stock quota.
+        // Probe the names gating actually sees so existing installations
+        // are told to update instead of routing blind.
+        const gates = (window: string) => lowered.some((sub) => sub !== "" && window.includes(sub));
+        if (!gates("primary") || !gates("secondary")) {
           warnings.push(
             `providerWindows[codex] does not gate the stock primary/secondary windows; existing overrides need "primary" and "secondary" entries (or a matching substring) or stock Codex quota stops constraining routing.`,
           );

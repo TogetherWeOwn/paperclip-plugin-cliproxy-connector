@@ -252,10 +252,22 @@ export function deriveProviderModels(
     // accountless provider's fallback claim would fabricate overlaps that
     // hide the actually-serving provider's usable model.
     const eligible = opts.ownedByEligible ? new Set(opts.ownedByEligible.map((p) => p.toLowerCase())) : null;
-    const ownedClaimed =
-      ownedInScope && !liveOk.has(ownedInScope) && (!eligible || eligible.has(ownedInScope))
-        ? ownedInScope
-        : null;
+    // An in-scope exact match that cannot claim must not block the vendor
+    // alias: `openai` configured without an account (in scope, ineligible)
+    // must not swallow codex's fallback claim. The live block stays
+    // absolute — live membership already spoke for that provider — only an
+    // eligibility block falls through to the alias.
+    const ownedClaimed = (() => {
+      if (!ownedInScope) return null;
+      if (!liveOk.has(ownedInScope) && (!eligible || eligible.has(ownedInScope))) return ownedInScope;
+      if (!eligible || liveOk.has(ownedInScope)) return null;
+      const ownedRaw = ownedBy ? ownedBy.trim().toLowerCase() : "";
+      const mapped = ownedRaw ? OWNED_BY_TO_PROVIDER[ownedRaw] : undefined;
+      if (mapped && mapped !== ownedInScope && inScope.has(mapped) && !liveOk.has(mapped) && eligible.has(mapped)) {
+        return mapped;
+      }
+      return null;
+    })();
     const parties = [...new Set([...claimants, ...(ownedClaimed ? [ownedClaimed] : [])])].sort();
     if (parties.length === 1) {
       give(parties[0] as string, id);
