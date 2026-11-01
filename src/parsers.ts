@@ -449,8 +449,12 @@ export function parseHeaderSignals(
     }
     if (provider === "codex" && key === "x-codex-credits-balance") continue; // informational only
     if (provider === "codex" && key.endsWith("-limit-name")) {
-      const m = /^x-codex-(?:(.*?)-)?(?:primary|secondary)-limit-name$/.exec(key);
-      if (m) acc(m[1] ? m[1] : "primary").labelExtra = value;
+      // The tier is part of the window identity, exactly as in the metric
+      // branch below: a bare `secondary` limit-name belongs to `secondary`
+      // (never the primary default), and a namespaced one belongs to
+      // `<ns>-<tier>` (never a phantom `<ns>` window).
+      const m = /^x-codex-(?:(.*?)-)?(primary|secondary)-limit-name$/.exec(key);
+      if (m) acc(m[1] ? `${m[1]}-${m[2]}` : m[2]).labelExtra = value;
       continue;
     }
 
@@ -523,6 +527,12 @@ export function parseHeaderSignals(
 
   const limits: UsageLimitRow[] = [];
   for (const a of byWindow.values()) {
+    // Metadata alone is never a window: a bare limit-name with no quota
+    // reading must not emit an allowed:null row, which reads as limiting
+    // for admission-signal providers and would false-exhaust the account.
+    if (a.used === null && a.allowed === null && !a.limitReached && a.extraResetMs.length === 0) {
+      continue;
+    }
     let usedPercent: number | null = a.used;
     let remainingPercent: number | null =
       usedPercent !== null ? Math.max(0, 100 - Math.min(100, usedPercent)) : null;

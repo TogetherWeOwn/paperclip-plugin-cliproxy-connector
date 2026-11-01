@@ -242,6 +242,50 @@ describe("parseHeaderSignals (source-mirrored header maps)", () => {
     expect(namespaced.limits[0]).toMatchObject({ id: "codex:acme-primary", ...expected });
   });
 
+  it("a bare secondary limit-name labels the secondary window, not primary", () => {
+    const { limits } = parseHeaderSignals(
+      "codex",
+      {
+        "x-codex-secondary-used-percent": "35",
+        "x-codex-secondary-limit-name": "Plus",
+      },
+      NOW,
+      ["secondary"],
+    );
+    expect(limits).toHaveLength(1);
+    expect(limits[0]).toMatchObject({ id: "codex:secondary" });
+    expect(limits[0]?.label).toContain("Plus");
+  });
+
+  it("a namespaced limit-name labels its own tier window, not a phantom namespace window", () => {
+    const { limits } = parseHeaderSignals(
+      "codex",
+      {
+        "x-codex-acme-primary-used-percent": "10",
+        "x-codex-acme-primary-limit-name": "Plus",
+      },
+      NOW,
+      ["acme-primary"],
+    );
+    expect(limits).toHaveLength(1);
+    expect(limits[0]).toMatchObject({ id: "codex:acme-primary" });
+    expect(limits[0]?.label).toContain("Plus");
+  });
+
+  it("a limit-name alone emits no window (metadata is never quota evidence)", () => {
+    // A bare label for an allow-listed namespace must not fabricate an
+    // allowed:null row: for admission-signal providers that reads as
+    // limiting and would false-exhaust the account.
+    const { limits, warnings } = parseHeaderSignals(
+      "codex",
+      { "x-codex-weekly-primary-limit-name": "Plus" },
+      NOW,
+      DEFAULT_PROVIDER_WINDOWS.codex,
+    );
+    expect(limits).toHaveLength(0);
+    expect(warnings.length).toBeGreaterThan(0);
+  });
+
   it("reads codex used-percent on the 0–100 scale (1% is not exhaustion)", () => {
     for (const [raw, used] of [
       ["0", 0],
