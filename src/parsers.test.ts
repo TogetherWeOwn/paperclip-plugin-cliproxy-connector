@@ -534,6 +534,16 @@ describe("sanitizeStatusMessage", () => {
     expect(scrubbed).toContain("[redacted]");
     expect(scrubbed).toContain("rate-limited");
   });
+
+  it("keeps timestamps, versions, k=v pairs and model ids out of the redactor", () => {
+    const msg = "reset 2026-11-01T12:00:00Z via HTTP/1.1, error=429 for gpt-4o-mini, key sk-live-abc123";
+    const scrubbed = sanitizeStatusMessage(msg) ?? "";
+    for (const keep of ["2026-11-01T12:00:00Z", "HTTP/1.1", "error=429", "gpt-4o-mini"]) {
+      expect(scrubbed).toContain(keep);
+    }
+    expect(scrubbed).not.toContain("sk-live-abc123");
+    expect(scrubbed).toContain("[redacted]");
+  });
 });
 
 describe("hashIdentity redaction", () => {

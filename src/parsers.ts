@@ -94,10 +94,11 @@ export function toIsoTimestamp(v: unknown): string | null {
  * Scrub an upstream `status_message` before it reaches the plugin page.
  * Emails become `[redacted-email]`; any whitespace-delimited token that
  * looks credential-like — a 20+ word-char run, or 8+ chars mixing letters
- * with digits (short API keys, session ids) — becomes `[redacted]`. The
- * digit requirement keeps hyphenated operational words ("rate-limited")
- * passing through. The note is capped at 120 chars. Plain notes ("ok",
- * "429 rate limited") pass through unchanged.
+ * with digits (short API keys, session ids) — becomes `[redacted]`. Tokens
+ * with operational shapes (timestamps, versions, `k=v` pairs, lowercase
+ * hyphenated slugs like model ids) pass through so the page keeps reset
+ * times and model names. The note is capped at 120 chars. Plain notes
+ * ("ok", "429 rate limited") pass through unchanged.
  */
 export function sanitizeStatusMessage(raw: string | null): string | null {
   if (!raw) return null;
@@ -109,12 +110,30 @@ export function sanitizeStatusMessage(raw: string | null): string | null {
     .map((tok) => {
       if (tok === "[redacted-email]") return tok;
       if (/[A-Za-z0-9_\-]{20,}/.test(tok)) return "[redacted]";
-      if (tok.length >= 8 && /[A-Za-z]/.test(tok) && /[0-9]/.test(tok)) return "[redacted]";
+      // Judge the punctuation-stripped core: real notes attach commas and
+      // periods ("for gpt-4o-mini, retry"), which must not defeat the
+      // operational-shape exemption.
+      const core = tok.replace(/^[^A-Za-z0-9]+/, "").replace(/[^A-Za-z0-9]+$/, "");
+      if (core.length >= 8 && /[A-Za-z]/.test(core) && /[0-9]/.test(core) && !isOperationalToken(core)) {
+        return "[redacted]";
+      }
       return tok;
     })
     .join(" ");
   if (s.length > 120) s = `${s.slice(0, 117)}...`;
   return s;
+}
+
+/**
+ * A letter+digit token that is operational, not a credential: timestamps,
+ * versions, URLs and `k=v` pairs (punctuation that bare keys/session ids
+ * almost never contain), and lowercase hyphenated slugs with only isolated
+ * digits (`gpt-4o-mini`, `claude-sonnet-4-5` model ids). `sk-live-abc123`
+ * still redacts: its `123` run breaks the slug shape.
+ */
+function isOperationalToken(tok: string): boolean {
+  if (/[/:=\.]/.test(tok)) return true;
+  return /^[a-z]+(-[a-z0-9]+)+$/.test(tok) && !/\d{2,}/.test(tok);
 }
 
 /** Opaque sha256 of an upstream account identity. Null when there is nothing to hash. */
