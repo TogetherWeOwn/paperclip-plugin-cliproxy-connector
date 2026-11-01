@@ -1,0 +1,60 @@
+{
+  "name": "@togetherweown/paperclip-plugin-cliproxy-connector",
+  "version": "0.1.0",
+  "description": "Paperclip plugin that syncs CLIProxy per-account quota into a local cache and routes AI-connection pools quota-aware (usage_aware) with wait/resume.",
+  "license": "MIT",
+  "type": "module",
+  "homepage": "https://github.com/TogetherWeOwn/paperclip-plugin-cliproxy-connector",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/TogetherWeOwn/paperclip-plugin-cliproxy-connector"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "files": [
+    "dist",
+    "scripts",
+    "README.md",
+    "LICENSE"
+  ],
+  "paperclipPlugin": {
+    "manifest": "./dist/manifest.js",
+    "worker": "./dist/worker.js",
+    "ui": "./dist/ui/index.js"
+  },
+  "keywords": [
+    "paperclip",
+    "plugin",
+    "cliproxy",
+    "ai-connections",
+    "router"
+  ],
+  "scripts": {
+    "build": "rm -rf dist && tsc -p tsconfig.build.json && npm run build:ui",
+    "build:ui": "esbuild ui/index.tsx --bundle --format=esm --platform=browser --target=es2022 --jsx=automatic --outfile=dist/ui/index.js --external:react --external:react-dom --external:@paperclipai/plugin-sdk --external:@paperclipai/plugin-sdk/ui",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
+    "check": "npm run typecheck && npm test && npm run build"
+  },
+  "peerDependencies": {
+    "@paperclipai/plugin-sdk": "*"
+  },
+  "devDependencies": {
+    "@paperclipai/plugin-sdk": "2026.1023.0",
+    "@types/node": "24.19.2",
+    "@types/react": "19.2.7",
+    "esbuild": "0.27.1",
+    "react": "19.2.0",
+    "typescript": "5.9.3",
+    "vitest": "4.1.12"
+  },
+  "engines": {
+    "node": ">=24"
+  }
+}
