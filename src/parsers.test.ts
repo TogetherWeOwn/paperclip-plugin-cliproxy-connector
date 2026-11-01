@@ -682,6 +682,26 @@ describe("sanitizeStatusMessage", () => {
     expect(scrubbed).toContain("2026-11-01T12:00:00Z");
     expect(scrubbed).toContain("[redacted]");
   });
+
+  it("redacts segmented letter-digit credentials spread across hyphen parts", () => {
+    const scrubbed = sanitizeStatusMessage("key sk-live-a1-b2-c3-d4 rejected") ?? "";
+    expect(scrubbed).not.toContain("sk-live-a1-b2-c3-d4");
+    expect(scrubbed).toContain("[redacted]");
+  });
+
+  it("keeps dotted model ids and minute-precision timestamps out of the redactor", () => {
+    const scrubbed =
+      sanitizeStatusMessage("reset 2026-11-01T12:00Z for claude-3.5-sonnet, gemini-2.5-flash-lite, llama-3.1-70b-instruct") ?? "";
+    for (const keep of [
+      "2026-11-01T12:00Z",
+      "claude-3.5-sonnet",
+      "gemini-2.5-flash-lite",
+      "llama-3.1-70b-instruct",
+    ]) {
+      expect(scrubbed).toContain(keep);
+    }
+    expect(scrubbed).not.toContain("[redacted]");
+  });
 });
 
 describe("hashIdentity redaction", () => {

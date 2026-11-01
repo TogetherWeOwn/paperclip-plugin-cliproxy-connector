@@ -129,17 +129,18 @@ export function sanitizeStatusMessage(raw: string | null): string | null {
  * (`error=429` keeps; `token=ab12cd34ef` redacts), and lowercase hyphenated
  * slugs without credential tells (`gpt-4o-mini`, `claude-sonnet-4-5` model
  * ids pass; `sk-live-abc123` and `sk-live-a1b2c3d4` still redact).
- * `:`/`/`/`.` tokens are operational only when no separated segment is
- * itself credential-shaped (`error=429` and `HTTP/1.1` keep;
- * `token:ab12cd34ef` redacts) — timestamps are exempted first so their
+ * `:`/`/` tokens are operational only when no separated segment is itself
+ * credential-shaped (`error=429` and `HTTP/1.1` keep; `token:ab12cd34ef`
+ * redacts). Dots stay inside the slug judgment as version separators
+ * (`claude-3.5-sonnet` keeps). Timestamps are exempted first so their
  * letter/digit segments (`2026-11-01T12`) never misfire.
  */
 function isOperationalToken(tok: string): boolean {
   const eq = tok.lastIndexOf("=");
   if (eq >= 0) return !isCredentialCore(tok.slice(eq + 1));
-  if (/\d{2}:\d{2}:\d{2}/.test(tok)) return true;
-  if (/[/:.]/.test(tok)) return !tok.split(/[/:.]/).some((seg) => isCredentialCore(seg));
-  return isSlugLike(tok);
+  if (/\d{4}-\d{2}-\d{2}/.test(tok) || /\d{2}:\d{2}:\d{2}/.test(tok)) return true;
+  if (/[/:]/.test(tok)) return !tok.split(/[/:]/).some((seg) => isCredentialCore(seg));
+  return isSlugLike(tok.replace(/\./g, "-"));
 }
 
 /** 8+ chars mixing letters with digits: a short key/session id shape. */
@@ -158,12 +159,17 @@ function isCredentialCore(core: string): boolean {
  * small number (`4`, `70`), a leading run plus letters (`4o`, `70b`), or a
  * trailing single digit (`v3`, `o1`). Anything else — an internal digit run
  * (`abc123def`), a trailing run (`abc123`), interleaved alphanumerics
- * (`a1b2c3d4`) — reads as a credential and redacts.
+ * (`a1b2c3d4`) — reads as a credential and redacts. At most one segment may
+ * mix letters and digits: model ids carry a single version-ish part, while
+ * `sk-live-a1-b2-c3-d4` spreads its entropy across four.
  */
 function isSlugLike(core: string): boolean {
   const parts = core.split("-");
   if (parts.length < 2 || !/^[a-z]+$/.test(parts[0] as string)) return false;
-  return (parts.slice(1) as string[]).every(
+  const rest = parts.slice(1) as string[];
+  const mixed = rest.filter((seg) => /[a-z]/.test(seg) && /[0-9]/.test(seg));
+  if (mixed.length > 1) return false;
+  return rest.every(
     (seg) =>
       /^[a-z]+$/.test(seg) ||
       /^[0-9]{1,4}$/.test(seg) ||
