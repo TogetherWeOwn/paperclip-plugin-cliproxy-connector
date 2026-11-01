@@ -159,4 +159,32 @@ describe("buildWidgetData", () => {
     expect(w.quotaBlind).toBe(1);
     expect(w.staleCount).toBe(1);
   });
+
+  it("surfaces a failure newer than the last success without moving ranAt", () => {
+    const lastSync = {
+      accountsSeen: 1,
+      rowsWritten: 1,
+      drift: [],
+      errors: [],
+      skipped: false,
+      skipReason: null,
+      startedAt: "2026-11-01T11:00:00.000Z",
+      finishedAt: "2026-11-01T11:00:30.000Z",
+    } as SyncSummary;
+    const failed = buildPageData(
+      args({ lastSync, lastFailure: { attemptedAt: NOW, message: "sync failed: boom" } }),
+    );
+    expect(failed.sync.ranAt).toBe("2026-11-01T11:00:30.000Z");
+    expect(failed.sync.lastError).toBe("sync failed: boom");
+    expect(failed.sync.lastAttemptAt).toBe(NOW);
+
+    const widget = buildWidgetData(args({ lastSync, lastFailure: { attemptedAt: NOW, message: "boom" } }));
+    expect(widget.status).toMatch(/last sync failed/);
+
+    // A failure older than the last success stays recorded but is not shown as current.
+    const cleared = buildPageData(
+      args({ lastSync, lastFailure: { attemptedAt: "2026-11-01T10:00:00.000Z", message: "old" } }),
+    );
+    expect(cleared.sync.lastError).toBeNull();
+  });
 });

@@ -13,7 +13,7 @@
  */
 
 import { graceMs, maxAgeMs, type ConnectorConfig } from "./config.js";
-import type { AccountUsageRow, DriftFinding, StrikeBudgetState, SyncSummary } from "./types.js";
+import type { AccountUsageRow, DriftFinding, StrikeBudgetState, SyncFailure, SyncSummary } from "./types.js";
 
 export const AUDIENCE_NOTICE =
   "Audience: this page shows upstream AI account identity (providers, plan labels, per-account quota state). " +
@@ -63,6 +63,9 @@ export interface PageData {
     skipped: boolean;
     skipReason: string | null;
     errors: string[];
+    /** Latest failed attempt (own state key; never moves `ranAt`). Null when the last attempt succeeded. */
+    lastError: string | null;
+    lastAttemptAt: string | null;
   };
   strike: {
     disabled: boolean;
@@ -137,8 +140,9 @@ export function buildPageData(args: {
   rows: Record<string, AccountUsageRow>;
   lastSync: SyncSummary | null;
   strike: StrikeBudgetState;
+  lastFailure?: SyncFailure | null;
 }): PageData {
-  const { now, config, rows, lastSync, strike } = args;
+  const { now, config, rows, lastSync, strike, lastFailure } = args;
   const nowMs = Date.parse(now);
   const maxAge = maxAgeMs(config);
   const grace = graceMs(config);
@@ -197,6 +201,16 @@ export function buildPageData(args: {
       skipped: lastSync?.skipped ?? true,
       skipReason: lastSync?.skipReason ?? "no sync has run yet.",
       errors: lastSync?.errors ?? [],
+      // A failure newer than the last successful run is shown explicitly so
+      // the page never silently presents stale success as current state.
+      lastError:
+        lastFailure &&
+        (!lastSync ||
+          Number.isNaN(Date.parse(lastSync.finishedAt)) ||
+          Date.parse(lastFailure.attemptedAt) > Date.parse(lastSync.finishedAt))
+          ? lastFailure.message
+          : null,
+      lastAttemptAt: lastFailure?.attemptedAt ?? null,
     },
     strike: {
       disabled: strike.disabled,
@@ -217,17 +231,20 @@ export function buildWidgetData(args: {
   rows: Record<string, AccountUsageRow>;
   lastSync: SyncSummary | null;
   strike: StrikeBudgetState;
+  lastFailure?: SyncFailure | null;
 }): WidgetData {
   const page = buildPageData(args);
   const nowMs = Date.parse(args.now);
   const staleCount = page.accounts.filter((a) => a.freshness === "stale" || a.freshness === "expired").length;
   const status = args.strike.disabled
     ? "disabled (strike budget spent)"
-    : page.drift.length > 0
-      ? `${page.drift.length} drift finding${page.drift.length === 1 ? "" : "s"}`
-      : page.accounts.length === 0
-        ? "no accounts synced yet"
-        : "healthy";
+    : page.sync.lastError
+      ? `last sync failed: ${page.sync.lastError}`
+      : page.drift.length > 0
+        ? `${page.drift.length} drift finding${page.drift.length === 1 ? "" : "s"}`
+        : page.accounts.length === 0
+          ? "no accounts synced yet"
+          : "healthy";
   return {
     generatedAt: args.now,
     ok: !args.strike.disabled,

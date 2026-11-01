@@ -6,7 +6,7 @@ import {
   runSync,
   type SyncDeps,
 } from "./sync.js";
-import type { StrikeBudgetState, SyncSummary } from "./types.js";
+import type { StrikeBudgetState, SyncFailure, SyncSummary } from "./types.js";
 
 const NOW = "2026-11-01T12:00:00.000Z";
 const KEY = "SECRET-KEY-MATERIAL-abc123";
@@ -70,6 +70,7 @@ interface Store {
   savedRows: Record<string, never> | null;
   lastSync: SyncSummary | null;
   savedSummary: SyncSummary | null;
+  failure: SyncFailure | null;
   activity: Array<{ message: string; metadata?: Record<string, unknown> }>;
 }
 
@@ -80,6 +81,7 @@ function store(over?: Partial<Store>): Store {
     savedRows: null,
     lastSync: null,
     savedSummary: null,
+    failure: null,
     activity: [],
     ...over,
   };
@@ -103,6 +105,9 @@ function deps(s: Store, fetchImpl?: typeof fetch): SyncDeps {
       s.savedRows = rows as never;
       s.savedSummary = summary;
     },
+    recordFailure: async (failure) => {
+      s.failure = failure;
+    },
     logActivity: async (message, metadata) => {
       s.activity.push({ message, metadata });
     },
@@ -110,7 +115,7 @@ function deps(s: Store, fetchImpl?: typeof fetch): SyncDeps {
 }
 
 function assertNoKeyLeak(s: Store) {
-  const blob = JSON.stringify([s.activity, s.savedSummary, s.strike]);
+  const blob = JSON.stringify([s.activity, s.savedSummary, s.strike, s.failure]);
   expect(blob).not.toContain(KEY);
 }
 
@@ -323,5 +328,58 @@ describe("run guards", () => {
     expect(summary.skipped).toBe(true);
     expect(s.strike.secretBad).toBe(true);
     expect(s.strike.failures).toHaveLength(1);
+  });
+});
+
+describe("sync failure visibility (S2)", () => {
+  it("a non-auth failure is recorded + logged without touching last-sync", async () => {
+    const lastSync: SyncSummary = {
+      accountsSeen: 1,
+      rowsWritten: 1,
+      drift: [],
+      errors: [],
+      skipped: false,
+      skipReason: null,
+      startedAt: "2026-11-01T11:00:00.000Z",
+      finishedAt: "2026-11-01T11:00:30.000Z",
+    };
+    const s = store({ lastSync });
+    // CLIProxy down: auth-files returns 500 (non-auth error). Bypass the
+    // min-interval guard by making the last success old enough.
+    s.lastSync = { ...lastSync, finishedAt: "2026-11-01T11:30:00.000Z" };
+    const d = deps(s, mockFetch({ authFilesStatus: 500 }) as unknown as typeof fetch);
+    d.now = "2026-11-01T12:00:00.000Z";
+    const summary = await runSync(d, { running: false });
+    expect(summary.skipped).toBe(true);
+    expect(summary.skipReason).toMatch(/sync failed/);
+    // Recorded under its own key…
+    expect(s.failure).not.toBeNull();
+    expect(s.failure?.attemptedAt).toBe("2026-11-01T12:00:00.000Z");
+    expect(s.failure?.message).toMatch(/sync failed/);
+    // …logged…
+    expect(s.activity.some((a) => a.message.includes("sync failed"))).toBe(true);
+    // …and last-sync is untouched (finishedAt still drives min-interval).
+    expect(s.savedSummary).toBeNull();
+    expect(s.lastSync?.finishedAt).toBe("2026-11-01T11:30:00.000Z");
+    assertNoKeyLeak(s);
+  });
+
+  it("a success clears the recorded failure", async () => {
+    const s = store({ failure: { attemptedAt: NOW, message: "sync failed: boom" } });
+    const summary = await runSync(deps(s, mockFetch() as unknown as typeof fetch), { running: false });
+    expect(summary.skipped).toBe(false);
+    expect(s.failure).toBeNull();
+  });
+
+  it("an unresolvable secret is recorded, not just logged", async () => {
+    const s = store();
+    const d = deps(s, mockFetch() as unknown as typeof fetch);
+    d.resolveSecret = async () => {
+      throw new Error("no such grant");
+    };
+    const summary = await runSync(d, { running: false });
+    expect(summary.skipped).toBe(true);
+    expect(s.failure?.message).toMatch(/could not resolve/);
+    assertNoKeyLeak(s);
   });
 });

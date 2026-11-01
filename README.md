@@ -21,9 +21,13 @@ pool by protocol family, pinned by CLIProxy prefix in pool member `profile.model
 - **Router** (`ai.connections.route`, capability `ai.connections.route`): pure function over the
   cache. 10% reserve default (strict `>`, minimum across gating windows); rotation — not
   most-headroom — among above-reserve members; pinned tasks never migrate (pinned wait uses the
-  latest limiting reset); pooled wait uses the earliest known reset; unknown/stale telemetry
+  latest limiting reset); pooled wait uses the earliest per-member recovery (each member's
+  latest limiting reset, or the 60 s recheck when it has none); unknown/stale telemetry
   rechecks in 60 s; stale telemetry fails open only within a bounded grace window
-  (≥2× sync interval freshness, 3× grace), then fails closed.
+  (≥2× sync interval freshness, 3× grace), then fails closed. Two ages are tracked:
+  cache age (the sync fetch time — sync death fails closed) and per-window observation
+  age (idle accounts go unknown/fail-open, never stuck low; passed resets and passed
+  cooldowns stop limiting).
 - **Per-account UI page + dashboard widget**: served worker-side from the cache; the React bundle
   in `ui/` renders it. The bundle never sees the management key.
 - **Operator provisioning script** (`scripts/provision-connections.mjs`): dry-run-first helper

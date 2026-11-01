@@ -14,6 +14,7 @@ import type {
 } from "@paperclipai/plugin-sdk";
 import { parseConfig } from "./config.js";
 import {
+  LAST_ERROR_STATE_KEY,
   LAST_SYNC_STATE_KEY,
   PAGE_DATA_KEY,
   REENABLE_ACTION_KEY,
@@ -26,7 +27,7 @@ import {
 } from "./manifest.js";
 import { route, type RouterCandidate } from "./router.js";
 import { emptyStrikeBudget, reenableAfterStrike, runSync } from "./sync.js";
-import type { AccountUsageRow, StrikeBudgetState, SyncSummary } from "./types.js";
+import type { AccountUsageRow, StrikeBudgetState, SyncFailure, SyncSummary } from "./types.js";
 import { buildPageData, buildWidgetData } from "./ui-data.js";
 
 const inFlight: { running: boolean } = { running: false };
@@ -54,6 +55,12 @@ async function loadRows(ctx: PluginContext, companyId: string): Promise<Record<s
 async function loadLastSync(ctx: PluginContext, companyId: string): Promise<SyncSummary | null> {
   const raw = await ctx.state.get(key(companyId, LAST_SYNC_STATE_KEY));
   if (raw !== null && typeof raw === "object") return raw as SyncSummary;
+  return null;
+}
+
+async function loadLastFailure(ctx: PluginContext, companyId: string): Promise<SyncFailure | null> {
+  const raw = await ctx.state.get(key(companyId, LAST_ERROR_STATE_KEY));
+  if (raw !== null && typeof raw === "object") return raw as SyncFailure;
   return null;
 }
 
@@ -101,13 +108,14 @@ const plugin = definePlugin({
     });
     ctx.data.register(WIDGET_DATA_KEY, async (params) => {
       const companyId = String((params as Record<string, unknown>).companyId ?? "");
-      const [config, rows, lastSync, strike] = await Promise.all([
+      const [config, rows, lastSync, strike, lastFailure] = await Promise.all([
         resolveCompany(ctx, companyId).then((r) => r.config),
         loadRows(ctx, companyId),
         loadLastSync(ctx, companyId),
         loadStrike(ctx, companyId),
+        loadLastFailure(ctx, companyId),
       ]);
-      return buildWidgetData({ now: new Date().toISOString(), config, rows, lastSync, strike });
+      return buildWidgetData({ now: new Date().toISOString(), config, rows, lastSync, strike, lastFailure });
     });
 
     ctx.actions.register(RESYNC_ACTION_KEY, async (params) => {
@@ -208,6 +216,9 @@ async function runCompanySync(
         await ctx.state.set(key(companyId, ROWS_STATE_KEY), rows);
         await ctx.state.set(key(companyId, LAST_SYNC_STATE_KEY), result);
       },
+      recordFailure: async (failure) => {
+        await ctx.state.set(key(companyId, LAST_ERROR_STATE_KEY), failure);
+      },
       logActivity: (message, metadata) => ctx.activity.log({ companyId, message, metadata }),
     },
     inFlight,
@@ -215,13 +226,14 @@ async function runCompanySync(
 }
 
 async function pageData(ctx: PluginContext, companyId: string, now: string) {
-  const [config, rows, lastSync, strike] = await Promise.all([
+  const [config, rows, lastSync, strike, lastFailure] = await Promise.all([
     resolveCompany(ctx, companyId).then((r) => r.config),
     loadRows(ctx, companyId),
     loadLastSync(ctx, companyId),
     loadStrike(ctx, companyId),
+    loadLastFailure(ctx, companyId),
   ]);
-  return buildPageData({ now, config, rows, lastSync, strike });
+  return buildPageData({ now, config, rows, lastSync, strike, lastFailure });
 }
 
 export function toRouterCandidates(

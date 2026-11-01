@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 import { parseConfig } from "./config.js";
+import { parseAuthFiles } from "./parsers.js";
 import { route, type RouteInput } from "./router.js";
+import { accountsToRows } from "./sync.js";
 import type { AccountUsageRow, UsageLimitRow } from "./types.js";
 
 const NOW = "2026-11-01T12:00:00.000Z";
@@ -353,7 +355,155 @@ describe("identity and config", () => {
       expect(r.skipped["m-a"]).toMatch(/usage_aware/);
     }
   });
+});
 
+/**
+ * Route through the REAL sync mapping: parseAuthFiles → accountsToRows →
+ * route. Hand-built rows all carry `checkedAt: NOW`, which is exactly why the
+ * idle-account and passed-reset deadlocks were missed.
+ */
+function routeFromAuthFiles(
+  payload: unknown,
+  candidates: RouteInput["candidates"],
+  extra?: Partial<RouteInput>,
+): ReturnType<typeof route> {
+  const config = baseConfig();
+  const { accounts, unkeyed } = parseAuthFiles(payload, {
+    now: NOW,
+    allowLists: config.providerWindows,
+  });
+  const byPrefix = new Map<string, typeof accounts>();
+  for (const a of accounts) {
+    const list = byPrefix.get(a.prefix) ?? [];
+    list.push(a);
+    byPrefix.set(a.prefix, list);
+  }
+  const { rows } = accountsToRows(byPrefix, unkeyed, config.prefixMap);
+  return route(input({ candidates, rows: new Map(Object.entries(rows)), ...extra }));
+}
+
+describe("review regressions (B1, B2, S1) via parseAuthFiles", () => {
+  it("B1: an idle healthy account (fresh sync, 3 h old observation) is unknown fail-open, not stuck exhausted", () => {
+    const r = routeFromAuthFiles(
+      [
+        {
+          prefix: "acct-a",
+          channel: "claude",
+          quota: {
+            observed_at: "2026-11-01T09:00:00Z", // 3 h old: passive, idle account
+            signals: [{ window: "5h", usedPercent: 10, resetAt: RESET_3H }],
+          },
+        },
+      ],
+      [{ memberId: "m-acct-a", model: "acct-a/claude-sonnet-5", connectionId: "conn-a" }],
+    );
+    // Before the fix: exhausted, retryAt +60s, "beyond the grace window" — forever.
+    expect(r.kind).toBe("selected");
+  });
+
+  it("B1: plugin-quota limits use the fetch time, not the passive observed_at", () => {
+    const config = baseConfig();
+    const { accounts } = parseAuthFiles(
+      [
+        {
+          prefix: "acct-a",
+          channel: "claude",
+          quota: { observed_at: "2026-11-01T09:00:00Z", signals: [] },
+        },
+      ],
+      {
+        now: NOW,
+        allowLists: config.providerWindows,
+        pluginPayloadByPrefix: new Map([
+          ["acct-a", { Groups: [{ Buckets: [{ Window: "5h", RemainingFraction: 0.9 }] }] }],
+        ]),
+      },
+    );
+    // The plugin limit was fetched just now even though the passive
+    // observation is 3 h old.
+    expect(accounts[0].checkedAt).toBe(NOW);
+    expect(accounts[0].limits[0].observedAt).toBe(NOW);
+  });
+
+  it("B2: an exhausted window whose reset already passed is unknown fail-open, not stuck exhausted", () => {
+    const r = routeFromAuthFiles(
+      [
+        {
+          prefix: "acct-a",
+          channel: "claude",
+          quota: {
+            observed_at: NOW,
+            signals: [{ window: "5h", usedPercent: 100, resetAt: "2026-11-01T11:59:00Z" }],
+          },
+        },
+      ],
+      [{ memberId: "m-acct-a", model: "acct-a/x", connectionId: "conn-a" }],
+    );
+    // Before the fix: exhausted, retryAt +60s, "at or below the 10% reserve" — forever.
+    expect(r.kind).toBe("selected");
+  });
+
+  it("B2: a passed cooldown with no fresh telemetry is unknown, not a wait", () => {
+    const r = routeFromAuthFiles(
+      [
+        {
+          prefix: "acct-a",
+          channel: "claude",
+          cooldown: { active: true, next_recover_at: "2026-11-01T11:59:00Z" },
+        },
+      ],
+      [{ memberId: "m-acct-a", model: "acct-a/x", connectionId: "conn-a" }],
+    );
+    expect(r.kind).toBe("selected");
+  });
+
+  it("S1: pooled retryAt honors the member that only needs a recheck", () => {
+    // Member A is low until +3h; member B cools down with no `until` and may
+    // recover within a minute. The pool must wake at the recheck, not +3h.
+    const r = routeFromAuthFiles(
+      [
+        {
+          prefix: "acct-a",
+          channel: "claude",
+          quota: {
+            observed_at: NOW,
+            signals: [{ window: "5h", usedPercent: 95, resetAt: RESET_3H }],
+          },
+        },
+        { prefix: "acct-b", channel: "codex", cooldown: { active: true } },
+      ],
+      [
+        { memberId: "m-a", model: "acct-a/x", connectionId: "conn-a" },
+        { memberId: "m-b", model: "acct-b/x", connectionId: "conn-b" },
+      ],
+    );
+    expect(r.kind).toBe("exhausted");
+    if (r.kind === "exhausted") expect(r.retryAt).toBe("2026-11-01T12:01:00.000Z");
+  });
+
+  it("S1: one member with 5h + 7d limiting waits on the latest reset, not the earliest", () => {
+    const r = routeFromAuthFiles(
+      [
+        {
+          prefix: "acct-a",
+          channel: "claude",
+          quota: {
+            observed_at: NOW,
+            signals: [
+              { window: "5h", usedPercent: 95, resetAt: RESET_1H },
+              { window: "7d", usedPercent: 97, resetAt: RESET_3H },
+            ],
+          },
+        },
+      ],
+      [{ memberId: "m-a", model: "acct-a/x", connectionId: "conn-a" }],
+    );
+    expect(r.kind).toBe("exhausted");
+    if (r.kind === "exhausted") expect(r.retryAt).toBe(RESET_3H);
+  });
+});
+
+describe("identity and config", () => {
   it("derives the reserve from the pool threshold instead of hard-gating", () => {
     const config = baseConfig();
     const rows = new Map([
@@ -368,12 +518,13 @@ describe("identity and config", () => {
 
   it("clamps retryAt to at least now+1s", () => {
     const rows = new Map([
-      ["acct-a", row({ prefix: "acct-a", limits: [limit({ id: "w", remainingPercent: 0, usedPercent: 100, resetsAt: "2026-11-01T11:00:00.000Z" })] })],
+      ["acct-a", row({ prefix: "acct-a", limits: [limit({ id: "w", remainingPercent: 0, usedPercent: 100, resetsAt: RESET_1H })] })],
     ]);
     const candidates = [{ memberId: "m-a", model: "acct-a/x", connectionId: "conn-a" }];
     const r = route(input({ candidates, rows }));
     expect(r.kind).toBe("exhausted");
     if (r.kind === "exhausted") {
+      expect(r.retryAt).toBe(RESET_1H);
       expect(Date.parse(r.retryAt) - Date.parse(NOW)).toBeGreaterThanOrEqual(1000);
     }
   });

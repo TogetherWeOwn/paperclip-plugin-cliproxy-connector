@@ -181,6 +181,7 @@ function makeLimit(init: {
   limitReached?: boolean;
   allowed?: boolean | null;
   gating?: boolean;
+  observedAt?: string | null;
 }): UsageLimitRow {
   return {
     id: init.id,
@@ -191,6 +192,7 @@ function makeLimit(init: {
     limitReached: init.limitReached ?? false,
     allowed: init.allowed ?? null,
     gating: init.gating ?? false,
+    observedAt: init.observedAt ?? null,
   };
 }
 
@@ -218,7 +220,7 @@ export function parsePluginQuota(
   provider: ProviderKey,
   payload: unknown,
   allowList: string[],
-  opts?: { softGating?: boolean },
+  opts?: { softGating?: boolean; observedAt?: string | null },
 ): ParsedPluginQuota {
   const warnings: string[] = [];
   const limits: UsageLimitRow[] = [];
@@ -300,6 +302,8 @@ export function parsePluginQuota(
           limitReached: exhausted,
           allowed: exhausted ? false : true,
           gating,
+          // Fetched at sync time: its observation is as fresh as the cache row.
+          observedAt: opts?.observedAt ?? null,
         }),
       );
     }
@@ -396,6 +400,9 @@ export function parsePassiveSignals(
         limitReached: exhausted,
         allowed: exhausted ? false : true,
         gating: isGatingWindow(provider, windowId, allowList, { scope, spendControl: spendBlocked }),
+        // Passive signals refresh only when the account serves traffic; null
+        // (no usable observed_at) falls back to the sync fetch time upstream.
+        observedAt,
       }),
     );
   };
@@ -494,13 +501,19 @@ export function parseAuthFiles(
     // NIM is local-estimate only: its numbers ride along as non-gating
     // context (soft signal), and the account stays quota-blind for routing.
     const softGating = provider === "nvidia-nim";
-    const { limits, observedAt, warnings: sigWarnings } = parsePassiveSignals(provider, quota, allowList);
+    // The per-window observation times ride on each limit's `observedAt`;
+    // the row-level `observedAt` is intentionally not used for `checkedAt`
+    // (cache age is the fetch time — see below).
+    const { limits, warnings: sigWarnings } = parsePassiveSignals(provider, quota, allowList);
 
     const pluginPayload = opts.pluginPayloadByPrefix?.get(prefix);
     let pluginQuota: ParsedPluginQuota | null = null;
     if (pluginPayload !== undefined) {
       pluginQuota = parsePluginQuota(provider, pluginPayload, allowList, {
         softGating: softGating,
+        // Plugin-quota limits are fetched right now: their observation time is
+        // the sync's fetch time, never the passive `observed_at`.
+        observedAt: opts.now,
       });
     }
     const pluginLimits: UsageLimitRow[] = pluginQuota?.limits ?? [];
@@ -530,13 +543,21 @@ export function parseAuthFiles(
       provider === "nvidia-nim" ||
       (limits.length === 0 && pluginLimits.length === 0);
 
+    // Passive limits without their own observed_at inherit the fetch time —
+    // the parser already warned that the observation is one step less
+    // trustworthy — so every window carries an explicit observation time.
+    const stampedPassive = limits.map((l) => (l.observedAt ? l : { ...l, observedAt: opts.now }));
     accounts.push({
       prefix,
       provider,
       channel,
-      limits: softGating ? [...limits.map((l) => ({ ...l, gating: false })), ...pluginLimits] : [...limits, ...pluginLimits],
+      limits: softGating ? [...stampedPassive.map((l) => ({ ...l, gating: false })), ...pluginLimits] : [...stampedPassive, ...pluginLimits],
       planType,
-      checkedAt: observedAt ?? opts.now,
+      // Cache age: the sync's own fetch time. It drives the bounded fail-open
+      // then fail-closed when sync dies — never the passive observed_at, which
+      // only refreshes when the account serves traffic (an idle healthy
+      // account must not be shut out for good).
+      checkedAt: opts.now,
       quotaBlind,
       accountHash: hashIdentity([
         getStr(entry, "account_id", "accountId", "id"),

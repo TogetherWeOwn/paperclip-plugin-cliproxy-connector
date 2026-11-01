@@ -16,6 +16,13 @@
  *   last-known-above-reserve members — then fail closed to `exhausted`);
  *   `allowed: null` waits only for providers exposing an admission signal;
  *   no near-reset exception in v1.
+ * - Two ages: **cache age** (`row.checkedAt`, the sync fetch time) drives the
+ *   bounded fail-open then fail-closed when sync dies; **observation age**
+ *   (per window, `limit.observedAt`) decides whether a window's verdict is
+ *   still evidence. An old observation becomes `unknown` (fail-open, never
+ *   headroom), never `low` — idle accounts must not be shut out for good. A
+ *   limiting verdict whose reset already passed, and a cooldown whose
+ *   recovery time already passed, stop limiting the same way.
  */
 
 import { effectiveReservePercent, graceMs, maxAgeMs, type ConnectorConfig } from "./config.js";
@@ -96,6 +103,25 @@ function classifyFreshness(
   return { freshness: "expired", ageMs: age };
 }
 
+/**
+ * Observation age of one window in ms, or null when it cannot be trusted.
+ * Falls back to the row's fetch time for rows cached before per-window
+ * `observedAt` existed (or hand-built rows without it).
+ */
+function windowObservationAgeMs(
+  observedAt: string | null | undefined,
+  rowCheckedAt: string,
+  nowMs: number,
+  futureSkewMs: number,
+): number | null {
+  const raw = observedAt ?? rowCheckedAt;
+  if (!raw) return null;
+  const t = parseTime(raw);
+  if (t === null) return null;
+  if (t > nowMs + futureSkewMs) return null;
+  return nowMs - Math.min(t, nowMs);
+}
+
 function assess(
   candidate: RouterCandidate,
   input: RouteInput,
@@ -166,13 +192,25 @@ function assess(
     };
   }
 
-  // Trusted + fresh/stale observation.
+  // Trusted + fresh/stale cache row. A 429/cooldown whose recovery time has
+  // already passed no longer limits: without fresh telemetry the account is
+  // unknown (fail-open), never stuck waiting on a dead cooldown.
+  let cooldownResets: string[] = [];
   if (row.coolingDown) {
-    const until = row.cooldownUntil && parseTime(row.cooldownUntil) !== null ? row.cooldownUntil : null;
+    const untilMs = row.cooldownUntil ? parseTime(row.cooldownUntil) : null;
+    if (untilMs !== null && untilMs <= nowMs) {
+      return {
+        candidate, prefix, row, trusted, trustReason, freshness, ageMs,
+        healthy: false, low: false, limitingResets: [],
+        reason: `cooldown for ${prefix} lifted at ${row.cooldownUntil} with no fresh telemetry since; unknown (fail-open candidate).`,
+      };
+    }
+    const until = row.cooldownUntil && untilMs !== null ? row.cooldownUntil : null;
+    cooldownResets = until ? [until] : [];
     return {
       candidate, prefix, row, trusted, trustReason, freshness, ageMs,
       healthy: false, low: true,
-      limitingResets: until ? [until] : [],
+      limitingResets: cooldownResets,
       reason: `CLIProxy reports a 429/cooldown state for ${prefix}${until ? ` until ${until}` : ""}; waiting.`,
     };
   }
@@ -191,34 +229,61 @@ function assess(
 
   const admission = hasAdmissionSignal(normalizeProvider(row.provider));
   // Strict `>`: a window exactly at the reserve is limiting (TWO-579).
+  // Two ages matter here. Cache age (row.checkedAt, classified above) tells
+  // whether sync is alive. Observation age (per window) tells whether the
+  // window's verdict is still evidence: passive signals only refresh when the
+  // account serves traffic, so an old observation — healthy or not — proves
+  // nothing and makes the window unknown (fail-open), never low. Likewise a
+  // limiting verdict whose reset has already passed is overtaken: the window
+  // may have refreshed, and without fresh telemetry it is unknown, not low.
   const limiting: string[] = [];
+  const unknownWindows: string[] = [];
   for (const w of gating) {
-    if (w.allowed === false || w.limitReached) {
+    const obsAge = windowObservationAgeMs(w.observedAt, row.checkedAt, nowMs, futureSkewMs);
+    if (obsAge === null || obsAge > grace) {
+      unknownWindows.push(w.id);
+      continue;
+    }
+    const resetMs = w.resetsAt ? parseTime(w.resetsAt) : null;
+    const verdict: "limiting" | "healthy" | "unknown" = (() => {
+      if (w.allowed === false || w.limitReached) return "limiting";
+      if (w.allowed === null && admission) return "limiting";
+      if (w.remainingPercent !== null) return w.remainingPercent <= reserve ? "limiting" : "healthy";
+      if (w.allowed === null && !admission) return "unknown";
+      return "unknown"; // gating window with no percent and no verdict
+    })();
+    if (verdict === "limiting" && resetMs !== null && resetMs <= nowMs) {
+      // The reset has passed since the observation: the verdict is stale.
+      unknownWindows.push(`${w.id} (reset passed)`);
+      continue;
+    }
+    if (verdict === "limiting") {
       limiting.push(w.id);
       continue;
     }
-    if (w.allowed === null && admission) {
-      // Providers with an admission signal: `null` waits (copy #17007).
-      limiting.push(w.id);
+    if (verdict === "unknown") {
+      unknownWindows.push(w.id);
       continue;
-    }
-    if (w.remainingPercent !== null) {
-      if (w.remainingPercent <= reserve) limiting.push(w.id);
-    } else {
-      // Gating window with no percent and no admission verdict: unknown.
-      limiting.push(`${w.id} (no percent)`);
     }
   }
 
   if (limiting.length > 0) {
+    // Only future resets bound the wait; past resets no longer limit.
     const resets = gating
       .filter((w) => limiting.some((id) => id === w.id || id.startsWith(`${w.id} `)))
       .map((w) => w.resetsAt)
-      .filter((r): r is string => r !== null && parseTime(r) !== null);
+      .filter((r): r is string => r !== null && (parseTime(r) ?? -Infinity) > nowMs);
     return {
       candidate, prefix, row, trusted, trustReason, freshness, ageMs,
       healthy: false, low: true, limitingResets: resets,
       reason: `${prefix} is at or below the ${reserve}% reserve on ${limiting.join(", ")}; waiting.`,
+    };
+  }
+  if (unknownWindows.length > 0) {
+    return {
+      candidate, prefix, row, trusted, trustReason, freshness, ageMs,
+      healthy: false, low: false, limitingResets: [],
+      reason: `${prefix} has no fresh verdict on ${unknownWindows.join(", ")} (stale observation or passed reset); unknown (fail-open candidate).`,
     };
   }
   return {
@@ -320,16 +385,26 @@ export function route(input: RouteInput): RouteResult {
     return { kind: "selected", memberId: selectedId, skipped };
   }
 
-  // Nothing eligible: exhausted. Pooled wait uses the earliest known reset;
-  // unknown/stale-only pools recheck in 60 s.
-  const resets: number[] = [];
+  // Nothing eligible: exhausted. Each low member recovers at the LATEST of
+  // its limiting resets (every limiting window must clear), or at the recheck
+  // when it has none (e.g. cooldown with no `until`); the pool wakes at the
+  // earliest of those per-member recoveries. Taking the earliest window of
+  // any member would wake the pool too early when one member has both a 5h
+  // and a 7d window limiting, and would ignore members that only need a
+  // recheck. Unknown/stale-only pools recheck in 60 s.
+  const recheckMs = parseTime(recheckAt) ?? nowMs + 60_000;
+  const perMemberRecoveries: number[] = [];
   for (const a of assessed) {
-    for (const r of a.limitingResets) {
-      const t = parseTime(r);
-      if (t !== null && t > nowMs) resets.push(t);
-    }
+    if (!a.low) continue;
+    const future = a.limitingResets
+      .map((r) => parseTime(r))
+      .filter((t): t is number => t !== null && t > nowMs);
+    perMemberRecoveries.push(future.length > 0 ? Math.max(...future) : recheckMs);
   }
-  let retryAt = resets.length > 0 ? new Date(Math.min(...resets)).toISOString() : recheckAt;
+  let retryAt =
+    perMemberRecoveries.length > 0
+      ? new Date(Math.min(...perMemberRecoveries)).toISOString()
+      : recheckAt;
   if (retryAt <= new Date(nowMs + 1000).toISOString()) {
     retryAt = new Date(nowMs + 1000).toISOString();
   }
