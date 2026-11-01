@@ -112,6 +112,104 @@ describe("deriveProviderModels", () => {
     expect(warnings.some((w) => w.includes("shared-bare-model"))).toBe(true);
   });
 
+  it("resolves an openrouter namespace by exact match with no code change", () => {
+    const served = parseModelsPayload({ data: [{ id: "openrouter/deepseek-v3" }] }).models;
+    const { providerModels, overlaps, warnings } = deriveProviderModels(served, {
+      authProviders: ["openrouter"],
+      observedKeysByProvider: new Map(),
+    });
+    expect(providerModels.openrouter).toEqual(["openrouter/deepseek-v3"]);
+    expect(overlaps).toEqual([]);
+    expect(warnings).toEqual([]);
+  });
+
+  it("warns on a namespace with no in-scope provider instead of guessing", () => {
+    const served = parseModelsPayload({ data: [{ id: "mystery-ns/model-x" }] }).models;
+    const { providerModels, warnings } = deriveProviderModels(served, {
+      authProviders: ["claude"],
+      observedKeysByProvider: new Map(),
+    });
+    expect(providerModels).toEqual({});
+    expect(warnings.some((w) => w.includes("mystery-ns"))).toBe(true);
+  });
+
+  it("maps owned_by through the explicit vendor table (anthropic → claude)", () => {
+    const served = parseModelsPayload({ data: [{ id: "claude-opus-4-5", owned_by: "anthropic" }] }).models;
+    const { providerModels } = deriveProviderModels(served, {
+      authProviders: ["claude"],
+      observedKeysByProvider: new Map(),
+    });
+    expect(providerModels.claude).toEqual(["claude-opus-4-5"]);
+  });
+
+  it("flags the canonical overlap: claude-sonnet-4-6 served by claude and antigravity, antigravity with no model_quotas", () => {
+    // The live served set is the evidence antigravity serves the id even
+    // though its auth file reports no per-model state for it.
+    const served = parseModelsPayload({ data: [{ id: "claude-sonnet-4-6" }] }).models;
+    const { providerModels, overlaps, warnings } = deriveProviderModels(served, {
+      authProviders: ["claude", "antigravity"],
+      observedKeysByProvider: new Map([["claude", new Set(["claude-sonnet-4-6"])]]),
+      servedByProvider: new Map([
+        ["claude", new Set(["claude-sonnet-4-6"])],
+        ["antigravity", new Set(["claude-sonnet-4-6"])],
+      ]),
+    });
+    expect(overlaps).toEqual([{ id: "claude-sonnet-4-6", providers: ["antigravity", "claude"] }]);
+    expect(providerModels.claude ?? []).not.toContain("claude-sonnet-4-6");
+    expect(providerModels.antigravity ?? []).not.toContain("claude-sonnet-4-6");
+    expect(warnings.some((w) => w.includes("claude-sonnet-4-6"))).toBe(true);
+  });
+
+  it("live evidence supersedes the owned_by fallback for providers whose file answered", () => {
+    // Claude's live set excludes the id (its quota keys are withheld by the
+    // caller once live answers); antigravity's live set includes it. The
+    // catalog still says owned_by: anthropic — a stale fallback that must not
+    // fabricate an overlap once live has spoken for both providers.
+    const served = parseModelsPayload({
+      data: [{ id: "shared-live-model", owned_by: "anthropic" }],
+    }).models;
+    const { providerModels, overlaps } = deriveProviderModels(served, {
+      authProviders: ["claude", "antigravity"],
+      observedKeysByProvider: new Map(),
+      servedByProvider: new Map([["antigravity", new Set(["shared-live-model"])]]),
+      liveOkProviders: ["claude", "antigravity"],
+    });
+    expect(providerModels.antigravity).toEqual(["shared-live-model"]);
+    expect(providerModels.claude ?? []).not.toContain("shared-live-model");
+    expect(overlaps).toEqual([]);
+  });
+
+  it("a successful empty served set means the provider serves nothing in the catalog", () => {
+    // Claude's file answered with an empty set: live says it serves nothing,
+    // so owned_by: anthropic cannot claim the id for it — unattributed with
+    // a warning, never a false single attribution.
+    const served = parseModelsPayload({
+      data: [{ id: "stale-owned-model", owned_by: "anthropic" }],
+    }).models;
+    const { providerModels, overlaps, warnings } = deriveProviderModels(served, {
+      authProviders: ["claude"],
+      observedKeysByProvider: new Map(),
+      servedByProvider: new Map([["claude", new Set()]]),
+      liveOkProviders: ["claude"],
+    });
+    expect(providerModels).toEqual({});
+    expect(overlaps).toEqual([]);
+    expect(warnings.some((w) => w.includes("stale-owned-model"))).toBe(true);
+  });
+
+  it("a served set alone claims a bare id the heuristic never saw", () => {
+    // google-owned Antigravity Gemini ids: no model_quotas, unhelpful
+    // owned_by — the served set attributes them once the endpoint lands.
+    const served = parseModelsPayload({ data: [{ id: "gemini-3-pro" }] }).models;
+    const { providerModels, overlaps } = deriveProviderModels(served, {
+      authProviders: ["antigravity"],
+      observedKeysByProvider: new Map(),
+      servedByProvider: new Map([["antigravity", new Set(["gemini-3-pro"])]]),
+    });
+    expect(providerModels.antigravity).toEqual(["gemini-3-pro"]);
+    expect(overlaps).toEqual([]);
+  });
+
   it("an owned_by pointing elsewhere joins the overlap, not a silent steal", () => {
     const served = parseModelsPayload({
       data: [{ id: "shared-bare-model", owned_by: "openai" }],

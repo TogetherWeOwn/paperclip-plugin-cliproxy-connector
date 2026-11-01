@@ -44,18 +44,22 @@ describe("providers[] rows", () => {
     expect(validation.errors.some((e) => e.includes("duplicate provider row"))).toBe(true);
   });
 
-  it("skips unknown provider words with a warning, keeping the rest", () => {
+  it("accepts future provider words as-is: openrouter gets its own row with no code change", () => {
     const { config, validation } = parseConfig(
       base({
         providers: [
           { provider: "claude", connectionId: "conn-a" },
-          { provider: "typo-provider", connectionId: "conn-b" },
+          { provider: "openrouter", connectionId: "conn-openrouter" },
+          { provider: "cloudflare-workers-ai", connectionId: "conn-cf" },
         ],
       }),
     );
     expect(validation.ok).toBe(true);
-    expect(config.providers).toHaveLength(1);
-    expect(validation.warnings.some((w) => w.includes("typo-provider"))).toBe(true);
+    expect(config.providers).toEqual([
+      { provider: "claude", connectionId: "conn-a", completeInventory: false },
+      { provider: "openrouter", connectionId: "conn-openrouter", completeInventory: false },
+      { provider: "cloudflare-workers-ai", connectionId: "conn-cf", completeInventory: false },
+    ]);
   });
 
   it("warns on empty providers and rejects a leftover v1 prefixMap loudly", () => {

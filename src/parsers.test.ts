@@ -98,7 +98,7 @@ function redactedAuthFiles() {
   };
 }
 
-describe("provider normalization", () => {
+describe("provider normalization (parser keys only, never identity)", () => {
   it("maps CLIProxy provider words to parser keys", () => {
     expect(normalizeProvider("claude")).toBe("claude");
     expect(normalizeProvider("Anthropic")).toBe("claude");
@@ -108,6 +108,10 @@ describe("provider normalization", () => {
     expect(normalizeProvider("gemini")).toBe("antigravity");
     expect(normalizeProvider("nvidia-nim")).toBe("nvidia-nim");
     expect(normalizeProvider("something-new")).toBe("unknown-provider");
+  });
+
+  it("does not misfile minimax as nvidia-nim (substring nim is not a token)", () => {
+    expect(normalizeProvider("minimax")).toBe("unknown-provider");
   });
 
   it("only claude/codex/devin/synthetic/cloudflare/zai/opencode-go expose admission signals", () => {
@@ -227,6 +231,48 @@ describe("parseAuthFiles (redacted fixture)", () => {
       ...extra,
     });
   }
+
+  it("groups by the raw provider string: openrouter, minimax and cloudflare-workers-ai keep their own groups", () => {
+    const { accounts } = parse([
+      { id: "o-1", provider: "openrouter" },
+      { id: "m-1", provider: "minimax" },
+      { id: "cf-1", provider: "cloudflare-workers-ai" },
+      { id: "n-1", provider: "nvidia-nim" },
+      { id: "c-1", provider: " Claude " },
+    ]);
+    expect(accounts.map((a) => a.provider)).toEqual([
+      "openrouter",
+      "minimax",
+      "cloudflare-workers-ai",
+      "nvidia-nim",
+      "claude",
+    ]);
+    // Quota-blind fallback for the unrecognised providers, real parsers kept.
+    expect(accounts.find((a) => a.provider === "openrouter")?.quotaBlind).toBe(true);
+    expect(accounts.find((a) => a.provider === "minimax")?.quotaBlind).toBe(true);
+    expect(accounts.find((a) => a.provider === "nvidia-nim")?.quotaBlind).toBe(true);
+    expect(accounts.find((a) => a.provider === "claude")?.quotaBlind).toBe(true); // no windows → blind
+    // The cloudflare-workers-ai row inherits the cloudflare parser's
+    // allow-list (raw key first, parser key as fallback).
+    const { accounts: cf } = parse([{ id: "cf-1", provider: "cloudflare-workers-ai" }], {
+      allowLists: { cloudflare: ["daily"] },
+      pluginPayloadByProvider: new Map([
+        ["cloudflare-workers-ai", { Groups: [{ Buckets: [{ Window: "daily", RemainingFraction: 0.5 }] }] }],
+      ]),
+    });
+    const daily = cf[0]?.limits.find((l) => l.id === "cloudflare:daily");
+    expect(daily?.gating).toBe(true);
+    expect(cf[0]?.quotaBlind).toBe(false);
+  });
+
+  it("carries the auth-file name for the served-set fetch", () => {
+    const { accounts } = parse([
+      { id: "n-1", provider: "claude", name: "claude-file" },
+      { id: "n-2", provider: "claude" },
+    ]);
+    expect(accounts.find((a) => a.key && a.fileName === "claude-file")).toBeDefined();
+    expect(accounts.find((a) => a.fileName === null)).toBeDefined();
+  });
 
   it("keys rows acct-<hash>, groups by provider, and never leaks identifiers", () => {
     const { accounts, unkeyed, warnings } = parse();

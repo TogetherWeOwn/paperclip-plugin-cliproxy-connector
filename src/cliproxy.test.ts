@@ -2,13 +2,17 @@ import { describe, expect, it, vi } from "vitest";
 import {
   type ManagementFetch,
   AUTH_FILES_PATH,
+  AUTH_FILE_MODELS_PATH,
+  authFileModelsPath,
   CliproxyAuthError,
   CliproxyBodyError,
   CliproxyClientApiClient,
   CliproxyConfigError,
   CliproxyManagementClient,
   CliproxyNetworkError,
+  CliproxyNotFoundError,
   CliproxyRedirectError,
+  isSafeAuthFileName,
   MODELS_PATH,
   pluginQuotaPath,
 } from "./cliproxy.js";
@@ -242,6 +246,82 @@ describe("client API path (/v1/models, separate key)", () => {
   it("refuses to propagate a body containing client-key material", async () => {
     const fetch = vi.fn(async () => json(200, { echoed: CLIENT_KEY }));
     await expect(modelsClient(fetch).getModels()).rejects.toThrow(CliproxyBodyError);
+  });
+});
+
+describe("served-set path (GET auth-files/models?name=<file>, same management key)", () => {
+  it("pins the served-set path and validates the name as a single safe value", () => {
+    expect(AUTH_FILE_MODELS_PATH).toBe("/v0/management/auth-files/models");
+    expect(authFileModelsPath("claude-file")).toBe(
+      "/v0/management/auth-files/models?name=claude-file",
+    );
+    expect(isSafeAuthFileName("auth1.json")).toBe(true);
+    // CLIProxy OAuth flows generate email-style file names — these must fetch,
+    // not fail closed (otherwise those credentials lose live served evidence).
+    expect(isSafeAuthFileName("antigravity-user@example.com.json")).toBe(true);
+    expect(isSafeAuthFileName("claude+work.json")).toBe(true);
+    expect(authFileModelsPath("antigravity-user@example.com.json")).toBe(
+      "/v0/management/auth-files/models?name=antigravity-user%40example.com.json",
+    );
+    for (const bad of ["../config", "..%2Fconfig", "a/b", "", ".", "x y", "api-call", "a".repeat(300)]) {
+      expect(isSafeAuthFileName(bad)).toBe(false);
+    }
+  });
+
+  it("rejects hostile names before any network happens", async () => {
+    for (const bad of ["../config", "a/b", "api-call"]) {
+      const fetch = vi.fn(async () => json(200, {}));
+      await expect(client(fetch).getAuthFileModels(bad)).rejects.toThrow(CliproxyConfigError);
+      expect(fetch).not.toHaveBeenCalled();
+    }
+  });
+
+  it("GETs the served set with the management key header", async () => {
+    let seen: { url?: string; headers?: Headers } = {};
+    const fetch = vi.fn(async (url: string, init?: RequestInit) => {
+      seen = { url, headers: new Headers(init?.headers) };
+      return json(200, { data: [] });
+    });
+    const body = await client(fetch).getAuthFileModels("claude-file");
+    expect(body).toEqual({ data: [] });
+    expect(seen.url).toBe("http://127.0.0.1:8317/v0/management/auth-files/models?name=claude-file");
+    expect(seen.headers?.get("X-Test-Key")).toBe(KEY);
+  });
+
+  it("fetches an email-style file name through the pinned shape", async () => {
+    let seenUrl = "";
+    const fetch = vi.fn(async (url: string) => {
+      seenUrl = url;
+      return json(200, { data: [] });
+    });
+    await client(fetch).getAuthFileModels("antigravity-user@example.com.json");
+    expect(seenUrl).toBe(
+      "http://127.0.0.1:8317/v0/management/auth-files/models?name=antigravity-user%40example.com.json",
+    );
+  });
+
+  it("maps 404 to CliproxyNotFoundError (degradation, never the strike budget)", async () => {
+    const fetch = vi.fn(async () => new Response("nope", { status: 404 }));
+    const err = await client(fetch)
+      .getAuthFileModels("claude-file")
+      .catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(CliproxyNotFoundError);
+    expect((err as Error).message).not.toContain(KEY);
+  });
+
+  it("maps 401 to CliproxyAuthError (same strike rules as every management GET)", async () => {
+    const fetch = vi.fn(async () => new Response("denied", { status: 401 }));
+    const err = await client(fetch)
+      .getAuthFileModels("claude-file")
+      .catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(CliproxyAuthError);
+  });
+
+  it("refuses a redirect to a served-set path with an unsafe name", async () => {
+    const fetch = vi.fn(
+      async () => new Response(null, { status: 302, headers: { location: "/v0/management/auth-files/models?name=..%2Fconfig" } }),
+    );
+    await expect(client(fetch).getAuthFiles()).rejects.toThrow(CliproxyRedirectError);
   });
 });
 

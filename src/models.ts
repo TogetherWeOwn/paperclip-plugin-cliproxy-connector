@@ -10,24 +10,34 @@
  * `zai/…`, `opencode-go/…`); `opencode-zen-free` (openai-compat) is bare
  * unless its entry sets the stock `prefix` field.
  *
- * Attribution rules (no hard-coded id lists):
- * - Namespaced ids (`ns/rest`) attribute by namespace through
- *   `normalizeProvider(ns)`. The namespace wins over `/v1/models`
- *   `owned_by`: Devin reports `owned_by: anthropic` for
- *   `devin/claude-…`, but the quota — and the model — is Devin's.
- * - Bare ids attribute by per-provider `model_quotas` evidence from
- *   `auth-files` (grouped by auth-file `provider`, never by `owned_by`),
- *   falling back to `owned_by` when no provider reports the id (this covers
- *   quota-blind providers such as Meta, whose accounts carry no per-model
- *   state but whose served ids still carry an honest `owned_by`).
- * - A bare id attributable to more than one provider (the likely source is
- *   `opencode-zen-free`'s bare ids) is an overlap: it is flagged, and it is
- *   not counted as any provider's proven model. The plugin never requires or
- *   suggests CLIProxy config; the openai-compat `prefix` field is only an
- *   optional operator-side fix, mentioned in the README.
+ * Attribution rules (no hard-coded id lists, no substring parsing):
+ * - Namespaced ids (`ns/rest`) attribute by namespace: the namespace equals
+ *   its provider string, or the explicit `NAMESPACE_TO_PROVIDER` table
+ *   (`nvidia` → `nvidia-nim`, `cloudflare` → `cloudflare-workers-ai`). The
+ *   namespace wins over `/v1/models` `owned_by`: Devin reports `owned_by:
+ *   anthropic` for `devin/claude-…`, but the quota — and the model — is
+ *   Devin's. Future providers (e.g. `openrouter/…`) resolve by exact match
+ *   with no code change.
+ * - Bare ids attribute by per-provider served evidence, grouped by auth-file
+ *   `provider`, never by `owned_by`: the live per-credential served set from
+ *   `GET auth-files/models?name=<file>` where the file answered successfully
+ *   (empty answers included — live membership is authoritative for that
+ *   credential), else per-provider `model_quotas` keys for credentials without
+ *   live evidence. A bare id with no served evidence falls back to `owned_by`
+ *   through an explicit vendor-name table (`anthropic` → `claude`, `openai` →
+ *   `codex`; anything else must equal its provider string) — but only for
+ *   providers without live evidence this run. This covers quota-blind
+ *   providers such as Meta, whose accounts carry no per-model state but whose
+ *   served ids still carry an honest `owned_by`.
+ * - A bare id attributable to more than one enabled provider (the canonical
+ *   case is stock `claude-sonnet-4-6`, served by both claude and antigravity)
+ *   is an overlap: it is flagged, and it is not counted as any provider's
+ *   proven model. The plugin never requires or suggests CLIProxy config; the
+ *   openai-compat `prefix` field is only an optional operator-side fix,
+ *   mentioned in the README.
  */
 
-import { normalizeProvider } from "./parsers.js";
+import { NAMESPACE_TO_PROVIDER } from "./parsers.js";
 
 export interface ServedModel {
   /** Served id, lowercased for matching. */
@@ -120,14 +130,49 @@ export function observedModelKeysByProvider(
 }
 
 /**
+ * Vendor names from `/v1/models` `owned_by` that differ from their provider
+ * string (explicit table, not substring parsing). Every other `owned_by`
+ * must equal its provider string to claim an id.
+ */
+export const OWNED_BY_TO_PROVIDER: Record<string, string> = {
+  anthropic: "claude",
+  openai: "codex",
+};
+
+/** Attribute a namespace to its in-scope provider: exact match or the explicit table. */
+export function providerForNamespace(
+  namespace: string,
+  inScope: Set<string>,
+): string | null {
+  const ns = namespace.toLowerCase();
+  if (inScope.has(ns)) return ns;
+  const mapped = NAMESPACE_TO_PROVIDER[ns];
+  if (mapped && inScope.has(mapped)) return mapped;
+  return null;
+}
+
+/** Attribute an `owned_by` value to its in-scope provider: exact match or the explicit table. */
+export function providerForOwnedBy(ownedBy: string, inScope: Set<string>): string | null {
+  const owned = ownedBy.trim().toLowerCase();
+  if (!owned) return null;
+  if (inScope.has(owned)) return owned;
+  const mapped = OWNED_BY_TO_PROVIDER[owned];
+  if (mapped && inScope.has(mapped)) return mapped;
+  return null;
+}
+
+/**
  * Derive each provider's proven served ids plus the overlap list.
  *
  * - Namespaced ids attribute by namespace (namespace wins over `owned_by`).
- *   A namespace that names no known provider is unattributed with a warning.
- * - Bare ids attribute to their single claimant (via `model_quotas`
- *   evidence), else to their `owned_by` provider when that provider is in
- *   scope, else unattributed. Two or more attributing providers is an
- *   overlap: flagged, and proven for nobody.
+ *   A namespace that names no in-scope provider is unattributed with a
+ *   warning.
+ * - Bare ids attribute to their single claimant: the live per-credential
+ *   served set for credentials whose file answered successfully (the caller
+ *   already withholds those credentials' `model_quotas` keys), else
+ *   `model_quotas` evidence, else their `owned_by` provider when that
+ *   provider is in scope and has no live evidence this run. Two or more
+ *   attributing providers is an overlap: flagged, and proven for nobody.
  */
 export function deriveProviderModels(
   served: ServedModel[],
@@ -136,6 +181,21 @@ export function deriveProviderModels(
     authProviders: string[];
     /** Per-provider observed `model_quotas` keys (lowercased). */
     observedKeysByProvider: Map<string, Set<string>>;
+    /**
+     * Per-provider live served ids from `GET auth-files/models?name=<file>`
+     * (lowercased), grouped by auth-file provider. Absent/empty when the
+     * endpoint was unavailable this run — derivation falls back to the
+     * `model_quotas` + `owned_by` heuristic with a warning.
+     */
+    servedByProvider?: Map<string, Set<string>>;
+    /**
+     * Lowercase providers with at least one successfully fetched live served
+     * set this run. Their `owned_by` claims are ignored: live membership is
+     * authoritative for them (a successful empty set means the provider
+     * serves nothing in the catalog), and the `owned_by` fallback only
+     * covers providers without live evidence.
+     */
+    liveOkProviders?: string[];
   },
 ): { providerModels: Record<string, string[]>; overlaps: ModelOverlap[]; warnings: string[] } {
   const warnings: string[] = [];
@@ -155,25 +215,38 @@ export function deriveProviderModels(
     const ns = namespaceOfModelId(id);
     if (ns !== null) {
       // Namespace-first: `owned_by` never overrides it (Devin case).
-      const provider = normalizeProvider(ns);
-      if (provider === "unknown-provider") {
+      const provider = providerForNamespace(ns, inScope);
+      if (provider === null) {
         warnings.push(
-          `model ${JSON.stringify(id)} names an unknown namespace ${JSON.stringify(ns)}; not counted as any provider's proven model.`,
+          `model ${JSON.stringify(id)} names a namespace ${JSON.stringify(ns)} with no in-scope provider; not counted as any provider's proven model.`,
         );
         continue;
       }
       give(provider, id);
       continue;
     }
-    const claimants = [...inScope].filter((p) => opts.observedKeysByProvider.get(p)?.has(id) ?? false).sort();
-    const owned = ownedBy ? normalizeProvider(ownedBy) : "unknown-provider";
-    const ownedInScope = owned !== "unknown-provider" && inScope.has(owned) ? owned : null;
-    const parties = [...new Set([...claimants, ...(ownedInScope ? [ownedInScope] : [])])].sort();
+    const quotaClaimants = [...inScope].filter(
+      (p) => opts.observedKeysByProvider.get(p)?.has(id) ?? false,
+    );
+    const servedClaimants = opts.servedByProvider
+      ? [...inScope].filter((p) => {
+          const set = opts.servedByProvider?.get(p);
+          return set ? [...set].some((s) => s.toLowerCase() === id) : false;
+        })
+      : [];
+    const claimants = [...new Set([...quotaClaimants, ...servedClaimants])].sort();
+    const liveOk = new Set((opts.liveOkProviders ?? []).map((p) => p.toLowerCase()));
+    const ownedInScope = ownedBy ? providerForOwnedBy(ownedBy, inScope) : null;
+    // Live membership supersedes the fallback: a provider whose served set
+    // answered successfully never claims via `owned_by` (its live set — even
+    // an empty one — already says what it serves).
+    const ownedClaimed = ownedInScope && !liveOk.has(ownedInScope) ? ownedInScope : null;
+    const parties = [...new Set([...claimants, ...(ownedClaimed ? [ownedClaimed] : [])])].sort();
     if (parties.length === 1) {
       give(parties[0] as string, id);
     } else if (parties.length === 0) {
       warnings.push(
-        `model ${JSON.stringify(id)} is served but no provider reports it (no model_quotas evidence and no in-scope owned_by); not counted as any provider's proven model.`,
+        `model ${JSON.stringify(id)} is served but no provider reports it (no served-set or model_quotas evidence and no in-scope owned_by); not counted as any provider's proven model.`,
       );
     } else {
       overlaps.push({ id, providers: parties });

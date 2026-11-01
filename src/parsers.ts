@@ -119,7 +119,13 @@ export type ProviderKey =
   | "opencode-go"
   | "unknown-provider";
 
-/** Normalize a CLIProxy provider word into a parser key. */
+/**
+ * Map a CLIProxy provider word into a parser key. This chooses ONLY the quota
+ * parser and the admission-signal class (unknown words fall back to the
+ * generic parser, which understands no signal shape and stays quota-blind).
+ * It is never an identity: grouping, config, drift and routing all use the
+ * raw auth-file provider string (trimmed, lowercased).
+ */
 export function normalizeProvider(channel: unknown): ProviderKey {
   const c = String(channel ?? "").toLowerCase().replace(/[_-]/g, "-");
   if (!c) return "unknown-provider";
@@ -133,10 +139,32 @@ export function normalizeProvider(channel: unknown): ProviderKey {
   if (c.includes("opencode-go") || c.includes("opencodego")) return "opencode-go";
   if (c.includes("opencode") || c.includes("compat") || c.includes("zen")) return "compat";
   if (c.includes("synthetic")) return "synthetic";
-  if (c.includes("nvidia") || c.includes("nim")) return "nvidia-nim";
+  // Token match on `nim`, not substring: a bare `includes("nim")` misfiles a
+  // provider such as `minimax` as `nvidia-nim`.
+  if (c.includes("nvidia") || /(^|-)nim($|-)/.test(c)) return "nvidia-nim";
   if (c.includes("cloudflare")) return "cloudflare";
   if (c === "zai" || c.includes("zai") || c.includes("glm") || c.includes("zhipu")) return "zai";
   return "unknown-provider";
+}
+
+/**
+ * Namespaces that differ from their provider string (spike TWO-681 §1: the
+ * table is data, not parsing). Every other namespace equals its provider
+ * string, so future providers (e.g. `openrouter/…`) resolve with no code
+ * change. Used by model → provider derivation and namespace stripping —
+ * never by quota grouping.
+ */
+export const NAMESPACE_TO_PROVIDER: Record<string, string> = {
+  nvidia: "nvidia-nim",
+  cloudflare: "cloudflare-workers-ai",
+};
+
+/** True when `ns` names `provider`: exact match or the explicit table above. */
+export function namespaceMatchesProvider(namespace: string, provider: string): boolean {
+  const ns = namespace.toLowerCase();
+  const p = provider.toLowerCase();
+  if (ns === p) return true;
+  return NAMESPACE_TO_PROVIDER[ns] === p;
 }
 
 /** Providers whose quota observations carry an admission signal. */
@@ -605,9 +633,22 @@ export function parseLegacySignalList(
 export interface ParsedAccount {
   /** Stable row key (`acct-<sha256[0..16]>`; never a raw identifier). */
   key: string;
-  provider: ProviderKey;
+  /**
+   * Raw CLIProxy provider string (trimmed, lowercased) — the identity used
+   * for grouping, config matching, drift and routing. Never normalized:
+   * every provider (including future ones like `openrouter`) keeps its own
+   * group, and `minimax` never merges into `nvidia-nim`.
+   */
+  provider: string;
   /** Raw provider word from the entry, for UI labels. */
   channel: string;
+  /**
+   * Auth-file `name` for the per-credential served-set fetch
+   * (`GET auth-files/models?name=<file>`), or null when the entry carries
+   * none. Never sent unless it passes the management client's safe-name
+   * check; files without a usable name keep the `model_quotas` heuristic.
+   */
+  fileName: string | null;
   /** Reconciled lifecycle state. */
   status: AccountStatus;
   /** CLIProxy `status_message`, when present (operational note). */
@@ -674,7 +715,14 @@ export function parseAuthFiles(
     }
     const channel =
       getStr(entry, "provider", "Provider", "type", "Type", "channel", "Channel", "kind") ?? "unknown";
-    const provider = normalizeProvider(channel);
+    // Raw identity (trimmed, lowercased) — never the parser key. Config rows,
+    // drift and routing match on this string exactly.
+    const rawProvider = channel.trim().toLowerCase();
+    const provider = rawProvider || "unknown";
+    // The parser key chooses only the quota parser and the admission-signal
+    // class; unknown providers fall back to the generic (quota-blind) parser.
+    const parserKey = normalizeProvider(provider);
+    const fileName = getStr(entry, "name", "Name") ?? null;
 
     // Stable identity: CLIProxy `id` first, then the auth-file `path`.
     const stableId = getStr(entry, "id", "ID", "auth_id") ?? getStr(entry, "path", "Path") ?? null;
@@ -714,12 +762,15 @@ export function parseAuthFiles(
           ? Number(priorityRaw)
           : null;
 
-    const allowList = opts.allowLists[provider] ?? [];
+    // Operator overrides keyed by the raw string win; otherwise the parser
+    // key's defaults apply (e.g. a `cloudflare-workers-ai` row inherits the
+    // `cloudflare` windows). Unknown providers carry no allow-list.
+    const allowList = opts.allowLists[provider] ?? opts.allowLists[parserKey] ?? [];
     // NIM is local-estimate only: its numbers ride along as non-gating
     // context (soft signal), and the account stays quota-blind for routing.
-    const softGating = provider === "nvidia-nim";
+    const softGating = parserKey === "nvidia-nim";
     const labelPrefix =
-      provider === "claude" ? "Claude unified" : provider === "codex" ? "Codex" : provider === "devin" ? "Devin" : provider;
+      parserKey === "claude" ? "Claude unified" : parserKey === "codex" ? "Codex" : parserKey === "devin" ? "Devin" : provider;
 
     // Passive account-level observation.
     const quota = getObj(entry, "quota", "Quota", "observation", "usage");
@@ -779,7 +830,7 @@ export function parseAuthFiles(
       getStr(entry, "plan", "planType", "Plan", "account_type", "AccountType") ?? null;
     for (const input of signalInputs) {
       if ("__legacy" in input.signals) {
-        const parsed = parseLegacySignalList(provider, (input.signals as Record<string, unknown>).__legacy, input.observed, allowList, {
+        const parsed = parseLegacySignalList(parserKey, (input.signals as Record<string, unknown>).__legacy, input.observed, allowList, {
           models: input.models,
           labelPrefix,
         });
@@ -787,7 +838,7 @@ export function parseAuthFiles(
         limits.push(...stampLimits(parsed.limits, input.observed, opts.now));
         continue;
       }
-      const parsed = parseHeaderSignals(provider, input.signals, input.observed, allowList, {
+      const parsed = parseHeaderSignals(parserKey, input.signals, input.observed, allowList, {
         models: input.models,
         labelPrefix,
       });
@@ -802,7 +853,7 @@ export function parseAuthFiles(
     const pluginPayload = opts.pluginPayloadByProvider?.get(provider);
     let pluginQuota: ParsedPluginQuota | null = null;
     if (pluginPayload !== undefined && !disabled) {
-      pluginQuota = parsePluginQuota(provider, pluginPayload, allowList, {
+      pluginQuota = parsePluginQuota(parserKey, pluginPayload, allowList, {
         softGating,
         // Plugin-quota limits are fetched right now: their observation time is
         // the sync's fetch time, never the passive `observed_at`.
@@ -817,13 +868,13 @@ export function parseAuthFiles(
       : [...limits, ...pluginLimits];
 
     const quotaBlind =
-      provider === "meta" ||
-      provider === "antigravity" ||
-      provider === "xai" ||
-      provider === "kimi" ||
-      provider === "compat" ||
-      provider === "unknown-provider" ||
-      provider === "nvidia-nim" ||
+      parserKey === "meta" ||
+      parserKey === "antigravity" ||
+      parserKey === "xai" ||
+      parserKey === "kimi" ||
+      parserKey === "compat" ||
+      parserKey === "unknown-provider" ||
+      parserKey === "nvidia-nim" ||
       (stamped.length === 0 && pluginLimits.length === 0);
 
     if (quota && !observedAt) {
@@ -834,6 +885,7 @@ export function parseAuthFiles(
       key,
       provider,
       channel,
+      fileName,
       status,
       statusMessage,
       priority,

@@ -20,6 +20,7 @@ import {
   CliproxyAuthError,
   CliproxyClientApiClient,
   CliproxyManagementClient,
+  CliproxyNotFoundError,
   type ManagementFetch,
 } from "./cliproxy.js";
 import type { ConnectorConfig, ProviderEntry } from "./config.js";
@@ -248,6 +249,14 @@ export async function runSync(deps: SyncDeps, inFlight: { running: boolean }): P
 
       const { rows, drift } = accountsToRows(byKey, deps.config.providers, unkeyed);
 
+      // Per-credential live served sets (best-effort): one pinned
+      // `GET auth-files/models?name=<file>` per enabled auth file, grouped by
+      // auth-file provider. A missing endpoint (404 on every file, e.g. an
+      // older CLIProxy) degrades to the `model_quotas` heuristic with a
+      // warning; auth failures propagate to the strike budget like every
+      // other management GET.
+      const servedSets = await fetchServedSets(client, accounts);
+
       // Served-model catalog (best-effort): live `/v1/models` with the
       // *client* key, intersected with the auth-file list. A failed or
       // unconfigured catalog only disables derivation + overlap detection
@@ -255,6 +264,16 @@ export async function runSync(deps: SyncDeps, inFlight: { running: boolean }): P
       // are ordinary fetch failures here: they never touch the management
       // strike budget (different key, no host lockout).
       const catalog = await fetchModelCatalog(deps);
+      // Live served sets supersede the heuristic per credential: an account
+      // whose file answered successfully claims models only through its live
+      // set, so a stale `model_quotas` key cannot fabricate an overlap.
+      // Accounts with no usable file name (or a failed fetch) keep the
+      // heuristic — that is the fallback. Disabled accounts are excluded
+      // everywhere else (quota aggregation, served-set fetching); they are
+      // excluded here too, so disabling a credential clears its claims.
+      const quotaAccounts = accounts.filter(
+        (a) => a.status !== "disabled" && !(a.fileName && servedSets.okFiles.has(a.fileName)),
+      );
       const derivation = deriveProviderModels(catalog.served, {
         authProviders: [
           ...new Set([
@@ -262,7 +281,9 @@ export async function runSync(deps: SyncDeps, inFlight: { running: boolean }): P
             ...deps.config.providers.map((p) => p.provider),
           ]),
         ],
-        observedKeysByProvider: observedModelKeysByProvider(accounts),
+        observedKeysByProvider: observedModelKeysByProvider(quotaAccounts),
+        servedByProvider: servedSets.byProvider,
+        liveOkProviders: [...servedSets.okProviders],
       });
       for (const overlap of derivation.overlaps) {
         for (const provider of overlap.providers) {
@@ -278,7 +299,7 @@ export async function runSync(deps: SyncDeps, inFlight: { running: boolean }): P
         }
       }
 
-      const errors = [...pluginErrors, ...warnings, ...catalog.warnings, ...derivation.warnings];
+      const errors = [...pluginErrors, ...warnings, ...servedSets.warnings, ...catalog.warnings, ...derivation.warnings];
       const providerModels: Record<string, string[]> | undefined =
         catalog.available ? derivation.providerModels : undefined;
       const modelOverlaps: ModelOverlap[] | undefined =
@@ -321,6 +342,107 @@ export async function runSync(deps: SyncDeps, inFlight: { running: boolean }): P
   } finally {
     inFlight.running = false;
   }
+}
+
+/**
+ * Fetch the live per-credential served sets for model → provider derivation.
+ * One pinned `GET auth-files/models?name=<file>` per enabled auth file with
+ * a usable entry `name` (deduplicated by name), grouped by auth-file
+ * provider — intra-family sharing is one claim, not ambiguity. Successfully
+ * fetched file names are reported in `okFiles` (empty answers included) so
+ * the caller can let live membership supersede those credentials'
+ * `model_quotas` keys; files without a usable name are skipped with a warning
+ * (their `model_quotas` evidence still counts). Always best-effort except
+ * auth: a 401/403 rethrows to the
+ * strike budget; a 404 on *every* file means the endpoint is missing on this
+ * CLIProxy build and derivation degrades to the heuristic with one warning;
+ * any other per-file failure warns for that file and keeps the rest.
+ */
+async function fetchServedSets(
+  client: CliproxyManagementClient,
+  accounts: ParsedAccount[],
+): Promise<{
+  byProvider: Map<string, Set<string>>;
+  /** File names whose served set answered successfully (empty sets included). */
+  okFiles: Set<string>;
+  /** Providers with at least one successfully fetched file. */
+  okProviders: Set<string>;
+  warnings: string[];
+}> {
+  const warnings: string[] = [];
+  const byProvider = new Map<string, Set<string>>();
+  const okFiles = new Set<string>();
+  const okProviders = new Set<string>();
+  // Enabled files only; group names so one GET serves every entry sharing it.
+  const providersByName = new Map<string, Set<string>>();
+  for (const a of accounts) {
+    if (a.status === "disabled") continue;
+    if (!a.fileName) {
+      warnings.push(
+        `${a.provider}: auth file for row ${a.key} carries no name; skipping its served-set fetch (model_quotas evidence still counts).`,
+      );
+      continue;
+    }
+    let set = providersByName.get(a.fileName);
+    if (!set) {
+      set = new Set<string>();
+      providersByName.set(a.fileName, set);
+    }
+    set.add(a.provider);
+  }
+  if (providersByName.size === 0) {
+    warnings.push(
+      "no enabled auth file exposes a name; skipping the served-set fetch this run (model_quotas heuristic still applies).",
+    );
+    return { byProvider, okFiles, okProviders, warnings };
+  }
+  let ok = 0;
+  let notFound = 0;
+  for (const [name, providers] of [...providersByName.entries()].sort()) {
+    let payload: unknown;
+    try {
+      payload = await client.getAuthFileModels(name);
+    } catch (err) {
+      if (err instanceof CliproxyAuthError) throw err;
+      if (err instanceof CliproxyNotFoundError) {
+        notFound += 1;
+        warnings.push(
+          `${[...providers].sort().join(", ")}: served-set fetch for auth file ${JSON.stringify(name)} returned 404; no served evidence from this file this run.`,
+        );
+        continue;
+      }
+      warnings.push(
+        `${[...providers].sort().join(", ")}: served-set fetch for auth file ${JSON.stringify(name)} failed (${err instanceof Error ? err.message : "fetch failed"}); no served evidence from this file this run.`,
+      );
+      continue;
+    }
+    const parsed = parseModelsPayload(payload);
+    ok += 1;
+    // A successful answer — even an empty set — is evidence: this file's live
+    // membership supersedes its historical model_quotas keys (see the call
+    // site), so a stale quota key cannot fabricate an overlap.
+    okFiles.add(name);
+    for (const provider of providers) okProviders.add(provider);
+    for (const w of parsed.warnings) {
+      warnings.push(`${[...providers].sort().join(", ")} served set (${JSON.stringify(name)}): ${w}`);
+    }
+    for (const m of parsed.models) {
+      for (const provider of providers) {
+        let set = byProvider.get(provider);
+        if (!set) {
+          set = new Set<string>();
+          byProvider.set(provider, set);
+        }
+        set.add(m.id);
+      }
+    }
+  }
+  if (ok === 0 && notFound > 0 && warnings.length > 0) {
+    warnings.push(
+      "the served-set endpoint returned 404 for every enabled auth file (older CLIProxy builds lack it); overlap detection falls back to the model_quotas + owned_by heuristic this run.",
+    );
+  }
+  return { byProvider, okFiles, okProviders, warnings };
 }
 
 /**

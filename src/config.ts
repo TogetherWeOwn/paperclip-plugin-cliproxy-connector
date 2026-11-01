@@ -166,9 +166,11 @@ export function parseConfig(raw: unknown): { config: ConnectorConfig; validation
     errors.push(`syncIntervalMinutes must be within [1, 60]; got ${syncIntervalMinutes}.`);
   }
 
-  // v2 provider rows. Unknown provider words are skipped with a warning (a
-  // typo must not fail the whole sync closed); the discovered accounts of a
-  // skipped provider drift-warn as unconfigured instead.
+  // v2 provider rows. Any non-empty provider string is accepted as-is
+  // (raw auth-file word, trimmed and lowercased): future providers such as
+  // `openrouter` need no code change, and `cloudflare-workers-ai` matches its
+  // accounts exactly. A typo'd row simply matches no accounts and drift-warns
+  // as having zero enabled accounts instead of failing the sync closed.
   const providers: ProviderEntry[] = [];
   const providersIn = r.providers ?? [];
   const seenProviders = new Set<string>();
@@ -195,12 +197,6 @@ export function parseConfig(raw: unknown): { config: ConnectorConfig; validation
       seenProviders.add(provider);
       if (!connectionId) {
         errors.push(`${where} for ${JSON.stringify(provider)}: connectionId must be a non-empty Paperclip connection id.`);
-        continue;
-      }
-      if (!isKnownProviderWord(provider)) {
-        warnings.push(
-          `${where}: ${JSON.stringify(provider)} is not a known CLIProxy provider word; the row is ignored and discovered accounts of it will drift-warn as unconfigured.`,
-        );
         continue;
       }
       const prev = seenConnections.get(connectionId);
@@ -308,7 +304,11 @@ export function parseConfig(raw: unknown): { config: ConnectorConfig; validation
   return { config, validation: { ok: errors.length === 0, warnings, errors } };
 }
 
-/** CLIProxy provider words the connector understands (auth-files `provider`). */
+/**
+ * Provider words with a dedicated quota parser (informational only — config
+ * rows accept any provider string). Unknown words use the generic parser and
+ * stay quota-blind. Kept exported for the plugin page's provider labels.
+ */
 const KNOWN_PROVIDER_WORDS = new Set([
   "claude",
   "codex",
@@ -321,6 +321,7 @@ const KNOWN_PROVIDER_WORDS = new Set([
   "synthetic",
   "nvidia-nim",
   "cloudflare",
+  "cloudflare-workers-ai",
   "zai",
   "opencode-go",
 ]);

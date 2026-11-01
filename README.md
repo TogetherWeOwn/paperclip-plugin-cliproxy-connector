@@ -45,9 +45,17 @@ list. A connection's model list is its provider's stock ids — bare for Claude,
 Codex/OpenAI, Antigravity and Meta; `devin/…` for Devin (built into CLIProxy); the fixed
 plugin namespaces `synthetic/…`, `nvidia/…`, `cloudflare/…`, `zai/…`, `opencode-go/…`;
 `opencode-zen-free` (openai-compat) is bare unless its entry sets the stock `prefix`
-field. If one served id maps to more than one provider (likely `opencode-zen-free`'s
-bare ids), the page flags the overlap and the id counts as no provider's proven model;
-setting that openai-compat entry's `prefix` field is an optional operator-side fix.
+field. Any other provider string works the same way — a future family such as
+`openrouter` needs one `providers[]` row and no plugin update. Bare-id overlap is
+resolved against each credential's live served set
+(`GET /v0/management/auth-files/models?name=<file>`, one fetch per enabled auth file;
+a file that answers — even with an empty set — supersedes that credential's
+`model_quotas` keys and `owned_by` fallback, so stale quota state cannot fabricate
+an overlap; older builds without the endpoint fall back to the `model_quotas`
+heuristic with a warning). If one served id maps to more than one provider (the stock example is
+`claude-sonnet-4-6`, served by both claude and antigravity), the page flags the overlap
+and the id counts as no provider's proven model; setting that openai-compat entry's
+`prefix` field is an optional operator-side fix.
 
 Agents must never call the CLIProxy management API; every key-bearing step below is run by
 the operator. You read redacted output only.
@@ -107,14 +115,15 @@ the operator. You read redacted output only.
 | `perPoolReservePercent` | `{}` | Per-pool override, wins over everything. |
 | `recheckSeconds` | `60` | Wait before re-probing unknown/stale telemetry. |
 | `maxAgeMultiplier` / `graceMultiplier` | `2` / `3` | Freshness = sync interval × 2; grace = freshness × 3. |
-| `providers` | `[]` | One `{ provider, connectionId, completeInventory }` row per CLIProxy provider family. Duplicates error; unknown provider words warn + skip (discovered accounts drift-warn as unconfigured). Empty warns. |
+| `providers` | `[]` | One `{ provider, connectionId, completeInventory }` row per CLIProxy provider family. The provider word is the raw auth-file string (e.g. `cloudflare-workers-ai`); any string is accepted, duplicates error, and a row that matches no accounts drift-warns as having zero enabled accounts. Empty warns. |
 | `providerWindows` | spike matrix §2 | Per-provider gating-window allow-lists (lowercased substrings). |
 | `pluginQuotaIds` | `{}` | CLIProxy plugin id per provider for quota fetch. |
 | `audienceConfirmed` | `false` | Page shows upstream quota state; confirm the audience, then set `true`. |
 
 ## Endpoint assumptions
 
-The management paths are pinned in code (`/v0/management/auth-files` and
+The management paths are pinned in code (`/v0/management/auth-files`,
+`/v0/management/auth-files/models?name=<file>` and
 `/v0/management/plugins/<segment>/quota`) — there are deliberately no config knobs for
 them, and the management key is never sent to `/v1` paths. The served-model list has its
 own pinned path (`/v1/models`, `MODELS_PATH`) fetched with the separate client API key

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { aggregateProvider } from "./aggregate.js";
+import { aggregateProvider, stripProviderNamespace } from "./aggregate.js";
 import { parseConfig, type ConnectorConfig } from "./config.js";
 import type { AccountUsageRow, UsageLimitRow } from "./types.js";
 
@@ -264,6 +264,24 @@ describe("namespaced requested models (stock CLIProxy ids)", () => {
   it("other models route on the account-level window", () => {
     expect(devinAssess("devin/other-model").state).toBe("allowed");
     expect(devinAssess("other-model").state).toBe("allowed");
+  });
+
+  it("strips only the provider's own namespace: explicit table, no substring parsing", () => {
+    // Exact matches strip (including future providers like openrouter).
+    expect(stripProviderNamespace("devin/claude-opus-4-5", "devin")).toBe("claude-opus-4-5");
+    expect(stripProviderNamespace("openrouter/deepseek-v3", "openrouter")).toBe("deepseek-v3");
+    // Explicit table entries strip for their provider string.
+    expect(stripProviderNamespace("nvidia/llama-3-3-70b", "nvidia-nim")).toBe("llama-3-3-70b");
+    expect(stripProviderNamespace("cloudflare/qwen-3-32b", "cloudflare-workers-ai")).toBe(
+      "qwen-3-32b",
+    );
+    // Foreign namespaces never strip — not even substring lookalikes.
+    expect(stripProviderNamespace("minimax/minimax-m2", "nvidia-nim")).toBe("minimax/minimax-m2");
+    expect(stripProviderNamespace("nim/llama-3-3-70b", "minimax")).toBe("nim/llama-3-3-70b");
+    expect(stripProviderNamespace("nvidia/llama-3-3-70b", "minimax")).toBe("nvidia/llama-3-3-70b");
+    // Bare ids and malformed namespaces pass through.
+    expect(stripProviderNamespace("claude-opus-4-5", "claude")).toBe("claude-opus-4-5");
+    expect(stripProviderNamespace("/leading", "claude")).toBe("/leading");
   });
 
   it("a foreign namespace never matches this provider's per-model window", () => {

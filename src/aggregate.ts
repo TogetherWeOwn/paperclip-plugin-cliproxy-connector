@@ -25,7 +25,7 @@
  */
 
 import { effectiveReservePercent, graceMs, maxAgeMs, type ConnectorConfig } from "./config.js";
-import { hasAdmissionSignal, normalizeProvider } from "./parsers.js";
+import { hasAdmissionSignal, namespaceMatchesProvider, normalizeProvider } from "./parsers.js";
 import type { AccountUsageRow, Freshness, ProviderState, UsageLimitRow } from "./types.js";
 
 export interface ProviderAssessment {
@@ -89,22 +89,22 @@ function windowObservationAgeMs(
 
 /**
  * Strip a leading provider namespace (`ns/rest` → `rest`) when — and only
- * when — it names this aggregate's own provider. The namespace set is
- * derived from provider data (`normalizeProvider`), not from a hard-coded
- * strip list: `devin/…` and the plugin namespaces (`synthetic/…`, `nvidia/…`
- * for `nvidia-nim`, `cloudflare/…`, `zai/…`, `opencode-go/…`) strip for
- * their own provider. Stock bare ids have nothing to strip. A namespace
- * naming any other (or no known) provider stays literal, so a request can
- * never match another provider's per-model window. Matching always tries
- * both the full and the stripped form, so bare and namespaced requests for
- * the same model agree.
+ * when — it names this aggregate's own provider. The mapping is data, not
+ * parsing: the namespace equals the provider string, or the explicit
+ * `NAMESPACE_TO_PROVIDER` table (`nvidia` → `nvidia-nim`, `cloudflare` →
+ * `cloudflare-workers-ai`). `devin/…` and the plugin namespaces strip for
+ * their own provider; stock bare ids have nothing to strip. A namespace
+ * naming any other provider (or none) stays literal, so a request can never
+ * match another provider's per-model window. Matching always tries both the
+ * full and the stripped form, so bare and namespaced requests for the same
+ * model agree.
  */
 export function stripProviderNamespace(model: string, provider: string): string {
   const slash = model.indexOf("/");
   if (slash <= 0 || slash === model.length - 1) return model;
   const ns = model.slice(0, slash);
   const rest = model.slice(slash + 1);
-  if (normalizeProvider(ns) !== normalizeProvider(provider)) return model;
+  if (!namespaceMatchesProvider(ns, provider)) return model;
   return rest;
 }
 

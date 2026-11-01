@@ -38,6 +38,41 @@ export const AUTH_FILES_PATH = "/v0/management/auth-files";
 const PLUGIN_QUOTA_SHAPE = /^\/v0\/management\/plugins\/[A-Za-z0-9][A-Za-z0-9_-]*\/quota$/;
 
 /**
+ * Pinned per-credential served-set path (TWO-679 round 2, approved 09:24Z
+ * design input): `GET /v0/management/auth-files/models?name=<file>`
+ * (`GetAuthFileModels`). One GET per enabled auth file per sync; the `name`
+ * query value is the auth-files entry `name`, validated as a single safe
+ * value before any network happens. Same management key, same strike and
+ * timeout rules as the other management paths.
+ */
+export const AUTH_FILE_MODELS_PATH = "/v0/management/auth-files/models";
+
+/**
+ * Single safe auth-file name: starts alphanumeric, then alphanumerics, dots,
+ * underscores, hyphens, `@` or `+` (CLIProxy OAuth flows generate email-style
+ * file names such as `antigravity-user@example.com.json`; rejecting them would
+ * silently drop those credentials' live served evidence). `..` is rejected
+ * separately, and `api-call` can never appear in the pathname (the ban runs
+ * on the decoded path, as for every pinned shape).
+ */
+export const AUTH_FILE_NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._@+-]{0,255}$/;
+
+export function isSafeAuthFileName(name: string): boolean {
+  return (
+    AUTH_FILE_NAME_PATTERN.test(name) &&
+    !name.includes("..") &&
+    !name.toLowerCase().includes("api-call")
+  );
+}
+
+export function authFileModelsPath(name: string): string {
+  if (!isSafeAuthFileName(name)) {
+    throw new CliproxyConfigError(`refusing to build a served-set path from an untrusted auth-file name: ${name}`);
+  }
+  return `${AUTH_FILE_MODELS_PATH}?name=${encodeURIComponent(name)}`;
+}
+
+/**
  * Pinned client path (fixed shape, never a config string). The only GET the
  * client API key is ever attached to: the served model list that drives
  * model → provider derivation. Same guarded-fetch rules as the management
@@ -53,6 +88,17 @@ export function pluginQuotaPath(pluginId: string): string {
 }
 
 export class CliproxyConfigError extends Error {}
+/**
+ * The endpoint does not exist (or the named file does not). Callers treat
+ * this as best-effort degradation (served-set → heuristic fallback), never
+ * as an auth failure: it spends no strike budget.
+ */
+export class CliproxyNotFoundError extends Error {
+  constructor(path: string) {
+    super(`CLIProxy has no served-set for this request (HTTP 404 on ${path})`);
+    this.name = "CliproxyNotFoundError";
+  }
+}
 export class CliproxyAuthError extends Error {
   readonly status: number;
   constructor(status: number, path: string) {
@@ -101,6 +147,17 @@ function assertAllowListed(url: URL, what: string): void {
   const pathname = decodedPathname(url, what);
   if (pathname.toLowerCase().includes("api-call")) {
     throw new CliproxyConfigError("`api-call` is excluded from the allow-list and can never be called.");
+  }
+  if (pathname === AUTH_FILE_MODELS_PATH) {
+    // Pinned served-set shape: exactly one `name` param, and it must be a
+    // single safe value (validated the same way as at path-build time, so a
+    // hostile redirect target cannot smuggle a traversal past the check).
+    const keys = [...url.searchParams.keys()];
+    const names = url.searchParams.getAll("name");
+    if (keys.length !== 1 || keys[0] !== "name" || names.length !== 1 || !isSafeAuthFileName(names[0] as string)) {
+      throw new CliproxyConfigError(`served-set request has an unsafe name parameter (${what})`);
+    }
+    return;
   }
   if (pathname !== AUTH_FILES_PATH && !PLUGIN_QUOTA_SHAPE.test(pathname)) {
     throw new CliproxyConfigError(`path is outside the pinned GET allow-list: ${pathname}`);
@@ -158,6 +215,9 @@ async function guardedGetJson(args: {
     }
     if (res.status === 401 || res.status === 403) {
       throw new CliproxyAuthError(res.status, url.pathname);
+    }
+    if (res.status === 404) {
+      throw new CliproxyNotFoundError(url.pathname);
     }
     if (res.status >= 300 && res.status < 400) {
       const location = res.headers.get("location");
@@ -284,6 +344,19 @@ export class CliproxyManagementClient {
 
   getAuthFiles(): Promise<unknown> {
     return this.getJson(AUTH_FILES_PATH);
+  }
+
+  /**
+   * GET one auth file's live served set. The name is validated to a single
+   * safe value before any network happens; 401/403 spends the strike budget
+   * like every other management GET, while 404 (`CliproxyNotFoundError`) is
+   * the caller's cue to degrade to the `model_quotas` heuristic.
+   */
+  async getAuthFileModels(name: string): Promise<unknown> {
+    // Validated single safe value: the substituted path always matches the
+    // pinned shape. Anything else rejects before any network happens.
+    // (`async` so the validation throw surfaces as a rejection.)
+    return this.getJson(authFileModelsPath(name));
   }
 
   async getPluginQuota(pluginId: string): Promise<unknown> {
