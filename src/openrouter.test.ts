@@ -103,6 +103,21 @@ describe("fetchOpenRouterCredits", () => {
     );
   });
 
+  it("never follows a redirect: 3xx with redirect:manual is a body error", async () => {
+    let seenInit: RequestInit | undefined;
+    const httpFetch: OpenRouterFetch = vi.fn(async (_url, init) => {
+      seenInit = init;
+      return new Response(null, { status: 302, headers: { Location: "https://evil.invalid/" } });
+    });
+    const err = await fetchOpenRouterCredits({ httpFetch, secret: SECRET, fetchedAt: NOW }).catch(
+      (e: unknown) => e,
+    );
+    expect(seenInit?.redirect).toBe("manual");
+    expect(err).toBeInstanceOf(OpenRouterBodyError);
+    expect((err as Error).message).toMatch(/HTTP 302/);
+    expect((err as Error).message).not.toContain(SECRET);
+  });
+
   it("maps transport failures without leaking the secret", async () => {
     const http: OpenRouterFetch = async () => {
       throw new TypeError("fetch failed");

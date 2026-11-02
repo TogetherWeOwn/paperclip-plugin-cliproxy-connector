@@ -11,6 +11,7 @@ import {
   emptyStrikeBudget,
   reenableAfterStrike,
   runSync,
+  scrubWarnings,
   type SyncDeps,
 } from "./sync.js";
 import type {
@@ -2365,9 +2366,9 @@ describe("read-model extras (OpenRouter spend + request counts)", () => {
     expect(s.savedCounts).toEqual({
       lanes: [],
       fetchedAt: null,
-      note: expect.stringMatching(/paused until the next successful sync/),
+      note: expect.stringMatching(/skipped this run and retried next sync/),
     });
-    expect(summary.errors.join(" ")).toMatch(/paused until the next successful sync/);
+    expect(summary.errors.join(" ")).toMatch(/skipped this run and retried next sync/);
     // Exactly one request-count probe this run.
     expect(seen.filter((u) => u.includes("api-key-usage"))).toHaveLength(1);
     assertNoKeyLeak(s);
@@ -2384,5 +2385,29 @@ describe("read-model extras (OpenRouter spend + request counts)", () => {
     expect(s.savedCounts?.note).not.toBeNull();
     expect(JSON.stringify([s.savedCounts, summary.errors])).not.toContain("evil@example.com");
     assertNoKeyLeak(s);
+  });
+});
+
+describe("scrubWarnings (stored-note contract)", () => {
+  it("passes the realistic parse-warning corpus through unchanged", () => {
+    expect(
+      scrubWarnings([
+        "antigravity: skipping a malformed quota group.",
+        "devin: daily quota percent is unusable; marking it unknown.",
+        "claude: account observation carries no quota signals; treating as unknown.",
+      ]),
+    ).toBe(
+      "antigravity: skipping a malformed quota group. | devin: daily quota percent is unusable; marking it unknown. | claude: account observation carries no quota signals; treating as unknown.",
+    );
+  });
+
+  it("still redacts emails, long tokens and credential cores by design", () => {
+    expect(scrubWarnings(["contact ops@example.com for help"])).not.toContain("ops@example.com");
+    expect(scrubWarnings(["saw token sk-live-abc123def456 leaking"])).not.toContain("sk-live-abc123def456");
+    // Long operational slugs are the known conservative tradeoff: they redact
+    // rather than risk a laundered secret reaching stored state.
+    expect(scrubWarnings(["saw header anthropic-ratelimit-unified-5h-utilization missing"])).toContain(
+      "[redacted]",
+    );
   });
 });

@@ -80,8 +80,12 @@ describe("parseApiKeyUsage", () => {
     expect(lanes.map((l) => l.provider)).toEqual(["unknown", "weird"]);
     expect(lanes[0]).toMatchObject({ success: 10, failed: 2, total: 12 });
     expect(lanes[1]).toMatchObject({ success: 0, failed: 0, total: 0, recent: [] });
-    // Non-array recent_requests drops with a warning count.
+    // Non-array recent_requests drops with a warning count, and the two
+    // present-but-unusable counters (-5, "many") warn instead of zeroing silently.
     expect(warnings.some((w) => w.includes("weird") && w.includes("dropped 1 malformed"))).toBe(true);
+    expect(
+      warnings.some((w) => w.includes("weird") && w.includes("2 malformed counters read as 0")),
+    ).toBe(true);
   });
 
   it("skips malformed key entries and buckets with warning counts", () => {

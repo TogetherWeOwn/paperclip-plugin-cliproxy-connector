@@ -575,7 +575,9 @@ export function buildUsageData(args: {
     providers,
     earliestReset,
     earliestResetIn: resetIn(earliestReset, nowMs),
-    quotaFetchedAt: lastSync?.finishedAt ?? null,
+    // A skipped run (invalid config, min-interval) writes no rows: its finish
+    // time must not masquerade as a fresh quota fetch.
+    quotaFetchedAt: lastSync && !lastSync.skipped ? lastSync.finishedAt : null,
     spend: {
       configured: config.openRouterSecretRef !== undefined && config.openRouterSecretRef !== null,
       totalCredits,

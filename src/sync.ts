@@ -1182,9 +1182,12 @@ async function syncRequestCounts(
     payload = await client.getApiKeyUsage();
   } catch (err) {
     if (err instanceof CliproxyAuthError) {
+      // Per-run skip-and-retry (no cross-run pause state, no strike): a key the
+      // management path just accepted rarely fails here twice in a row, and a
+      // persistent rejection surfaces every run until the operator looks.
       const note =
         `request counts: CLIProxy rejected the key on api-key-usage (HTTP ${err.status}); ` +
-        `request-count sync paused until the next successful sync. No probe beyond this run.`;
+        `request counts skipped this run and retried next sync. No strike spent and no probe beyond this run.`;
       await keep(note);
       return note;
     }

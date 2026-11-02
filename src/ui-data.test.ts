@@ -672,3 +672,16 @@ describe("read-model sections (spend, usage, lane map, links)", () => {
     expect(blob).not.toMatch(/https?:\/\//);
   });
 });
+
+describe("skipped sync honesty", () => {
+  it("leaves quotaFetchedAt null when the saved summary is a skip", () => {
+    const usage = buildUsageData({
+      now: NOW,
+      config: testConfig(),
+      rows: {},
+      lastSync: { ...LAST_SYNC, skipped: true, skipReason: "minimum sync interval has not elapsed." },
+    });
+    expect(usage.quotaFetchedAt).toBeNull();
+    expect(usage.sync.skipped).toBe(true);
+  });
+});
