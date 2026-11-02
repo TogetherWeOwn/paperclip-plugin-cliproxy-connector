@@ -20,6 +20,7 @@
 
 import { aggregateProvider } from "./aggregate.js";
 import { graceMs, maxAgeMs, type ConnectorConfig } from "./config.js";
+import { providerDisplayName } from "./models.js";
 import { normalizeProvider, quotaBlindReason } from "./parsers.js";
 import { strikeWaitUntil } from "./sync.js";
 import type {
@@ -48,6 +49,15 @@ export interface ProviderAccountDetail {
    * `acct-<8hex>…`. Still a hash — never a raw identifier.
    */
   maskedLabel: string;
+  /**
+   * Operator-set display label (scrubbed note / safe label; null when
+   * neither qualifies). Display only — the hash key stays the identity.
+   */
+  displayLabel: string | null;
+  /** Read-only "needs sign-in" badge (v8 renewal fields or sign-in cooldown). */
+  needsSignIn: boolean;
+  /** Scrubbed recovery hint behind the badge, when the entry carries one. */
+  needsSignInHint: string | null;
   status: string;
   statusMessage: string | null;
   priority: number | null;
@@ -95,6 +105,8 @@ export interface AccountCardLimit {
 
 export interface ProviderCard {
   provider: string;
+  /** Human provider label for the UI (raw word fallback, never routing). */
+  displayName: string;
   connectionId: string;
   completeInventory: boolean;
   state: ProviderState;
@@ -121,6 +133,11 @@ export interface ProviderCard {
   reason: string;
   /** Proven served-model ids for this provider (stock ids), or [] when unknown. */
   models: string[];
+  /**
+   * Human display names per proven model id (`auth-files/models`
+   * `display_name`, scrubbed, display only — never a routing key).
+   */
+  modelNames: Record<string, string>;
   accounts: ProviderAccountDetail[];
 }
 
@@ -164,6 +181,11 @@ export interface PageData {
   earliestReset: string | null;
   /** Proven served-model ids per provider from the latest sync (stock ids). */
   providerModels: Record<string, string[]>;
+  /**
+   * Human display names per proven model id (scrubbed `display_name`,
+   * display only — never a routing key), keyed by provider then lowercase id.
+   */
+  providerModelNames: Record<string, Record<string, string>>;
   /** Served ids claimed by more than one provider (proven for nobody). */
   modelOverlaps: Array<{ id: string; providers: string[] }>;
   /**
@@ -224,35 +246,6 @@ export const REQUEST_COUNT_FIDELITY_NOTE =
   "OAuth lanes are invisible to this endpoint and are not represented here.";
 
 /**
- * Static lane map, derived from the cost-integration plan §1.3 on
- * 2026-11-01 — not from the ledger. The flag travels with the data so the page
- * can never render the map without its provenance, and `derivedAt` is the
- * section's timestamp. Any change to the underlying agent lanes means
- * re-deriving this table (and its date), not editing numbers in place.
- */
-export const LANE_MAP_DERIVED_AT = "2026-11-01";
-export const LANE_MAP_FLAG = `Config-derived mapping (derived ${LANE_MAP_DERIVED_AT}). Not ledger data.`;
-
-export interface LaneMapRow {
-  lane: string;
-  agents: number;
-  provider: string;
-  model: string;
-}
-
-export const LANE_MAP: LaneMapRow[] = [
-  { lane: "wonder-full", agents: 7, provider: "anthropic", model: "opus" },
-  { lane: "spark", agents: 3, provider: "anthropic", model: "opus" },
-  { lane: "opus", agents: 2, provider: "anthropic", model: "opus" },
-];
-
-export interface LaneMapSection {
-  derivedAt: string;
-  flag: string;
-  lanes: LaneMapRow[];
-}
-
-/**
  * Native cost views live outside this plugin (write-path and budget policy are
  * out of scope by design): the page links out with literal path constants, so
  * no payload-derived href can ever steer navigation (T4).
@@ -272,7 +265,7 @@ export interface NativeLinksSection {
  * Derived entirely from the already-synced cache — never a live read, and
  * never the destructive usage-queue endpoint.
  *
- * Read-model sections (spend, per-lane usage, lane map, native links) ride the
+ * Read-model sections (spend, per-lane usage, native links) ride the
  * same cache: every section carries its own timestamp (`quotaFetchedAt` for
  * the provider cards, whose per-account `checkedAt` fields give finer grain).
  */
@@ -288,7 +281,6 @@ export interface UsagePageData {
   quotaFetchedAt: string | null;
   spend: SpendSection;
   usage: UsageCountsSection;
-  laneMap: LaneMapSection;
   links: NativeLinksSection;
 }
 
@@ -328,7 +320,8 @@ export function buildPageData(args: {
         : null;
 
   const providerModels = lastSync?.providerModels ?? {};
-  const providers = buildProviderCards({ config, rows, now, nowMs, providerModels });
+  const providerModelNames = lastSync?.providerModelNames ?? {};
+  const providers = buildProviderCards({ config, rows, now, nowMs, providerModels, providerModelNames });
 
   const earliestReset = earliestRetryAt(providers);
 
@@ -354,6 +347,7 @@ export function buildPageData(args: {
     providers,
     earliestReset,
     providerModels,
+    providerModelNames,
     modelOverlaps,
     modelsNote,
   };
@@ -395,6 +389,9 @@ function toAccountDetail(
   return {
     key: row.key,
     maskedLabel: row.key.length > 14 ? `${row.key.slice(0, 13)}…` : row.key,
+    displayLabel: row.displayLabel ?? null,
+    needsSignIn: row.needsSignIn === true,
+    needsSignInHint: row.needsSignInHint ?? null,
     status: row.status,
     statusMessage: row.statusMessage,
     priority: row.priority,
@@ -435,8 +432,9 @@ function buildProviderCards(args: {
   now: string;
   nowMs: number;
   providerModels: Record<string, string[]>;
+  providerModelNames?: Record<string, Record<string, string>>;
 }): ProviderCard[] {
-  const { config, rows, now, nowMs, providerModels } = args;
+  const { config, rows, now, nowMs, providerModels, providerModelNames } = args;
   const allRows = Object.values(rows);
   return [...config.providers]
     .sort((a, b) => a.provider.localeCompare(b.provider))
@@ -463,6 +461,7 @@ function buildProviderCards(args: {
       const nextReset = earliestTime(countable.map((a) => a.nextReset));
       return {
         provider: entry.provider,
+        displayName: providerDisplayName(entry.provider),
         connectionId: entry.connectionId,
         completeInventory: entry.completeInventory,
         state: verdict.state,
@@ -480,6 +479,7 @@ function buildProviderCards(args: {
           ? `${verdict.reason} Wait/resume is off for this provider: inventory is not confirmed complete.`
           : verdict.reason,
         models: providerModels[entry.provider] ?? [],
+        modelNames: providerModelNames?.[entry.provider] ?? {},
         accounts,
       };
     });
@@ -600,7 +600,14 @@ export function buildUsageData(args: {
 }): UsagePageData {
   const { now, config, rows, lastSync, lastFailure, spend, counts } = args;
   const nowMs = Date.parse(now);
-  const providers = buildProviderCards({ config, rows, now, nowMs, providerModels: {} });
+  const providers = buildProviderCards({
+    config,
+    rows,
+    now,
+    nowMs,
+    providerModels: lastSync?.providerModels ?? {},
+    providerModelNames: lastSync?.providerModelNames ?? {},
+  });
   const earliestReset = earliestKnownReset(providers);
   const totalCredits = spend?.data?.totalCredits ?? null;
   const totalUsage = spend?.data?.totalUsage ?? null;
@@ -638,11 +645,6 @@ export function buildUsageData(args: {
       fetchedAt: counts?.fetchedAt ?? null,
       note: counts?.note ?? null,
       fidelityNote: REQUEST_COUNT_FIDELITY_NOTE,
-    },
-    laneMap: {
-      derivedAt: LANE_MAP_DERIVED_AT,
-      flag: LANE_MAP_FLAG,
-      lanes: LANE_MAP,
     },
     links: {
       costsUrl: NATIVE_COSTS_URL,

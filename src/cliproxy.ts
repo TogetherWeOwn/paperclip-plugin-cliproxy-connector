@@ -37,6 +37,15 @@ export const MANAGEMENT_MAX_REDIRECTS = 2;
  * `/v1/models` from a management GET is refused.
  */
 export const AUTH_FILES_PATH = "/v0/management/auth-files";
+/**
+ * Pinned stock v8 credential list (`GET /v8/management/credentials`, same
+ * `ListAuthFiles` handler with the v8-only fields `quota_plugin_id`,
+ * `access_token_expires_at`, `requires_sign_in`, `next_action`,
+ * `recovery_hint`). Exact path, no query string, no prefix match — a prefix
+ * allowance would also admit `/credentials/download` (full auth files with
+ * tokens) and `/credentials/models`.
+ */
+export const V8_CREDENTIALS_PATH = "/v8/management/credentials";
 const PLUGIN_QUOTA_SHAPE = /^\/v0\/management\/plugins\/[A-Za-z0-9][A-Za-z0-9_-]*\/quota$/;
 
 /**
@@ -597,6 +606,15 @@ function assertAllowListed(url: URL, what: string): void {
     }
     return;
   }
+  if (pathname === V8_CREDENTIALS_PATH) {
+    // Pinned v8 credential list: exact path, no query string. Any parameter —
+    // or any longer path such as `/credentials/download` or
+    // `/credentials/models` — rejects before any network happens.
+    if ([...url.searchParams.keys()].length > 0) {
+      throw new CliproxyConfigError(`v8 credentials request carries no query string (${what})`);
+    }
+    return;
+  }
   if (pathname !== AUTH_FILES_PATH) {
     throw new CliproxyConfigError(`path is outside the pinned GET allow-list: ${pathname}`);
   }
@@ -843,6 +861,30 @@ export class CliproxyManagementClient {
 
   getAuthFiles(): Promise<unknown> {
     return this.getJson(AUTH_FILES_PATH);
+  }
+
+  /**
+   * GET the stock v8 credential list (exact pinned path, no query). Callers
+   * treat 404 as "older build": fall back to the v0 `auth-files` list.
+   */
+  getCredentials(): Promise<unknown> {
+    return this.getJson(V8_CREDENTIALS_PATH);
+  }
+
+  /**
+   * Prefer the v8 credential list (v8-only renewal fields), falling back to
+   * the v0 `auth-files` list on 404 (older builds). Auth failures propagate
+   * to the strike budget like every other management GET.
+   */
+  async getAuthFilesWithV8Fallback(): Promise<{ payload: unknown; source: "v8" | "v0" }> {
+    try {
+      return { payload: await this.getCredentials(), source: "v8" };
+    } catch (err) {
+      if (err instanceof CliproxyNotFoundError) {
+        return { payload: await this.getAuthFiles(), source: "v0" };
+      }
+      throw err;
+    }
   }
 
   /**

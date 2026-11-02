@@ -45,6 +45,18 @@ function jsonResponse(status: number, body: unknown): Response {
 function mockFetch() {
   return vi.fn(async (input: string | URL | Request): Promise<Response> => {
     const url = new URL(String(input));
+    if (url.pathname === "/v8/management/credentials") {
+      return jsonResponse(200, [
+        {
+          id: "harness-claude-1",
+          provider: "claude",
+          quota: {
+            observed_at: "2026-11-01T12:00:00.000Z",
+            signals: { "anthropic-ratelimit-unified-5h-utilization": "0.2" },
+          },
+        },
+      ]);
+    }
     if (url.pathname === "/v0/management/auth-files") {
       return jsonResponse(200, [
         {
@@ -87,8 +99,9 @@ describe("sync job", () => {
     await harness.runJob(SYNC_JOB_KEY);
     // The worker reaches the loopback origin through the worker-local
     // transport (TWO-749), never through the host SSRF-guarded client.
+    // v8 credentials are preferred; v0 auth-files is the fallback.
     expect(String((fetchMock.mock.calls[0] as unknown[])[0])).toBe(
-      "http://127.0.0.1:8317/v0/management/auth-files",
+      "http://127.0.0.1:8317/v8/management/credentials",
     );
     const rows = harness.getState(stateKey(ROWS_STATE_KEY)) as Record<string, AccountUsageRow>;
     const keys = Object.keys(rows);

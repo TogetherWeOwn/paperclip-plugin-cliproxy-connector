@@ -86,6 +86,20 @@ export interface AccountUsageRow {
   provider: string;
   /** Raw provider word from the entry, for UI labels. */
   channel: string;
+  /**
+   * Operator-set display label for the account table (scrubbed `note`, else a
+   * scrubbed non-email `label`; null when neither qualifies). Display only —
+   * never a routing key, never an email unless `showAccountEmails` is on.
+   */
+  displayLabel?: string | null;
+  /**
+   * True when the account needs a fresh sign-in (stock v8 `requires_sign_in` /
+   * `next_action`, or an `invalid_grant` / `unauthorized` cooldown). Badge
+   * only — never triggers a reset or re-login.
+   */
+  needsSignIn?: boolean;
+  /** Scrubbed recovery hint behind the badge, when the entry carries one. */
+  needsSignInHint?: string | null;
   /** Lifecycle state; `disabled` rows are excluded from aggregation. */
   status: AccountStatus;
   /** CLIProxy `status_message`, when present (operational note, never a key). */
@@ -300,6 +314,12 @@ export interface SyncSummary {
    * overlap detection is off instead of showing stale lists.
    */
   providerModels?: Record<string, string[]>;
+  /**
+   * Human display names per proven model id (`auth-files/models`
+   * `display_name`, scrubbed, display only — never a routing key), keyed by
+   * provider then lowercase id. Absent when no file answered with names.
+   */
+  providerModelNames?: Record<string, Record<string, string>>;
   /** Overlapping served ids from this run (excluded from every proven list). */
   modelOverlaps?: ModelOverlap[];
 }

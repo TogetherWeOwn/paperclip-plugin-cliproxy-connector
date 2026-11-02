@@ -641,16 +641,10 @@ describe("read-model sections (spend, usage, lane map, links)", () => {
     expect(usage.usage.fidelityNote).toMatch(/No per-lane token split/);
   });
 
-  it("flags the lane map as config-derived with its derivation date", () => {
+  it("exposes no hard-coded company lane map", () => {
     const usage = buildUsageData({ now: NOW, config: testConfig(), rows: {}, lastSync: null });
-    expect(usage.laneMap.derivedAt).toBe("2026-11-01");
-    expect(usage.laneMap.flag).toMatch(/Config-derived mapping \(derived 2026-11-01\)/);
-    expect(usage.laneMap.flag).toMatch(/Not ledger data/);
-    expect(usage.laneMap.lanes).toEqual([
-      { lane: "wonder-full", agents: 7, provider: "anthropic", model: "opus" },
-      { lane: "spark", agents: 3, provider: "anthropic", model: "opus" },
-      { lane: "opus", agents: 2, provider: "anthropic", model: "opus" },
-    ]);
+    expect(usage).not.toHaveProperty("laneMap");
+    expect(JSON.stringify(usage)).not.toMatch(/wonder-full/);
   });
 
   it("links out with literal native paths only", () => {
@@ -775,5 +769,52 @@ describe("skipped sync honesty", () => {
     });
     expect(usage.quotaFetchedAt).toBe(NOW);
     expect(usage.sync.skipped).toBe(true);
+  });
+});
+
+describe("Group A: display names, labels, sign-in badge (no lane map)", () => {
+  it("passes provider display names and per-model display names through to cards", () => {
+    const page = buildPageData({
+      now: NOW,
+      config: testConfig(),
+      rows: { "acct-aaa": row() },
+      lastSync: {
+        ...LAST_SYNC,
+        providerModels: { claude: ["claude-opus-4-5"] },
+        providerModelNames: { claude: { "claude-opus-4-5": "Claude Opus 4.5" } },
+      },
+      strike: emptyStrikeBudget(),
+    });
+    const claude = page.providers[0];
+    expect(claude.displayName).toBe("Claude");
+    expect(claude.modelNames?.["claude-opus-4-5"]).toBe("Claude Opus 4.5");
+    const usage = buildUsageData({
+      now: NOW,
+      config: testConfig(),
+      rows: { "acct-aaa": row() },
+      lastSync: {
+        ...LAST_SYNC,
+        providerModels: { claude: ["claude-opus-4-5"] },
+        providerModelNames: { claude: { "claude-opus-4-5": "Claude Opus 4.5" } },
+      },
+    });
+    expect(usage.providers[0]?.displayName).toBe("Claude");
+    expect(usage.providers[0]?.modelNames?.["claude-opus-4-5"]).toBe("Claude Opus 4.5");
+  });
+
+  it("surfaces display labels and the needs-sign-in badge on account details", () => {
+    const page = buildPageData({
+      now: NOW,
+      config: testConfig(),
+      rows: {
+        "acct-aaa": row({ displayLabel: "spare key", needsSignIn: true, needsSignInHint: "reauth in console" }),
+      },
+      lastSync: LAST_SYNC,
+      strike: emptyStrikeBudget(),
+    });
+    const account = page.providers[0]?.accounts[0];
+    expect(account?.displayLabel).toBe("spare key");
+    expect(account?.needsSignIn).toBe(true);
+    expect(account?.needsSignInHint).toMatch(/reauth/);
   });
 });

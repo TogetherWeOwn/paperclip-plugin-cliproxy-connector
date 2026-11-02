@@ -2,12 +2,18 @@ import { describe, expect, it } from "vitest";
 import {
   hasAdmissionSignal,
   hashIdentity,
+  isGatingCooldown,
   isGatingWindow,
+  isModelGatingCooldown,
   normalizeProvider,
+  parseAccountLabel,
   parseAuthFiles,
+  parseCooldowns,
   parseHeaderSignals,
   parseLegacySignalList,
   parsePluginQuota,
+  parseSignInFields,
+  quotaBlindReasonWithExhaustedUntil,
   sanitizeStatusMessage,
 } from "./parsers.js";
 import { DEFAULT_PROVIDER_WINDOWS } from "./config.js";
@@ -498,9 +504,13 @@ describe("parseAuthFiles (redacted fixture)", () => {
       expect(a.key).toMatch(/^acct-[0-9a-f]{16}$/);
     }
     const blob = JSON.stringify(accounts);
-    for (const secret of ["REDACTED-EMAIL", "REDACTED-TOKEN", "REDACTED-LABEL", "REDACTED-PROJECT", "/REDACTED/PATH"]) {
+    // Emails, tokens, project ids and paths never persist. The operator-set
+    // label is intentionally surfaced (scrubbed) as displayLabel — it is
+    // display-only and never a routing key.
+    for (const secret of ["REDACTED-EMAIL", "REDACTED-TOKEN", "REDACTED-PROJECT", "/REDACTED/PATH"]) {
       expect(blob).not.toContain(secret);
     }
+    expect(accounts[0]?.displayLabel).toBe("REDACTED-LABEL");
     expect(warnings).toEqual([]);
   });
 
@@ -1989,5 +1999,89 @@ describe("parseMetaQuota (panel parseMetaQuotaPayload shape)", () => {
     const blob = JSON.stringify(parsed);
     expect(blob).not.toContain("sk-planted-secret-key");
     expect(blob).not.toContain("someone@example.com");
+  });
+});
+
+describe("Group A: cooldowns[], sign-in badge, account labels", () => {
+  const FUTURE = iso(NOW_MS + 3_600_000);
+  const PAST = iso(NOW_MS - 3_600_000);
+
+  it("quota cooldowns gate until retry_at; unknown and payment_required are display-only", () => {
+    const entry = {
+      cooldowns: [
+        { reason: "quota", retry_at: FUTURE },
+        { reason: "payment_required", retry_at: FUTURE },
+        { reason: "mystery_reason", retry_at: FUTURE },
+        { reason: "quota", retry_at: PAST },
+      ],
+    };
+    const cooldowns = parseCooldowns(entry as never);
+    expect(cooldowns).toHaveLength(4);
+    const [quota, pay, mystery, expired] = cooldowns;
+    expect(isGatingCooldown(quota, NOW_MS)).toBe(true);
+    expect(isGatingCooldown(pay, NOW_MS)).toBe(false);
+    expect(isGatingCooldown(mystery, NOW_MS)).toBe(false);
+    expect(isGatingCooldown(expired, NOW_MS)).toBe(false);
+  });
+
+  it("model-scoped quota cooldowns gate per model via models: [model_key]", () => {
+    const cooldowns = parseCooldowns({
+      cooldowns: [{ scope: "model", model_key: "claude-opus-4-5", reason: "quota", retry_at: FUTURE }],
+    } as never);
+    expect(cooldowns).toHaveLength(1);
+    expect(isModelGatingCooldown(cooldowns[0], NOW_MS)).toBe(true);
+    expect(isGatingCooldown(cooldowns[0], NOW_MS)).toBe(false);
+  });
+
+  it("sign-in fields raise a read-only badge, never a reset", () => {
+    const badge = parseSignInFields({ requires_sign_in: true, recovery_hint: "reauth in console" } as never);
+    expect(badge.needsSignIn).toBe(true);
+    expect(badge.hint).toMatch(/reauth/);
+    const viaAction = parseSignInFields({ next_action: "reauth in console" } as never);
+    expect(viaAction.needsSignIn).toBe(true);
+    const clear = parseSignInFields({ requires_sign_in: false } as never);
+    expect(clear.needsSignIn).toBe(false);
+  });
+
+  it("prefers the operator note, hides emails by default, shows them only on opt-in", () => {
+    expect(parseAccountLabel({ note: "spare key", label: "other", email: "a@x.test" } as never, "claude")).toBe(
+      "spare key",
+    );
+    expect(parseAccountLabel({ email: "a@x.test" } as never, "claude")).toBeNull();
+    expect(
+      parseAccountLabel({ email: "a@x.test" } as never, "claude", { showEmails: true }),
+    ).toBe("a@x.test");
+    // A label that merely repeats the provider word carries no signal.
+    expect(parseAccountLabel({ label: "claude" } as never, "claude")).toBeNull();
+  });
+
+  it("Meta blind reason names the exhausted-until time when a quota cooldown fired", () => {
+    expect(quotaBlindReasonWithExhaustedUntil("meta", FUTURE)).toMatch(/exhausted until/);
+    expect(quotaBlindReasonWithExhaustedUntil("meta", null)).toBeNull();
+  });
+
+  it("a quota cooldown synthesizes a gating window; sign-in reasons do not", () => {
+    function parse(payload: unknown = [], extra: Record<string, unknown> = {}) {
+      return parseAuthFiles(payload, {
+        now: NOW,
+        allowLists: { claude: ["5h"] },
+        ...extra,
+      });
+    }
+    const { accounts } = parse([
+      {
+        id: "cool-1",
+        provider: "claude",
+        cooldowns: [
+          { reason: "quota", retry_at: FUTURE },
+          { reason: "invalid_grant", retry_at: FUTURE },
+        ],
+      },
+    ]);
+    expect(accounts).toHaveLength(1);
+    const gating = (accounts[0]?.limits ?? []).filter((l) => l.gating);
+    expect(gating.map((l) => l.id)).toContain("claude:quota-cooldown");
+    expect(accounts[0]?.needsSignIn).toBe(true);
+    expect(accounts[0]?.cooldownExhaustedUntil).toBe(FUTURE);
   });
 });

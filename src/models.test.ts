@@ -13,20 +13,32 @@ function keysFor(provider: string, models: string[]) {
 describe("parseModelsPayload", () => {
   it("accepts the OpenAI list shape and plain arrays of ids", () => {
     const a = parseModelsPayload({ data: [{ id: "claude-opus-4-5", owned_by: "anthropic" }] });
-    expect(a.models).toEqual([{ id: "claude-opus-4-5", ownedBy: "anthropic" }]);
+    expect(a.models).toEqual([{ id: "claude-opus-4-5", ownedBy: "anthropic", displayName: null }]);
     expect(a.warnings).toEqual([]);
     const b = parseModelsPayload(["devin/claude-opus-4-5"]);
-    expect(b.models).toEqual([{ id: "devin/claude-opus-4-5", ownedBy: null }]);
+    expect(b.models).toEqual([{ id: "devin/claude-opus-4-5", ownedBy: null, displayName: null }]);
     const c = parseModelsPayload({ models: [{ id: "x", owner: "meta" }] });
-    expect(c.models).toEqual([{ id: "x", ownedBy: "meta" }]);
+    expect(c.models).toEqual([{ id: "x", ownedBy: "meta", displayName: null }]);
   });
 
   it("lowercases ids, dedupes repeats, and warns on unusable entries", () => {
     const { models, warnings } = parseModelsPayload({
       data: [{ id: "Claude-Opus-4-5" }, { id: "claude-opus-4-5" }, { nope: 1 }],
     });
-    expect(models).toEqual([{ id: "claude-opus-4-5", ownedBy: null }]);
+    expect(models).toEqual([{ id: "claude-opus-4-5", ownedBy: null, displayName: null }]);
     expect(warnings.length).toBeGreaterThan(0);
+  });
+
+  it("keeps a scrubbed display_name for display only, never as a routing key", () => {
+    const { models, warnings } = parseModelsPayload({
+      data: [{ id: "claude-opus-4-5", owned_by: "anthropic", display_name: "Claude Opus 4.5" }],
+    });
+    expect(models).toEqual([
+      { id: "claude-opus-4-5", ownedBy: "anthropic", displayName: "Claude Opus 4.5" },
+    ]);
+    expect(warnings).toEqual([]);
+    // Routing still keys on the id: displayName never appears in the id set.
+    expect(models.map((m) => m.id)).toEqual(["claude-opus-4-5"]);
   });
 
   it("warns on an empty payload instead of claiming models", () => {

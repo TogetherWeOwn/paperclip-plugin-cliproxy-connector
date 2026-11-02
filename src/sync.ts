@@ -390,7 +390,10 @@ export async function runSync(deps: SyncDeps, inFlight: { running: boolean }): P
     // (`key = ""` in the finally below only clears this local binding; the
     // client's copy is an immutable string left for GC — no copies are made.)
     try {
-      const authFiles = await client.getAuthFiles().catch((err) => {
+      // Prefer the v8 credential list (v8-only renewal fields feed the
+      // read-only "needs sign-in" badge); older builds 404 and fall back to
+      // the v0 `auth-files` list. The parse is shape-tolerant to both.
+      const { payload: authFiles } = await client.getAuthFilesWithV8Fallback().catch((err) => {
         throw err;
       });
 
@@ -414,6 +417,7 @@ export async function runSync(deps: SyncDeps, inFlight: { running: boolean }): P
       const discovered = parseAuthFiles(authFiles, {
         now: deps.now,
         allowLists: deps.config.providerWindows,
+        showAccountEmails: deps.config.showAccountEmails === true,
       });
       const enabledIndexesByProvider = new Map<string, Set<string>>();
       // Same-provider accounts may advertise different quota plugins: keep
@@ -709,6 +713,17 @@ export async function runSync(deps: SyncDeps, inFlight: { running: boolean }): P
           liveQuotaDisabled += 1;
           continue;
         }
+        // Expired access tokens skip the call for families stock api-call
+        // does NOT refresh (devin, codex, claude) — a 401 inside a 200
+        // envelope is certain, so do not spend it. Antigravity/meta/xai
+        // resolve or refresh tokens server-side, so they are never skipped.
+        if (
+          (a.provider === "devin" || a.provider === "codex" || a.provider === "claude") &&
+          a.tokenExpiresAt
+        ) {
+          const expiryMs = Date.parse(a.tokenExpiresAt);
+          if (!Number.isNaN(expiryMs) && expiryMs <= nowMs) continue;
+        }
         if (fetchedApiCallIndexes.has(a.authIndex)) continue;
         fetchedApiCallIndexes.add(a.authIndex);
         const authIndex: string = a.authIndex;
@@ -899,6 +914,7 @@ export async function runSync(deps: SyncDeps, inFlight: { running: boolean }): P
         apiCallPayloadByAuthIndex,
         apiCallQuotaPayloadByAuthIndex,
         apiCallObservedAt: deps.now,
+        showAccountEmails: deps.config.showAccountEmails === true,
       });
 
       // Group by stable row key: duplicates defeat keying (spike G-K1) and
@@ -1026,6 +1042,24 @@ export async function runSync(deps: SyncDeps, inFlight: { running: boolean }): P
         catalog.available ? derivation.providerModels : undefined;
       const modelOverlaps: ModelOverlap[] | undefined =
         catalog.available ? derivation.overlaps : undefined;
+      // Human display names for proven ids only (per-file served-set names,
+      // scrubbed at parse time; never a routing key). Absent when no file
+      // answered with names.
+      let providerModelNames: Record<string, Record<string, string>> | undefined;
+      if (catalog.available) {
+        const names: Record<string, Record<string, string>> = {};
+        for (const [provider, ids] of Object.entries(derivation.providerModels)) {
+          const perFile = servedSets.displayNames.get(provider);
+          if (!perFile) continue;
+          const picked: Record<string, string> = {};
+          for (const id of ids) {
+            const displayName = perFile.get(id);
+            if (displayName) picked[id] = displayName;
+          }
+          if (Object.keys(picked).length > 0) names[provider] = picked;
+        }
+        if (Object.keys(names).length > 0) providerModelNames = names;
+      }
       // State-change logging only: new findings log once, cleared findings log
       // once, and persistent findings remind at most daily. Accepted findings
       // never reach the ledger or the feed.
@@ -1040,6 +1074,7 @@ export async function runSync(deps: SyncDeps, inFlight: { running: boolean }): P
         acceptedDrift,
         errors,
         providerModels,
+        providerModelNames,
         modelOverlaps,
       });
       await deps.saveSync(rows, result);
@@ -1108,12 +1143,19 @@ async function fetchServedSets(
    * function; only hashed file references.
    */
   refused: Array<{ fileRef: string; providers: string[] }>;
+  /**
+   * Scrubbed human display names per served id (`auth-files/models`
+   * `display_name`), grouped by auth-file provider. Display only — never a
+   * routing or matching key.
+   */
+  displayNames: Map<string, Map<string, string>>;
 }> {
   const warnings: string[] = [];
   const byProvider = new Map<string, Set<string>>();
   const okFiles = new Set<string>();
   const okProviders = new Set<string>();
   const refused: Array<{ fileRef: string; providers: string[] }> = [];
+  const displayNames = new Map<string, Map<string, string>>();
   // Enabled files only; group names so one GET serves every entry sharing it.
   const providersByName = new Map<string, Set<string>>();
   for (const a of accounts) {
@@ -1135,7 +1177,7 @@ async function fetchServedSets(
     warnings.push(
       "no enabled auth file exposes a name; skipping the served-set fetch this run (model_quotas heuristic still applies).",
     );
-    return { byProvider, okFiles, okProviders, warnings, refused };
+    return { byProvider, okFiles, okProviders, warnings, refused, displayNames };
   }
   let ok = 0;
   let notFound = 0;
@@ -1196,6 +1238,16 @@ async function fetchServedSets(
           byProvider.set(provider, set);
         }
         set.add(m.id);
+        // Per-file display names win over the id: the sync already fetched
+        // this file, so its names are authoritative for its provider.
+        if (m.displayName && m.displayName.toLowerCase() !== m.id) {
+          let names = displayNames.get(provider);
+          if (!names) {
+            names = new Map<string, string>();
+            displayNames.set(provider, names);
+          }
+          if (!names.has(m.id)) names.set(m.id, m.displayName);
+        }
       }
     }
   }
@@ -1204,7 +1256,7 @@ async function fetchServedSets(
       "the served-set endpoint returned 404 for every enabled auth file (older CLIProxy builds lack it); overlap detection falls back to the model_quotas + owned_by heuristic this run.",
     );
   }
-  return { byProvider, okFiles, okProviders, warnings, refused };
+  return { byProvider, okFiles, okProviders, warnings, refused, displayNames };
 }
 
 /**
@@ -1441,6 +1493,9 @@ export function accountsToRows(
       key: rowKey,
       provider: a.provider,
       channel: a.channel,
+      displayLabel: a.displayLabel,
+      needsSignIn: a.needsSignIn,
+      needsSignInHint: a.needsSignInHint,
       status: a.status,
       statusMessage: a.statusMessage,
       priority: a.priority,

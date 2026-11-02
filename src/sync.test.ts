@@ -2872,3 +2872,92 @@ describe("scrubWarnings (stored-note contract)", () => {
     );
   });
 });
+
+describe("Group A: token-expiry skip and provider model display names", () => {
+  const PAST = new Date(Date.parse(NOW) - 3_600_000).toISOString();
+  const FUTURE = new Date(Date.parse(NOW) + 3_600_000).toISOString();
+
+  function tokenSkipFetch(calls: string[], files: unknown[]) {
+    return vi.fn(async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+      const url = new URL(String(input));
+      if (url.pathname === "/v8/management/credentials" || url.pathname === "/v0/management/auth-files") {
+        return jsonResponse(200, files);
+      }
+      if (url.pathname === "/v1/models") return jsonResponse(200, { data: [] });
+      if (url.pathname.includes("/plugins/")) return jsonResponse(200, { groups: [] });
+      if (url.pathname === "/v0/management/api-call") {
+        const sent = JSON.parse(String(init?.body)) as { url: string; auth_index: string };
+        calls.push(sent.auth_index);
+        return jsonResponse(200, { status_code: 200, header: {}, body: JSON.stringify({ ok: true }) });
+      }
+      return new Response("not found", { status: 404 });
+    });
+  }
+
+  function configFor(...providers: string[]) {
+    const raw = baseConfigRaw();
+    raw.providers = providers.map((p) => ({ provider: p, connectionId: `conn-${p}`, completeInventory: false }));
+    return parseConfig(raw).config;
+  }
+
+  it("skips expired tokens for devin/codex/claude only; antigravity/meta are never skipped", async () => {
+    const s = store();
+    const calls: string[] = [];
+    const files = [
+      { id: "devin-old", provider: "devin", auth_index: "d-old", access_token_expires_at: PAST },
+      { id: "devin-fresh", provider: "devin", auth_index: "d-fresh", access_token_expires_at: FUTURE },
+      { id: "claude-old", provider: "claude", auth_index: "c-old", access_token_expires_at: PAST },
+      { id: "ag-old", provider: "antigravity", auth_index: "a-old", project_id: "p", access_token_expires_at: PAST },
+    ];
+    const summary = await runSync(
+      { ...deps(s, tokenSkipFetch(calls, files) as unknown as typeof fetch), config: configFor("devin", "claude", "antigravity") },
+      { running: false },
+    );
+    expect(summary.skipped).toBe(false);
+    // Expired devin/claude credentials make no api-call; the fresh devin
+    // credential and the expired antigravity credential (server-side refresh)
+    // still do.
+    expect(calls).toContain("d-fresh");
+    expect(calls).toContain("a-old");
+    expect(calls).not.toContain("d-old");
+    expect(calls).not.toContain("c-old");
+    assertNoKeyLeak(s);
+  });
+
+  it("carries provider model display names onto the summary for proven ids only", async () => {
+    const s = store();
+    const fetch = vi.fn(async (input: string | URL | Request): Promise<Response> => {
+      const url = new URL(String(input));
+      if (url.pathname === "/v8/management/credentials" || url.pathname === "/v0/management/auth-files") {
+        return jsonResponse(200, [
+          { id: "claude-1", provider: "claude", name: "claude-file", quota: { observed_at: NOW, signals: {} } },
+        ]);
+      }
+      if (url.pathname === "/v0/management/auth-files/models") {
+        return jsonResponse(200, [
+          { id: "claude-opus-4-5", display_name: "Claude Opus 4.5" },
+          // Served-set-only id: absent from the /v1 catalog, so never proven
+          // — its name must not leak onto the summary.
+          { id: "ghost-model", display_name: "Ghost" },
+        ]);
+      }
+      if (url.pathname === "/v1/models") {
+        return jsonResponse(200, { data: [{ id: "claude-opus-4-5" }] });
+      }
+      if (url.pathname.includes("/plugins/")) return jsonResponse(200, { groups: [] });
+      return new Response("not found", { status: 404 });
+    });
+    const raw = baseConfigRaw();
+    raw.providers = [{ provider: "claude", connectionId: "conn-claude", completeInventory: true }];
+    const summary = await runSync(
+      { ...deps(s, fetch as unknown as typeof fetch), config: parseConfig(raw).config },
+      { running: false },
+    );
+    expect(summary.skipped).toBe(false);
+    expect(summary.providerModels?.claude).toContain("claude-opus-4-5");
+    // Display names ride along for proven ids; unproven ids never gain one.
+    expect(summary.providerModelNames?.claude?.["claude-opus-4-5"]).toBe("Claude Opus 4.5");
+    expect(summary.providerModelNames?.claude?.["ghost-model"]).toBeUndefined();
+    assertNoKeyLeak(s);
+  });
+});

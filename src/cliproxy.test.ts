@@ -990,3 +990,51 @@ describe("Meta live quota (download + literal-header key call)", () => {
     expect(err.message).not.toContain(DCA_FIXTURE);
   });
 });
+
+describe("v8 credentials allow-list (exact path, no wildcard)", () => {
+  it("admits the exact /v8/management/credentials path with no query", async () => {
+    const seen: string[] = [];
+    const fetch = vi.fn(async (url: string) => {
+      seen.push(url);
+      return json(200, []);
+    });
+    await client(fetch).getCredentials();
+    expect(seen).toEqual(["http://127.0.0.1:8317/v8/management/credentials"]);
+  });
+
+  it("refuses credentials sub-paths and any query string", async () => {
+    const fetch = vi.fn(async () => json(200, {}));
+    for (const path of [
+      "/v8/management/credentials?limit=10",
+      "/v8/management/credentials/download",
+      "/v8/management/credentials/models",
+      "/v8/management/credentials/",
+    ]) {
+      await expect(client(fetch).getJson(path)).rejects.toThrow(CliproxyConfigError);
+    }
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it("prefers v8 credentials and falls back to v0 auth-files on 404", async () => {
+    const seen: string[] = [];
+    const fetch = vi.fn(async (url: string) => {
+      seen.push(url);
+      if (url.endsWith("/v8/management/credentials")) return json(200, [{ id: "a" }]);
+      return json(200, [{ id: "b" }]);
+    });
+    const hit = await client(fetch).getAuthFilesWithV8Fallback();
+    expect(hit.source).toBe("v8");
+    expect(hit.payload).toEqual([{ id: "a" }]);
+
+    const seen2: string[] = [];
+    const fallback = vi.fn(async (url: string) => {
+      seen2.push(url);
+      if (url.endsWith("/v8/management/credentials")) return json(404, {});
+      return json(200, [{ id: "b" }]);
+    });
+    const miss = await client(fallback).getAuthFilesWithV8Fallback();
+    expect(miss.source).toBe("v0");
+    expect(miss.payload).toEqual([{ id: "b" }]);
+    expect(seen2[0]).toContain("/v8/management/credentials");
+  });
+});

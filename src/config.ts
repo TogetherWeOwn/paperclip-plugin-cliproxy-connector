@@ -114,6 +114,11 @@ export interface ConnectorConfig {
   metaQuota: { enabled: boolean };
   /** Operator confirms the page audience exposure is intended (proposal §4.4). */
   audienceConfirmed: boolean;
+  /**
+   * Opt-in to show account emails in labels. Default false: email patterns
+   * never become account labels, and raw emails never render either way.
+   */
+  showAccountEmails?: boolean;
 }
 
 export const DEFAULTS = {
@@ -414,6 +419,14 @@ export function parseConfig(raw: unknown): { config: ConnectorConfig; validation
   // fetch either way (refused names are never fetched).
   const ignoredProviders = parseIgnoredProviderList(r.ignoredProviders, errors, warnings);
   const ignoredAuthFileRefs = parseIgnoredAuthFileRefs(r.ignoredAuthFileRefs, errors, warnings);
+  let showAccountEmails = false;
+  if (r.showAccountEmails !== undefined && r.showAccountEmails !== null) {
+    if (typeof r.showAccountEmails !== "boolean") {
+      errors.push("showAccountEmails must be a boolean; it defaults to false (emails stay hidden).");
+    } else {
+      showAccountEmails = r.showAccountEmails;
+    }
+  }
 
   // The management client uses pinned paths (see cliproxy.ts
   // AUTH_FILES_PATH / pluginQuotaPath) — there are deliberately no config
@@ -448,6 +461,7 @@ export function parseConfig(raw: unknown): { config: ConnectorConfig; validation
     audienceConfirmed: r.audienceConfirmed === true,
     ignoredProviders,
     ignoredAuthFileRefs,
+    showAccountEmails,
   };
   return { config, validation: { ok: errors.length === 0, warnings, errors } };
 }
