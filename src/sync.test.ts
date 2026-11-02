@@ -1680,6 +1680,41 @@ describe("live provider-API quota (pinned api-call templates)", () => {
     assertNoApiKeyLeak(s);
   });
 
+  it("calls the provider once on forced refresh when two rows share one auth index", async () => {
+    const s = store();
+    const calls: string[] = [];
+    const downloads: string[] = [];
+    // Distinct auth-files rows can share one credential index; a forced
+    // refresh bypasses the throttle, so without per-run dedup one resync
+    // would download twice and hit the provider twice for `m1`.
+    const files = [
+      { id: "meta-a", provider: "meta", name: "meta-a.json", auth_index: "m1" },
+      { id: "meta-b", provider: "meta", name: "meta-b.json", auth_index: "m1" },
+    ];
+    const config = configWith({ provider: "meta", connectionId: "conn-meta" });
+    const summary = await runSync(
+      {
+        ...depsWith(s, config, metaFetch(calls, downloads, files) as never),
+        forceMetaRefresh: true,
+      },
+      { running: false },
+    );
+    expect(summary.skipped).toBe(false);
+    expect(downloads).toEqual(["meta-a.json"]);
+    expect(calls).toEqual(["m1 https://api.meta.ai/muse-code/key"]);
+    // The single envelope attaches to every row by auth_index: no row loses
+    // its windows to the dedup.
+    const rows = Object.values(s.savedRows ?? {});
+    expect(rows).toHaveLength(2);
+    for (const row of rows) {
+      expect(row.quotaBlind).toBe(false);
+      expect(row.limits.map((l) => l.id)).toEqual(["meta:window", "meta:weekly"]);
+    }
+    assertNoKeyLeak(s);
+    assertNoDcaLeak(s);
+    assertNoApiKeyLeak(s);
+  });
+
   it("makes no download or key call when metaQuota is disabled and says so once", async () => {
     const s = store();
     const calls: string[] = [];

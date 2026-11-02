@@ -233,10 +233,16 @@ is ever logged, persisted, attached to activity/metrics/errors/plugin state, or
 shown in UI payloads. The key answer's `subs_usage.window` / `subs_usage.weekly`
 (`used_percent`, `resets_at`) become the `meta:window` / `meta:weekly` rows with
 the plan name from `subs_tier_name` (falling back to `subs_usage.tier`); a 2xx
-without `subs_usage` is unknown, never zero. Meta polls at most every 45 minutes
+without `subs_usage` is unknown, never zero. The key answer's `api_key` is
+dropped by the client before caching or parsing: it is never stored, logged, or
+displayed. Meta polls at most every 45 minutes
 per account (the panel only reads this endpoint on user refresh) with the last 2xx
 answer cached between polls; the Usage & quota page's resync action forces a
-manual refresh (bypasses the throttle, never the auth backoff). An upstream
+manual refresh (bypasses the throttle, never the auth backoff). Between polls the
+page keeps showing the last-known values with their observation time, but the
+router only treats a window as headroom while its observation is fresh (inside
+`maxAgeMs`): older cached windows route as unknown, never as headroom or
+exhaustion. An upstream
 401/403 parks the account for an hour like every other family. Antigravity
 reads two calls: the `loadCodeAssist` subscription (plan evidence) plus the winning
 `retrieveUserQuotaSummary` quota URL (panel try order, remembered per account) with

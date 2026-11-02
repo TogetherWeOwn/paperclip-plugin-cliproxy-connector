@@ -515,6 +515,7 @@ export async function runSync(deps: SyncDeps, inFlight: { running: boolean }): P
       const apiCallPayloadByAuthIndex = new Map<string, { statusCode: number; body: unknown; observedAt: string }>();
       const apiCallQuotaPayloadByAuthIndex = new Map<string, { statusCode: number; body: unknown; observedAt: string }>();
       const fetchedApiCallIndexes = new Set<string>();
+      const fetchedMetaIndexes = new Set<string>();
       const apiOrigin = apiCallOriginKey(deps.config.cliproxyBaseUrl);
       const configuredProviders = new Set(deps.config.providers.map((p) => p.provider));
       // Auth indexes are opaque tokens, but never persist one raw in a
@@ -575,6 +576,15 @@ export async function runSync(deps: SyncDeps, inFlight: { running: boolean }): P
             if (backoffUntil > nowMs) continue;
             deps.apiCallAuthBackoffUntil?.delete(metaAccountKey);
           }
+          // One download + key call per credential per run: distinct
+          // auth-files rows can share an `auth_index`, and a forced refresh
+          // bypasses the throttle below — without this set one resync would
+          // hit the provider twice for the same credential. The single
+          // envelope attaches to every row by `auth_index` at parse time, so
+          // skipping here loses no row (mirrors fetchedApiCallIndexes in the
+          // template branch).
+          if (fetchedMetaIndexes.has(authIndex)) continue;
+          fetchedMetaIndexes.add(authIndex);
           const lastCall = deps.apiCallLastCall?.get(metaAccountKey);
           if (
             deps.forceMetaRefresh !== true &&
