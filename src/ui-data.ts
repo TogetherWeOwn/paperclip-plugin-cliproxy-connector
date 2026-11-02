@@ -524,6 +524,26 @@ function earliestKnownReset(providers: ProviderCard[]): string | null {
   return earliestTime(providers.flatMap((p) => [p.retryAt, p.nextReset]));
 }
 
+/**
+ * Latest valid `checkedAt` across cached rows that carry quota windows. Rows
+ * without limits (quota-blind providers, best-effort quota failures) never
+ * contribute: the section timestamp must reflect an actual quota fetch.
+ */
+function latestQuotaCheckedAt(rows: Record<string, AccountUsageRow>): string | null {
+  let latest: string | null = null;
+  let latestMs = NaN;
+  for (const row of Object.values(rows)) {
+    if (row.limits.length === 0) continue;
+    const ms = Date.parse(row.checkedAt);
+    if (Number.isNaN(ms)) continue;
+    if (latest === null || ms > latestMs) {
+      latest = row.checkedAt;
+      latestMs = ms;
+    }
+  }
+  return latest;
+}
+
 function isFailureNewer(lastSync: SyncSummary | null, lastFailure?: SyncFailure | null): boolean {
   return Boolean(
     lastFailure &&
@@ -575,9 +595,12 @@ export function buildUsageData(args: {
     providers,
     earliestReset,
     earliestResetIn: resetIn(earliestReset, nowMs),
-    // A skipped run (invalid config, min-interval) writes no rows: its finish
-    // time must not masquerade as a fresh quota fetch.
-    quotaFetchedAt: lastSync && !lastSync.skipped ? lastSync.finishedAt : null,
+    // The quota timestamp comes from the cached rows, not the sync summary:
+    // `finishedAt` is sync completion time (later than the quota reads), and a
+    // best-effort quota failure can still save a successful summary. Only rows
+    // that actually carry quota windows qualify; null when none do. Skipped
+    // runs write no rows, so they can never masquerade as a fresh fetch.
+    quotaFetchedAt: latestQuotaCheckedAt(rows),
     spend: {
       configured: config.openRouterSecretRef !== undefined && config.openRouterSecretRef !== null,
       totalCredits,

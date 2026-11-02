@@ -2353,7 +2353,7 @@ describe("read-model extras (OpenRouter spend + request counts)", () => {
     assertNoReadModelLeak(s);
   });
 
-  it("a 401 on api-key-usage fails closed: no rethrow, no strike, one warning, no further probe (T3)", async () => {
+  it("a 401 on api-key-usage fails closed: no rethrow, no strike, one warning, 30-min probe pause (T3)", async () => {
     const s = store();
     const { fetch, seen } = readModelFetch({ countsStatus: 401 });
     const d = deps(s, fetch as unknown as typeof fetch);
@@ -2366,11 +2366,53 @@ describe("read-model extras (OpenRouter spend + request counts)", () => {
     expect(s.savedCounts).toEqual({
       lanes: [],
       fetchedAt: null,
-      note: expect.stringMatching(/skipped this run and retried next sync/),
+      note: expect.stringMatching(/probes paused for 30 minutes/),
+      authRejectedAt: NOW,
     });
-    expect(summary.errors.join(" ")).toMatch(/skipped this run and retried next sync/);
+    expect(summary.errors.join(" ")).toMatch(/probes paused for 30 minutes/);
     // Exactly one request-count probe this run.
     expect(seen.filter((u) => u.includes("api-key-usage"))).toHaveLength(1);
+    assertNoKeyLeak(s);
+  });
+
+  it("a rejected api-key-usage endpoint is not re-probed until the pause expires", async () => {
+    const paused = {
+      lanes: [],
+      fetchedAt: null,
+      note: "request counts: CLIProxy rejected the key on api-key-usage (HTTP 401); request-count probes paused for 30 minutes. No strike spent and no probe beyond this run.",
+      authRejectedAt: NOW,
+    };
+    const s = store({ counts: paused });
+    const { fetch, seen } = readModelFetch();
+    const d = deps(s, fetch as unknown as typeof fetch);
+    d.config = configWithExtras({ apiKeyUsageEnabled: true });
+    const summary = await runSync(d, { running: false });
+    expect(summary.skipped).toBe(false);
+    // No probe, no state rewrite, no new warning: the stored pause note stands.
+    expect(seen.some((u) => u.includes("api-key-usage"))).toBe(false);
+    expect(s.savedCounts).toBeNull();
+    expect(summary.errors.join(" ")).not.toMatch(/request counts/);
+    assertNoKeyLeak(s);
+  });
+
+  it("request-count probes resume once the 30-minute rejection window expires", async () => {
+    const paused = {
+      lanes: [],
+      fetchedAt: null,
+      note: "request counts: CLIProxy rejected the key on api-key-usage (HTTP 401); request-count probes paused for 30 minutes. No strike spent and no probe beyond this run.",
+      authRejectedAt: NOW,
+    };
+    const s = store({ counts: paused });
+    const { fetch, seen } = readModelFetch();
+    const d = deps(s, fetch as unknown as typeof fetch);
+    d.config = configWithExtras({ apiKeyUsageEnabled: true });
+    d.now = "2026-11-01T12:31:00.000Z";
+    const summary = await runSync(d, { running: false });
+    expect(summary.skipped).toBe(false);
+    expect(seen.filter((u) => u.includes("api-key-usage"))).toHaveLength(1);
+    expect(s.savedCounts?.lanes).toMatchObject([{ provider: "anthropic", success: 15, failed: 3, total: 18 }]);
+    expect(s.savedCounts?.fetchedAt).toBe("2026-11-01T12:31:00.000Z");
+    expect(s.savedCounts?.authRejectedAt).toBeNull();
     assertNoKeyLeak(s);
   });
 

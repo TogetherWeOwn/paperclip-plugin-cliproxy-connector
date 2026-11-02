@@ -569,7 +569,7 @@ describe("read-model sections (spend, usage, lane map, links)", () => {
     const usage = buildUsageData({
       now: NOW,
       config: spendConfig(),
-      rows: {},
+      rows: { "acct-aaa": row() },
       lastSync: LAST_SYNC,
       spend: {
         data: { provider: "openrouter", totalCredits: 100, totalUsage: 37.5, fetchedAt: NOW },
@@ -682,6 +682,44 @@ describe("skipped sync honesty", () => {
       lastSync: { ...LAST_SYNC, skipped: true, skipReason: "minimum sync interval has not elapsed." },
     });
     expect(usage.quotaFetchedAt).toBeNull();
+    expect(usage.sync.skipped).toBe(true);
+  });
+
+  it("derives quotaFetchedAt from cached rows with limits, not the summary finish time", () => {
+    const usage = buildUsageData({
+      now: NOW,
+      config: testConfig(),
+      rows: { "acct-aaa": row({ checkedAt: "2026-11-01T11:00:00.000Z" }) },
+      lastSync: { ...LAST_SYNC, finishedAt: NOW },
+    });
+    // The summary finished later than the quota read; the page shows the read.
+    expect(usage.quotaFetchedAt).toBe("2026-11-01T11:00:00.000Z");
+  });
+
+  it("ignores quota-blind rows and unparseable row timestamps", () => {
+    const usage = buildUsageData({
+      now: NOW,
+      config: testConfig(),
+      rows: {
+        blind: row({ key: "acct-blind", limits: [], checkedAt: "2026-11-01T13:00:00.000Z" }),
+        broken: row({ key: "acct-broken", checkedAt: "not-a-time" }),
+        fresh: row({ key: "acct-fresh", checkedAt: "2026-11-01T11:30:00.000Z" }),
+        older: row({ key: "acct-older", checkedAt: "2026-11-01T10:00:00.000Z" }),
+      },
+      lastSync: LAST_SYNC,
+    });
+    // Latest valid checkedAt among rows that actually carry quota windows.
+    expect(usage.quotaFetchedAt).toBe("2026-11-01T11:30:00.000Z");
+  });
+
+  it("a skipped run keeps the cached quota-row timestamp (skips write no rows)", () => {
+    const usage = buildUsageData({
+      now: NOW,
+      config: testConfig(),
+      rows: { "acct-aaa": row() },
+      lastSync: { ...LAST_SYNC, skipped: true, skipReason: "minimum sync interval has not elapsed." },
+    });
+    expect(usage.quotaFetchedAt).toBe(NOW);
     expect(usage.sync.skipped).toBe(true);
   });
 });

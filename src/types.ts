@@ -266,6 +266,13 @@ export interface StoredRequestCounts {
   lanes: ProviderRequestCounts[];
   fetchedAt: string | null;
   note: string | null;
+  /**
+   * ISO time of the last 401/403 on `api-key-usage`. Probes stay off while
+   * this is within the strike window (30 min): a rejected endpoint must not
+   * be re-probed every sync run. Absent on snapshots written before the
+   * backoff existed (treated as no pause).
+   */
+  authRejectedAt?: string | null;
 }
 
 /** Result of one sync run (persisted summary + returned to the on-demand route). */

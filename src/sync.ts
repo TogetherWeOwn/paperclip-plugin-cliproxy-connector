@@ -1160,9 +1160,12 @@ async function syncSpend(deps: SyncDeps): Promise<string | null> {
  * and discarded before any state write — stored lanes carry provider words
  * and counts only (T1). Auth rejections fail closed WITHOUT spending strikes
  * or stopping the run (the management key already proved good against
- * `auth-files` this run): one warning, no further request-count probes until
- * the next successful sync (T3). Anything else warns per run and keeps the
- * last-known aggregates.
+ * `auth-files` this run): one warning, then no further probes until the
+ * rejection is older than the strike window (30 min, T3) — a rejected
+ * endpoint re-probed every sync run risks the host-wide CLIProxy ban that
+ * would also take down `auth-files` and the router. The page keeps showing
+ * the stored pause note while probes are off. Anything else warns per run
+ * and keeps the last-known aggregates.
  */
 async function syncRequestCounts(
   deps: SyncDeps,
@@ -1170,11 +1173,17 @@ async function syncRequestCounts(
 ): Promise<string | null> {
   if (!deps.config.apiKeyUsageEnabled) return null;
   const prev = await deps.loadRequestCounts().catch(() => null);
-  const keep = async (note: string | null) => {
+  const rejectedMs = prev?.authRejectedAt ? Date.parse(prev.authRejectedAt) : NaN;
+  if (!Number.isNaN(rejectedMs) && Date.parse(deps.now) - rejectedMs < STRIKE_WINDOW_MS) {
+    // Backing off: no probe, keep the stored note and lanes untouched.
+    return null;
+  }
+  const keep = async (note: string | null, rejectedAt?: string | null) => {
     await deps.saveRequestCounts({
       lanes: prev?.lanes ?? [],
       fetchedAt: prev?.fetchedAt ?? null,
       note,
+      authRejectedAt: rejectedAt ?? null,
     });
   };
   let payload: unknown;
@@ -1182,13 +1191,12 @@ async function syncRequestCounts(
     payload = await client.getApiKeyUsage();
   } catch (err) {
     if (err instanceof CliproxyAuthError) {
-      // Per-run skip-and-retry (no cross-run pause state, no strike): a key the
-      // management path just accepted rarely fails here twice in a row, and a
-      // persistent rejection surfaces every run until the operator looks.
+      // Cross-run pause (no strike): a persistent rejection surfaces via the
+      // stored note until the operator looks, without re-probing every run.
       const note =
         `request counts: CLIProxy rejected the key on api-key-usage (HTTP ${err.status}); ` +
-        `request counts skipped this run and retried next sync. No strike spent and no probe beyond this run.`;
-      await keep(note);
+        `request-count probes paused for 30 minutes. No strike spent and no probe beyond this run.`;
+      await keep(note, deps.now);
       return note;
     }
     const raw = err instanceof Error ? err.message : "fetch failed";
@@ -1201,7 +1209,7 @@ async function syncRequestCounts(
   try {
     const { lanes, warnings } = parseApiKeyUsage(payload, deps.now);
     const note = warnings.length > 0 ? scrubWarnings(warnings) : null;
-    await deps.saveRequestCounts({ lanes, fetchedAt: deps.now, note });
+    await deps.saveRequestCounts({ lanes, fetchedAt: deps.now, note, authRejectedAt: null });
     return note;
   } catch (err) {
     const raw = err instanceof Error ? err.message : "fetch failed";

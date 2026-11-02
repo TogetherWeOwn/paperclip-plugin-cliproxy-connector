@@ -159,12 +159,14 @@ The plugin ships two pages over the same sync cache:
     four fields only (`provider, totalCredits, totalUsage, fetchedAt`). Without
     `openRouterSecretRef` the section reads "not configured", never an error.
   - **Per-lane usage**: request counts from one `GET /v0/management/api-key-usage`
-    per sync (opt-in via `apiKeyUsageEnabled`, off by default), aggregated by
+    per sync (opt-in via `apiKeyUsageEnabled`, off by default; paused for
+    30 minutes after a 401/403), aggregated by
     provider in the worker — the composite `base_url|api_key` keys are discarded
     before any state write, so lanes carry provider words and counts only.
     Labelled "requests": there is no per-lane token split from any lawful
     read-only source, and OAuth lanes are invisible to the endpoint, so the page
-    says both outright.
+    says both outright. The section timestamp is the latest cached quota-row
+    fetch, never the sync finish time.
   - **Lane map**: the static agent-lane → provider/model table derived from the
     cost-integration plan §1.3 on 2026-11-01, flagged verbatim
     "Config-derived mapping (derived 2026-11-01). Not ledger data." Re-deriving
@@ -239,8 +241,10 @@ both fail soft with last-known kept):
   the v8 `/observability/usage/api-keys` route shares the handler, but the v0 path
   stays the only admitted one). The payload's `base_url|api_key` composite keys are
   iterated for their counter values only and never copied past the parse boundary;
-  a 401/403 fails closed with one warning and spends no strikes (the management key
-  already proved good against `auth-files` this run).
+  a 401/403 fails closed with one warning, spends no strikes (the management key
+  already proved good against `auth-files` this run), and pauses further probes
+  for 30 minutes (persisted rejection time; the page keeps showing the pause
+  note while probes are off).
 The quota-fetch wire shape is the lowercase CLIProxyAPI `sdk/pluginapi`
 `QuotaFetchResponse`: `groups[]` → `buckets[]`, with per-bucket `window`,
 `remainingFraction`, `resetTime` and a payload-level `summary[]` surfaced as a
