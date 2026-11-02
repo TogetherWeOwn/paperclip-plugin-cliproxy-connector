@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   hasAdmissionSignal,
   hashIdentity,
+  isEmailLike,
   isGatingCooldown,
   isGatingWindow,
   isModelGatingCooldown,
@@ -934,6 +935,26 @@ describe("parsePluginQuota (lowercase wire shape)", () => {
     });
     expect(limits.some((l) => l.id === "devin:weekly")).toBe(false);
     expect(warnings.some((w) => w.includes("weekly quota percent"))).toBe(true);
+  });
+});
+
+describe("isEmailLike", () => {
+  it("spots email-shaped strings without a backtracking regex", () => {
+    expect(isEmailLike("user@example.com")).toBe(true);
+    expect(isEmailLike("a@x.test")).toBe(true);
+    expect(isEmailLike("Claude Opus 4.5")).toBe(false);
+    expect(isEmailLike("not an email")).toBe(false);
+    expect(isEmailLike("a@b")).toBe(false);
+    expect(isEmailLike("a@@b.com")).toBe(false);
+    expect(isEmailLike("@x.com")).toBe(false);
+    expect(isEmailLike("")).toBe(false);
+  });
+
+  it("stays linear on adversarial repetition (CodeQL js/polynomial-redos)", () => {
+    const start = Date.now();
+    expect(isEmailLike(`${"%".repeat(10_000)}@example.com`)).toBe(true);
+    expect(isEmailLike(`${"a.".repeat(5_000)}com`)).toBe(false);
+    expect(Date.now() - start).toBeLessThan(1000);
   });
 });
 

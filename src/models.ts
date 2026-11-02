@@ -37,7 +37,7 @@
  *   mentioned in the README.
  */
 
-import { NAMESPACE_TO_PROVIDER } from "./parsers.js";
+import { NAMESPACE_TO_PROVIDER, isEmailLike } from "./parsers.js";
 
 export interface ServedModel {
   /** Served id, lowercased for matching. */
@@ -82,7 +82,7 @@ export function scrubDisplayName(raw: unknown): string | null {
   const s = raw.trim();
   if (!s) return null;
   // Emails never render as model names; duplicates fall back to the id.
-  if (/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/.test(s)) return null;
+  if (isEmailLike(s)) return null;
   const capped = s.length > 80 ? `${s.slice(0, 77)}...` : s;
   return capped;
 }

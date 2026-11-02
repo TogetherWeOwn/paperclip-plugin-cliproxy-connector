@@ -120,6 +120,27 @@ export function toIsoTimestamp(v: unknown): string | null {
 }
 
 /**
+ * True when `s` looks like an email address. Plain linear scan, no regex:
+ * the classic email pattern (`[A-Za-z0-9._%+-]+@…`) backtracks polynomially
+ * on adversarial input (CodeQL js/polynomial-redos), so every email check in
+ * this plugin stays in string code. Exactly one `@`, a non-empty domain with
+ * a dot, and a 2+ letter TLD; anything holding whitespace is not an email.
+ */
+export function isEmailLike(s: string): boolean {
+  if (s.includes(" ") || s.includes("\t") || s.includes("\n") || s.includes("\r")) return false;
+  const at = s.indexOf("@");
+  if (at <= 0 || at !== s.lastIndexOf("@") || at === s.length - 1) return false;
+  const domain = s.slice(at + 1);
+  const dot = domain.lastIndexOf(".");
+  if (dot <= 0 || dot >= domain.length - 2) return false;
+  for (let i = dot + 1; i < domain.length; i++) {
+    const c = domain.charCodeAt(i);
+    if (!((c >= 65 && c <= 90) || (c >= 97 && c <= 122))) return false;
+  }
+  return true;
+}
+
+/**
  * Scrub an upstream `status_message` before it reaches the plugin page.
  * Emails become `[redacted-email]`; any whitespace-delimited token that
  * looks credential-like — a 20+ word-char run, or 8+ chars mixing letters
@@ -133,16 +154,16 @@ export function sanitizeStatusMessage(raw: string | null): string | null {
   if (!raw) return null;
   let s = raw.trim();
   if (!s) return null;
-  s = s.replace(/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g, "[redacted-email]");
   s = s
     .split(/\s+/)
     .map((tok) => {
-      if (tok === "[redacted-email]") return tok;
-      if (/[A-Za-z0-9_\-]{20,}/.test(tok)) return "[redacted]";
       // Judge the punctuation-stripped core: real notes attach commas and
       // periods ("for gpt-4o-mini, retry"), which must not defeat the
-      // operational-shape exemption.
+      // operational-shape exemption. Email-like cores redact as a whole
+      // token, which also covers addresses glued to punctuation.
       const core = tok.replace(/^[^A-Za-z0-9]+/, "").replace(/[^A-Za-z0-9]+$/, "");
+      if (isEmailLike(core)) return "[redacted-email]";
+      if (/[A-Za-z0-9_\-]{20,}/.test(tok)) return "[redacted]";
       if (isCredentialCore(core)) return "[redacted]";
       return tok;
     })
@@ -653,8 +674,6 @@ export function isModelGatingCooldown(c: ParsedCooldown, nowMs: number): boolean
   return !Number.isNaN(t) && t > nowMs;
 }
 
-const EMAIL_PATTERN = /[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/;
-
 /**
  * Readable account label from the operator-set `note` (preferred) or `label`.
  * Stock `label` usually equals the account email or project id
@@ -683,8 +702,8 @@ export function parseAccountLabel(
     if (s.toLowerCase() === provider.toLowerCase()) continue;
     if (projectId && s === projectId.trim()) continue;
     if (email && s === email.trim() && !opts?.showEmails) continue;
-    if (EMAIL_PATTERN.test(s) && !opts?.showEmails) continue;
-    if (EMAIL_PATTERN.test(s) && opts?.showEmails) {
+    if (isEmailLike(s) && !opts?.showEmails) continue;
+    if (isEmailLike(s) && opts?.showEmails) {
       // Explicit operator opt-in: render the email label verbatim (capped).
       return s.length > 40 ? s.slice(0, 40) : s;
     }
@@ -697,7 +716,7 @@ export function parseAccountLabel(
     // account email itself (verbatim, capped; email-shaped only so a junk
     // email field cannot surface an identifier-shaped surprise).
     const s = email.trim();
-    if (s && EMAIL_PATTERN.test(s)) return s.length > 40 ? s.slice(0, 40) : s;
+    if (s && isEmailLike(s)) return s.length > 40 ? s.slice(0, 40) : s;
   }
   return null;
 }
