@@ -315,7 +315,7 @@ export function parseConfig(raw: unknown): { config: ConnectorConfig; validation
   }
 
   // Per-provider kill switch for the pinned live `api-call` rounds. Keys are
-  // lowercased provider words; values must be booleans. Missing entries fall
+  // trimmed and lowercased provider words; values must be booleans. Missing entries fall
   // back to DEFAULT_LIVE_QUOTA_PROVIDERS (on for antigravity/devin/meta).
   const apiCallEnabled: Record<string, boolean> = {};
   const apiCallEnabledIn = (r.apiCallEnabled ?? {}) as Record<string, unknown>;
@@ -325,7 +325,7 @@ export function parseConfig(raw: unknown): { config: ConnectorConfig; validation
         errors.push(`apiCallEnabled[${provider}] must be a boolean; got ${JSON.stringify(enabled)}.`);
         continue;
       }
-      apiCallEnabled[provider.toLowerCase()] = enabled;
+      apiCallEnabled[provider.trim().toLowerCase()] = enabled;
     }
   } else if (r.apiCallEnabled !== undefined) {
     errors.push("apiCallEnabled must be an object mapping provider words to booleans.");

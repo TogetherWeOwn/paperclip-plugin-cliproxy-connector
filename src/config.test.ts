@@ -114,6 +114,15 @@ describe("apiCallEnabled kill switch", () => {
     const notObject = parseConfig(base({ providers: [], apiCallEnabled: true }));
     expect(notObject.validation.ok).toBe(false);
   });
+
+  it("trims padded provider keys so the kill switch cannot silently miss", () => {
+    const padded = parseConfig(
+      base({ providers: [], apiCallEnabled: { " Antigravity ": false } }),
+    );
+    expect(padded.validation.ok).toBe(true);
+    expect(padded.config.apiCallEnabled).toEqual({ antigravity: false });
+    expect(isLiveQuotaEnabled(padded.config, "antigravity")).toBe(false);
+  });
 });
 
 describe("ignored drift acceptance (ignoredProviders / ignoredAuthFileRefs)", () => {
