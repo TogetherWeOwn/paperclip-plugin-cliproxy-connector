@@ -614,11 +614,12 @@ export async function runSync(deps: SyncDeps, inFlight: { running: boolean }): P
               authText = await client.getAuthFileText(a.fileName);
             } catch (err) {
               if (err instanceof CliproxyAuthError) throw err; // stop after first rejected key
-              // A provider hit happened even when it fails, so the throttle
-              // records it. The message quotes nothing from the file: the
-              // client reports pathnames only, and the scrub below is
-              // defense-in-depth.
-              deps.apiCallLastCall?.set(metaAccountKey, nowMs);
+              // No throttle stamp here: the failure names this row's file, not
+              // the credential, so a later row sharing the auth_index must still
+              // get to try its own file below. Only an actual key-call attempt
+              // consumes the credential's 45-minute budget (set below). The
+              // message quotes nothing from the file: the client reports
+              // pathnames only, and the scrub below is defense-in-depth.
               const rawMessage = err instanceof Error ? err.message : "fetch failed";
               const safeMessage = rawMessage.split(authIndex).join(apiFileRef(authIndex));
               pluginErrors.push(
@@ -631,10 +632,11 @@ export async function runSync(deps: SyncDeps, inFlight: { running: boolean }): P
               dcaToken = readDcaTokenFromAuthFile(authText);
             } catch (err) {
               if (err instanceof CliproxyAuthError) throw err; // stop after first rejected key
-              // A provider hit happened even when the file carries no token,
-              // so the throttle records it. The message is a fixed literal:
-              // nothing from the file is ever quoted into a warning.
-              deps.apiCallLastCall?.set(metaAccountKey, nowMs);
+              // No throttle stamp here either: a token-less file says nothing
+              // about the credential, so a later row sharing the auth_index
+              // must still get to try its own file below. The message is a
+              // fixed literal: nothing from the file is ever quoted into a
+              // warning.
               pluginErrors.push(
                 `meta (provider API, ${apiFileRef(authIndex)}): ` +
                   `auth-file download carries no usable dca_token; live Meta quota unavailable.`,

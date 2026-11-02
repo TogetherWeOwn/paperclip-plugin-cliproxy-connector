@@ -941,6 +941,24 @@ describe("Meta live quota (download + literal-header key call)", () => {
     expect(JSON.stringify(result.body)).not.toContain(LIVE_KEY_FIXTURE);
   });
 
+  it("nulls an unparseable string key body so no shape retains the live key", async () => {
+    // A 2xx whose envelope body is not JSON reaches the caller as a raw
+    // string; caching that text verbatim could retain the live api_key the
+    // endpoint returns. The quota parser treats non-objects as unknown, so
+    // the choke point drops the text instead.
+    const LIVE_KEY_FIXTURE = "sk-live-fixture-meta-key-9f8e7d6c5b4a";
+    const fetch = vi.fn(async () =>
+      json(200, {
+        status_code: 200,
+        header: {},
+        body: `not-json{{{ "api_key": "${LIVE_KEY_FIXTURE}"`,
+      }),
+    );
+    const result = await client(fetch).postMetaMuseCodeKey("m1", DCA_FIXTURE);
+    expect(result.statusCode).toBe(200);
+    expect(result.body).toBeNull();
+  });
+
   it("refuses an unusable token or index before any network happens", async () => {
     for (const badToken of ["", "not-a-dca-token", "dca:has whitespace", `dca:${"x".repeat(4096)}`]) {
       const fetch = vi.fn(async () => envelope(200, {}));

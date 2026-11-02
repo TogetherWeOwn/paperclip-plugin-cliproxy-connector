@@ -1757,6 +1757,51 @@ describe("live provider-API quota (pinned api-call templates)", () => {
     assertNoApiKeyLeak(s);
   });
 
+  it("falls back without a forced refresh when the first download fails for a shared auth index", async () => {
+    const s = store();
+    const calls: string[] = [];
+    const downloads: string[] = [];
+    // Same shape as the forced-refresh fallback above, but on a scheduled
+    // poll: the first row's failed download must not stamp the credential's
+    // 45-minute throttle, or the second row sharing `m1` would hit
+    // `nowMs - lastCall == 0` and stay quota-blind without trying its file.
+    const files = [
+      { id: "meta-old", provider: "meta", name: "meta-old.json", auth_index: "m1" },
+      { id: "meta-current", provider: "meta", name: "meta-current.json", auth_index: "m1" },
+    ];
+    const config = configWith({ provider: "meta", connectionId: "conn-meta" });
+    // Shared cross-run throttle state, as in production: without these maps
+    // the throttle is a no-op and the test could not catch the regression.
+    const base = {
+      apiCallLastCall: new Map<string, number>(),
+      apiCallCache: new Map<string, { statusCode: number; body: unknown; observedAt: string }>(),
+      apiCallAuthBackoffUntil: new Map<string, number>(),
+    };
+    const summary = await runSync(
+      {
+        ...depsWith(
+          s,
+          config,
+          metaFetch(calls, downloads, files, { failDownloads: ["meta-old.json"] }) as never,
+        ),
+        ...base,
+      },
+      { running: false },
+    );
+    expect(summary.skipped).toBe(false);
+    expect(downloads).toEqual(["meta-old.json", "meta-current.json"]);
+    expect(calls).toEqual(["m1 https://api.meta.ai/muse-code/key"]);
+    const rows = Object.values(s.savedRows ?? {});
+    expect(rows).toHaveLength(2);
+    for (const row of rows) {
+      expect(row.quotaBlind).toBe(false);
+      expect(row.limits.map((l) => l.id)).toEqual(["meta:window", "meta:weekly"]);
+    }
+    assertNoKeyLeak(s);
+    assertNoDcaLeak(s);
+    assertNoApiKeyLeak(s);
+  });
+
   it("makes no download or key call when metaQuota is disabled and says so once", async () => {
     const s = store();
     const calls: string[] = [];

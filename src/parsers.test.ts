@@ -1934,6 +1934,31 @@ describe("parseMetaQuota (panel parseMetaQuotaPayload shape)", () => {
     expect(weekly?.resetsAt).toBe(iso(RESET * 1000));
   });
 
+  it("reads negative percents as unknown, never phantom headroom", async () => {
+    // A negative used_percent is malformed upstream, not empty quota:
+    // clamping it to 0 used / 100 remaining would invent full headroom.
+    const { parseMetaQuota } = await import("./parsers.js");
+    const parsed = parseMetaQuota(
+      {
+        subs_usage: {
+          window: { used_percent: -1, resets_at: RESET },
+          weekly: { used_percent: "-5", resets_at: RESET },
+        },
+      },
+      NOW,
+      metaWindows(),
+    );
+    const [window, weekly] = parsed.limits;
+    expect(window?.usedPercent).toBeNull();
+    expect(window?.remainingPercent).toBeNull();
+    expect(window?.allowed).toBe(true);
+    expect(weekly?.usedPercent).toBeNull();
+    expect(weekly?.remainingPercent).toBeNull();
+    expect(weekly?.allowed).toBe(true);
+    expect(parsed.warnings.join(" ")).toMatch(/window quota percent is unusable/);
+    expect(parsed.warnings.join(" ")).toMatch(/weekly quota percent is unusable/);
+  });
+
   it("parses a JSON string body and warns without windows on garbage", async () => {
     const { parseMetaQuota } = await import("./parsers.js");
     const fromString = parseMetaQuota(JSON.stringify(keyBody()), NOW, metaWindows());

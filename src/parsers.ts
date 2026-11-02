@@ -1088,16 +1088,20 @@ export function parseDevinQuota(
 
 /**
  * Strict panel-style Meta percent (panel `metaQuota.ts` `parseUsedPercent`):
- * a finite 0–100 number, or a digits-only string — clamped, never guessed.
+ * a finite non-negative number, or a numeric string — clamped at the top,
+ * never guessed. A negative is malformed upstream, not empty quota: it reads
+ * null (unknown, never phantom headroom), number and string forms alike.
  * Anything else is null (unknown, never headroom).
  */
 function parseMetaUsedPercent(value: unknown): number | null {
   if (typeof value === "number") {
-    if (!Number.isFinite(value)) return null;
-    return Math.min(100, Math.max(0, value));
+    if (!Number.isFinite(value) || value < 0) return null;
+    return Math.min(100, value);
   }
   if (typeof value === "string" && value.trim() !== "" && Number.isFinite(Number(value))) {
-    return Math.min(100, Math.max(0, Number(value)));
+    const parsed = Number(value);
+    if (parsed < 0) return null;
+    return Math.min(100, parsed);
   }
   return null;
 }

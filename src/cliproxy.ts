@@ -1062,6 +1062,11 @@ export class CliproxyManagementClient {
     // are untouched.
     if (typeof result.body === "object" && result.body !== null && !Array.isArray(result.body)) {
       delete (result.body as Record<string, unknown>).api_key;
+    } else if (typeof result.body === "string") {
+      // An unparseable upstream body is never quota data (the parser treats
+      // non-objects as unknown) — drop the raw text so no body shape, however
+      // malformed, can carry the live key into the 45-minute cache.
+      result.body = null;
     }
     return result;
   }
