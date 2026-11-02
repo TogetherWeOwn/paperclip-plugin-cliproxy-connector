@@ -326,3 +326,15 @@ describe("live provider-API window defaults", () => {
     }
   });
 });
+
+describe("showAccountEmails opt-in (account labels)", () => {
+  it("defaults to false and accepts an explicit boolean", () => {
+    expect(parseConfig(base({})).config.showAccountEmails).toBe(false);
+    expect(parseConfig(base({ showAccountEmails: true })).config.showAccountEmails).toBe(true);
+    expect(parseConfig(base({ showAccountEmails: true })).validation.ok).toBe(true);
+  });
+
+  it("rejects non-boolean values", () => {
+    expect(parseConfig(base({ showAccountEmails: "yes" })).validation.ok).toBe(false);
+  });
+});

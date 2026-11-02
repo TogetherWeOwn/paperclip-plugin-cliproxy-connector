@@ -37,13 +37,58 @@
  *   mentioned in the README.
  */
 
-import { NAMESPACE_TO_PROVIDER } from "./parsers.js";
+import { NAMESPACE_TO_PROVIDER, isEmailLike, tokenContainsEmail } from "./parsers.js";
 
 export interface ServedModel {
   /** Served id, lowercased for matching. */
   id: string;
   /** Raw `owned_by` value, or null when absent. Never used for quota grouping. */
   ownedBy: string | null;
+  /**
+   * Human display name from the served set (`display_name`), scrubbed and
+   * length-capped. Display only — never a routing or matching key.
+   */
+  displayName: string | null;
+}
+
+/**
+ * Human provider labels for the UI. Falls back to the raw provider word;
+ * never used for routing, matching, or config.
+ */
+export const PROVIDER_DISPLAY_NAMES: Record<string, string> = {
+  claude: "Claude",
+  codex: "ChatGPT Codex",
+  meta: "Meta Muse",
+  antigravity: "Antigravity",
+  devin: "Devin",
+  synthetic: "Synthetic",
+  "nvidia-nim": "Nvidia NIM",
+  cloudflare: "Cloudflare",
+  "cloudflare-workers-ai": "Cloudflare Workers AI",
+  zai: "Z.ai",
+  "opencode-go": "opencode-go",
+  openrouter: "OpenRouter",
+};
+
+/** Human provider label for the UI (raw word fallback, never routing). */
+export function providerDisplayName(provider: string): string {
+  const word = provider.trim().toLowerCase();
+  return PROVIDER_DISPLAY_NAMES[word] ?? provider;
+}
+
+/** Scrub a `display_name` the same way as other upstream text (display only). */
+export function scrubDisplayName(raw: unknown): string | null {
+  if (typeof raw !== "string") return null;
+  const s = raw.trim();
+  if (!s) return null;
+  // Emails never render as model names — whole or glued inside other text
+  // (`"Available for user@example.com"`); rejects fall back to the id.
+  if (isEmailLike(s)) return null;
+  for (const tok of s.split(/\s+/)) {
+    if (tokenContainsEmail(tok)) return null;
+  }
+  const capped = s.length > 80 ? `${s.slice(0, 77)}...` : s;
+  return capped;
 }
 
 export interface ModelOverlap {
@@ -92,7 +137,12 @@ export function parseModelsPayload(payload: unknown): { models: ServedModel[]; w
     if (seen.has(id)) continue; // served twice (aliases) — keep the first
     seen.add(id);
     const ownedRaw = o ? (o.owned_by ?? o.ownedBy ?? o.owner ?? null) : null;
-    models.push({ id, ownedBy: typeof ownedRaw === "string" && ownedRaw.trim() ? ownedRaw.trim() : null });
+    const displayRaw = o ? (o.display_name ?? o.displayName ?? null) : null;
+    models.push({
+      id,
+      ownedBy: typeof ownedRaw === "string" && ownedRaw.trim() ? ownedRaw.trim() : null,
+      displayName: scrubDisplayName(displayRaw),
+    });
   }
   return { models, warnings };
 }

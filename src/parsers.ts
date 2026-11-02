@@ -120,8 +120,74 @@ export function toIsoTimestamp(v: unknown): string | null {
 }
 
 /**
+ * True when `s` looks like an email address. Plain linear scan, no regex:
+ * the classic email pattern (`[A-Za-z0-9._%+-]+@…`) backtracks polynomially
+ * on adversarial input (CodeQL js/polynomial-redos), so every email check in
+ * this plugin stays in string code. Exactly one `@`, a non-empty domain with
+ * a dot, and a 2+ letter TLD; anything holding whitespace is not an email.
+ */
+export function isEmailLike(s: string): boolean {
+  if (s.includes(" ") || s.includes("\t") || s.includes("\n") || s.includes("\r")) return false;
+  const at = s.indexOf("@");
+  if (at <= 0 || at !== s.lastIndexOf("@") || at === s.length - 1) return false;
+  const domain = s.slice(at + 1);
+  const dot = domain.lastIndexOf(".");
+  if (dot <= 0 || dot >= domain.length - 2) return false;
+  for (let i = dot + 1; i < domain.length; i++) {
+    const c = domain.charCodeAt(i);
+    if (!((c >= 65 && c <= 90) || (c >= 97 && c <= 122))) return false;
+  }
+  return true;
+}
+
+/**
+ * True for an ASCII letter or digit — the only chars kept at a token edge.
+ */
+function isEdgeAlnum(code: number): boolean {
+  return (
+    (code >= 48 && code <= 57) || (code >= 65 && code <= 90) || (code >= 97 && code <= 122)
+  );
+}
+
+/**
+ * Strip leading/trailing chars that cannot appear in an address (quotes,
+ * parens, trailing punctuation). Manual index walk — linear time, no
+ * backtracking pattern (CodeQL js/polynomial-redos flags the equivalent
+ * anchored regex trims).
+ */
+function trimEdgePunct(tok: string): string {
+  let start = 0;
+  let end = tok.length;
+  while (start < end && !isEdgeAlnum(tok.charCodeAt(start))) start++;
+  while (end > start && !isEdgeAlnum(tok.charCodeAt(end - 1))) end--;
+  return tok.slice(start, end);
+}
+
+/**
+ * True when a whitespace-delimited token holds an email-shaped piece glued to
+ * other text (`user@example.com's`, `a@x.com,b@y.com`, `email=a@b.com&retry`,
+ * `a@x.test/path`, `user@example.com:443`). The token is split on characters
+ * that cannot appear in an address and each piece is judged with the linear
+ * `isEmailLike` scan — edges trimmed with a linear index walk, no
+ * backtracking pattern (CodeQL js/polynomial-redos).
+ * Tokens without `@` return false without splitting.
+ */
+export function tokenContainsEmail(tok: string): boolean {
+  if (!tok.includes("@")) return false;
+  const core = trimEdgePunct(tok);
+  if (isEmailLike(core)) return true;
+  const pieces = core.split(/[^A-Za-z0-9._%+@-]+/);
+  for (const piece of pieces) {
+    const p = trimEdgePunct(piece);
+    if (p.length > 0 && p !== core && isEmailLike(p)) return true;
+  }
+  return false;
+}
+
+/**
  * Scrub an upstream `status_message` before it reaches the plugin page.
- * Emails become `[redacted-email]`; any whitespace-delimited token that
+ * Emails become `[redacted-email]` — whole tokens and addresses glued to
+ * other text alike; any whitespace-delimited token that
  * looks credential-like — a 20+ word-char run, or 8+ chars mixing letters
  * with digits (short API keys, session ids) — becomes `[redacted]`. Tokens
  * with operational shapes (timestamps, versions, benign `k=v` pairs like
@@ -133,16 +199,19 @@ export function sanitizeStatusMessage(raw: string | null): string | null {
   if (!raw) return null;
   let s = raw.trim();
   if (!s) return null;
-  s = s.replace(/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g, "[redacted-email]");
   s = s
     .split(/\s+/)
     .map((tok) => {
-      if (tok === "[redacted-email]") return tok;
-      if (/[A-Za-z0-9_\-]{20,}/.test(tok)) return "[redacted]";
       // Judge the punctuation-stripped core: real notes attach commas and
       // periods ("for gpt-4o-mini, retry"), which must not defeat the
-      // operational-shape exemption.
-      const core = tok.replace(/^[^A-Za-z0-9]+/, "").replace(/[^A-Za-z0-9]+$/, "");
+      // operational-shape exemption. Email-shaped pieces glued inside the
+      // token (`a@x.com,b@y.com`, `email=a@b.com&retry`) redact as a whole
+      // token, so a suffix cannot smuggle an address past the check.
+      // Linear edge trim (see `trimEdgePunct`) — the regex form trips
+      // CodeQL js/polynomial-redos.
+      const core = trimEdgePunct(tok);
+      if (tokenContainsEmail(tok)) return "[redacted-email]";
+      if (/[A-Za-z0-9_\-]{20,}/.test(tok)) return "[redacted]";
       if (isCredentialCore(core)) return "[redacted]";
       return tok;
     })
@@ -496,7 +565,10 @@ function summarizeMetrics(value: unknown): string[] | null {
   const out: string[] = [];
   for (const item of value.slice(0, 32)) {
     const push = (raw: string) => {
-      const clean = sanitizeStatusMessage(raw.slice(0, 240));
+      // Scrub the full string first: truncating before scrubbing can leave a
+      // partial email the scrubber no longer recognizes. The sanitizer caps
+      // at 120 chars itself.
+      const clean = sanitizeStatusMessage(raw);
       if (clean) out.push(clean);
     };
     if (typeof item === "string" && item.trim()) push(item.trim());
@@ -555,6 +627,203 @@ export function quotaBlindReason(parserKey: ProviderKey, hasWindows: boolean): s
     default:
       return hasWindows ? null : "no usable quota windows";
   }
+}
+
+/** Blind reason with a known exhaustion bound (Meta cooldown path): headroom stays unknown. */
+export function quotaBlindReasonWithExhaustedUntil(parserKey: ProviderKey, exhaustedUntil: string | null): string | null {
+  if (parserKey === "meta" && exhaustedUntil) {
+    return `headroom unknown; last exhausted until ${exhaustedUntil}`;
+  }
+  return null;
+}
+
+/* ------------------------------------------------------------------ */
+/* stock `cooldowns[]` + operator labels + v8 sign-in fields            */
+/* ------------------------------------------------------------------ */
+
+/** One normalized stock cooldown entry (display + gating inputs). */
+export interface ParsedCooldown {
+  /** `credential` or `model` (lowercased, others pass through as display-only). */
+  scope: string;
+  /** Lowercased model key for model-scoped entries, else null. */
+  modelKey: string | null;
+  /** Lowercased reason word (`credential_quota`, `quota`, `invalid_grant`, …). */
+  reason: string;
+  /** ISO retry time, when parseable. */
+  retryAt: string | null;
+  remainingSeconds: number | null;
+  httpStatus: number | null;
+}
+
+/** Reasons that gate routing until `retry_at` (credential scope only). */
+const GATING_COOLDOWN_REASONS = new Set(["credential_quota", "quota"]);
+
+/** Reasons that surface a read-only "needs sign-in" badge (never a reset). */
+const SIGN_IN_COOLDOWN_REASONS = new Set(["invalid_grant", "unauthorized"]);
+
+/**
+ * A cooldown token (model key / reason) is an identifier, not free text:
+ * allow-list pattern, email-shaped values rejected. The status-message
+ * scrubber redacted dated model ids (`claude-sonnet-4-5-20250929` trips the
+ * 20+ word-char rule) and silently disabled model-scoped gating, so model
+ * keys never go through it. Credential-shaped values are rejected too: a
+ * secret that lands in `model_key` must never gate routing nor render in the
+ * limit label. The whole-token credential check cannot apply here — dated
+ * model ids are letter+digit and 8+ chars, so it would reject them as well.
+ * Instead each dot/hyphen segment is judged with `isCredentialCore`: dated
+ * ids keep gating (their segments are words, small numbers, or digit-only
+ * runs like `20250929`), while key material (`sk-live-a1b2c3d4`,
+ * `AKIA1234`, `ab12cd34ef`) rejects. A leading secret marker (`sk-…`,
+ * `token.…`) rejects even when every segment is short, and opaque 20+
+ * separator-free runs reject like the status-message scrubber's rule.
+ * A rejected model key yields no model gating; callers keep the raw trimmed
+ * word for display-only reasons.
+ */
+const COOLDOWN_TOKEN_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$/;
+
+function scrubCooldownToken(raw: unknown): string | null {
+  if (typeof raw !== "string") return null;
+  const s = raw.trim();
+  if (!s) return null;
+  if (isEmailLike(s) || !COOLDOWN_TOKEN_PATTERN.test(s)) return null;
+  const segments = s.split(/[-.]/);
+  if (SECRET_DOT_PREFIX.test(segments[0] ?? "")) return null;
+  if (segments.some((seg) => isCredentialCore(seg))) return null;
+  if (/[A-Za-z0-9]{20,}/.test(s)) return null;
+  return s;
+}
+
+/**
+ * Parse stock `cooldowns[]` from an auth-files entry. Unknown reasons
+ * (including `payment_required`, present since v8.0.49) are display-only and
+ * never gate; `payment_required` is never read as a billing signal.
+ * `cooldowns: null` (Home mode) yields no entries.
+ */
+export function parseCooldowns(entry: Json): ParsedCooldown[] {
+  const raw = entry.cooldowns ?? entry.Cooldowns ?? null;
+  if (raw === null || raw === undefined) return [];
+  if (!Array.isArray(raw)) return [];
+  const out: ParsedCooldown[] = [];
+  for (const item of raw.slice(0, 32)) {
+    const o = asObj(item);
+    if (!o) continue;
+    const scopeRaw = getStr(o, "scope", "Scope");
+    const reasonRaw = getStr(o, "reason", "Reason");
+    if (!reasonRaw) continue;
+    const reason = scrubCooldownToken(reasonRaw)?.toLowerCase() ?? reasonRaw.trim().toLowerCase();
+    const scope = (scopeRaw ?? "credential").trim().toLowerCase() || "credential";
+    const modelRaw = getStr(o, "model_key", "modelKey", "model", "Model");
+    const modelKey = modelRaw ? (scrubCooldownToken(modelRaw)?.toLowerCase() ?? null) : null;
+    const retryAt = toIsoTimestamp(o.retry_at ?? o.retryAt ?? o.retryAfter ?? null);
+    const remainingRaw = o.remaining_seconds ?? o.remainingSeconds ?? null;
+    const remainingSeconds =
+      typeof remainingRaw === "number" && Number.isFinite(remainingRaw) && remainingRaw >= 0
+        ? Math.min(remainingRaw, 31_536_000)
+        : null;
+    const statusRaw = o.http_status ?? o.httpStatus ?? o.status ?? null;
+    const httpStatus =
+      typeof statusRaw === "number" && Number.isFinite(statusRaw) && statusRaw >= 100 && statusRaw < 600
+        ? Math.trunc(statusRaw)
+        : null;
+    out.push({ scope, modelKey, reason, retryAt, remainingSeconds, httpStatus });
+  }
+  return out;
+}
+
+/** True when this cooldown gates routing (explicit allow-set + future retry). */
+export function isGatingCooldown(c: ParsedCooldown, nowMs: number): boolean {
+  if (!GATING_COOLDOWN_REASONS.has(c.reason)) return false;
+  if (c.scope !== "credential" && c.scope !== "account") return false;
+  if (!c.retryAt) return false;
+  const t = Date.parse(c.retryAt);
+  return !Number.isNaN(t) && t > nowMs;
+}
+
+/** True when this cooldown is a model-scoped gating window for one model. */
+export function isModelGatingCooldown(c: ParsedCooldown, nowMs: number): boolean {
+  if (!GATING_COOLDOWN_REASONS.has(c.reason)) return false;
+  if (c.scope !== "model") return false;
+  if (!c.modelKey || !c.retryAt) return false;
+  const t = Date.parse(c.retryAt);
+  return !Number.isNaN(t) && t > nowMs;
+}
+
+/**
+ * Readable account label from the operator-set `note` (preferred) or `label`.
+ * Stock `label` usually equals the account email or project id
+ * (filestore fallback label → email → project_id), so a label is used only
+ * when it is non-empty, differs from the entry email/project id, contains no
+ * email pattern, and is not the bare provider word. The result is scrubbed and
+ * capped at ~40 chars. Emails stay hidden unless `showEmails` is on, in which
+ * case an email-shaped label renders verbatim (capped) — explicit operator
+ * opt-in. Project ids never render.
+ */
+export function parseAccountLabel(
+  entry: Json,
+  provider: string,
+  opts?: { showEmails?: boolean },
+): string | null {
+  const email = getStr(entry, "email", "Email", "login");
+  const projectId = getStr(entry, "project_id", "projectId");
+  const candidates: Array<{ value: string | null; isNote: boolean }> = [
+    { value: getStr(entry, "note", "Note"), isNote: true },
+    { value: getStr(entry, "label", "Label", "name"), isNote: false },
+  ];
+  for (const { value } of candidates) {
+    if (!value) continue;
+    const s = value.trim();
+    if (!s) continue;
+    if (s.toLowerCase() === provider.toLowerCase()) continue;
+    if (projectId && s === projectId.trim()) continue;
+    if (email && s === email.trim() && !opts?.showEmails) continue;
+    if (isEmailLike(s) && !opts?.showEmails) continue;
+    if (isEmailLike(s) && opts?.showEmails) {
+      // Explicit operator opt-in: render the email label verbatim (capped).
+      return s.length > 40 ? s.slice(0, 40) : s;
+    }
+    // Scrub the full note before capping: truncating first can leave a
+    // partial email (`...someone.long@example.c`) the scrubber misses.
+    const scrubbed = sanitizeStatusMessage(s);
+    if (!scrubbed || scrubbed.includes("[redacted-email]") || scrubbed === "[redacted]") continue;
+    return scrubbed.length > 40 ? scrubbed.slice(0, 40) : scrubbed;
+  }
+  if (opts?.showEmails && email) {
+    // Explicit operator opt-in with no usable note/label: fall back to the
+    // account email itself (verbatim, capped; email-shaped only so a junk
+    // email field cannot surface an identifier-shaped surprise).
+    const s = email.trim();
+    if (s && isEmailLike(s)) return s.length > 40 ? s.slice(0, 40) : s;
+  }
+  return null;
+}
+
+/** Stock v8 sign-in fields from an auth-files entry (v8 list only). */
+export interface ParsedSignIn {
+  needsSignIn: boolean;
+  hint: string | null;
+  tokenExpiresAt: string | null;
+}
+
+/**
+ * Read the v8 renewal fields. `requires_sign_in` / `next_action` raise the
+ * read-only badge; `recovery_hint` / `refresh_error.message` scrub into the
+ * hint. `renewal_event.account` (an email) is always ignored.
+ * `access_token_expires_at` is returned for SKIP-only use (never a refresh).
+ */
+export function parseSignInFields(entry: Json): ParsedSignIn {
+  const requiresSignIn = entry.requires_sign_in === true || entry.requiresSignIn === true;
+  const nextAction = getStr(entry, "next_action", "nextAction");
+  const recoveryHint = getStr(entry, "recovery_hint", "recoveryHint");
+  const refreshObj = getObj(entry, "refresh_error", "refreshError");
+  const refreshMessage = refreshObj ? getStr(refreshObj, "message", "Message", "error") : null;
+  const hintRaw = recoveryHint ?? refreshMessage ?? null;
+  // Scrub the full hint: the sanitizer already caps at 120 chars, and
+  // truncating first can leave a partial email it no longer recognizes.
+  const hint = hintRaw ? sanitizeStatusMessage(hintRaw) : null;
+  const tokenExpiresAt = toIsoTimestamp(
+    entry.access_token_expires_at ?? entry.accessTokenExpiresAt ?? null,
+  );
+  return { needsSignIn: requiresSignIn || nextAction !== null, hint, tokenExpiresAt };
 }
 
 /**
@@ -1601,6 +1870,20 @@ export interface ParsedAccount {
   statusMessage: string | null;
   /** Entry `priority` (burn order), when exposed. */
   priority: number | null;
+  /**
+   * Operator-set display label (scrubbed `note`, else a scrubbed non-email
+   * `label`; null when neither qualifies). Display only — never logged raw
+   * beyond this scrubbed value, never a routing key.
+   */
+  displayLabel: string | null;
+  /** Read-only "needs sign-in" badge (v8 fields or sign-in cooldown). */
+  needsSignIn: boolean;
+  /** Scrubbed recovery hint behind the badge, when the entry carries one. */
+  needsSignInHint: string | null;
+  /** Stock `access_token_expires_at` (SKIP-only; never triggers a refresh). */
+  tokenExpiresAt: string | null;
+  /** Latest future gating-cooldown retry, when a quota cooldown is active. */
+  cooldownExhaustedUntil: string | null;
   limits: UsageLimitRow[];
   planType: string | null;
   checkedAt: string;
@@ -1669,6 +1952,11 @@ export function parseAuthFiles(
      * so the staleness logic ages each answer honestly.
      */
     apiCallObservedAt?: string | null;
+    /**
+     * Operator opt-in to show account emails in labels. Default false: email
+     * patterns never become labels (and raw emails never render either way).
+     */
+    showAccountEmails?: boolean;
   },
 ): {
   accounts: ParsedAccount[];
@@ -1796,6 +2084,15 @@ export function parseAuthFiles(
     const statusMessage = sanitizeStatusMessage(
       getStr(entry, "status_message", "statusMessage", "StatusMessage"),
     );
+    // Read-only account label (operator-set note, else a safe non-email
+    // label) + v8 sign-in fields + stock cooldowns[]. Labels and hints are
+    // scrubbed here, so downstream state, warnings and UI never see raw
+    // emails, notes or account identifiers.
+    const displayLabel = parseAccountLabel(entry, provider, {
+      showEmails: opts.showAccountEmails === true,
+    });
+    const signIn = parseSignInFields(entry);
+    const cooldowns = parseCooldowns(entry);
     const priorityRaw = entry.priority ?? entry.Priority ?? null;
     const priority =
       typeof priorityRaw === "number" && Number.isFinite(priorityRaw)
@@ -2006,9 +2303,67 @@ export function parseAuthFiles(
       [...limits.filter(live), ...pluginLimits.filter(live)].filter(accountLevel).map((l) => l.id),
     );
     const apiRows = apiLimits.filter((l) => usableLive(l) || !twinIds.has(l.id));
-    const stamped = softGating
+    const baseStamped = softGating
       ? [...limits.filter(live).map((l) => ({ ...l, gating: false })), ...pluginLimits.filter(live), ...apiRows]
       : [...limits.filter(live), ...pluginLimits.filter(live), ...apiRows];
+
+    // Stock `cooldowns[]`: quota reasons gate until `retry_at`; unknown
+    // reasons (including `payment_required`) are display-only and never gate.
+    // Model-scoped quota cooldowns gate per model via `models: [model_key]`.
+    // Sign-in reasons raise the badge only — never a reset or re-login.
+    // (Reuses `nowMs` parsed above from opts.now.)
+    const cooldownLimits: UsageLimitRow[] = [];
+    let cooldownExhaustedUntil: string | null = null;
+    let cooldownSignIn = false;
+    if (!disabled && !Number.isNaN(nowMs)) {
+      for (const c of cooldowns) {
+        if (SIGN_IN_COOLDOWN_REASONS.has(c.reason)) {
+          cooldownSignIn = true;
+          continue;
+        }
+        if (isGatingCooldown(c, nowMs)) {
+          const retryAt = c.retryAt as string;
+          if (!cooldownExhaustedUntil || Date.parse(retryAt) > Date.parse(cooldownExhaustedUntil)) {
+            cooldownExhaustedUntil = retryAt;
+          }
+          cooldownLimits.push({
+            id: `${provider}:quota-cooldown`,
+            label: "quota exhausted (upstream 429)",
+            usedPercent: 100,
+            remainingPercent: 0,
+            resetsAt: retryAt,
+            limitReached: true,
+            allowed: false,
+            gating: true,
+            observedAt: opts.now,
+            models: null,
+            metrics: null,
+            viaProviderApi: null,
+          });
+        } else if (isModelGatingCooldown(c, nowMs)) {
+          const retryAt = c.retryAt as string;
+          const modelKey = c.modelKey as string;
+          if (!cooldownExhaustedUntil || Date.parse(retryAt) > Date.parse(cooldownExhaustedUntil)) {
+            cooldownExhaustedUntil = retryAt;
+          }
+          cooldownLimits.push({
+            id: `${provider}:quota-cooldown:${modelKey}`,
+            label: `quota exhausted for ${modelKey} (upstream 429)`,
+            usedPercent: 100,
+            remainingPercent: 0,
+            resetsAt: retryAt,
+            limitReached: true,
+            allowed: false,
+            gating: true,
+            observedAt: opts.now,
+            models: [modelKey],
+            metrics: null,
+            viaProviderApi: null,
+          });
+        }
+      }
+    }
+    const stamped = [...baseStamped, ...cooldownLimits];
 
     // Antigravity publishes no passive signals: without live provider-API
     // windows it stays quota-blind. With at least one gating live window it
@@ -2031,6 +2386,8 @@ export function parseAuthFiles(
       parseWarnings.push(`${provider}: observation has no usable observed_at; using fetch time.`);
     }
 
+    const needsSignIn = signIn.needsSignIn || cooldownSignIn;
+    const baseBlindReason = quotaBlind ? quotaBlindReason(parserKey, stamped.length > 0) : null;
     accounts.push({
       key,
       provider,
@@ -2042,9 +2399,17 @@ export function parseAuthFiles(
       status,
       statusMessage,
       priority,
+      displayLabel,
+      needsSignIn,
+      needsSignInHint: needsSignIn ? signIn.hint : null,
+      tokenExpiresAt: signIn.tokenExpiresAt,
+      cooldownExhaustedUntil,
       limits: stamped,
       planType,
-      quotaBlindReason: quotaBlind ? quotaBlindReason(parserKey, stamped.length > 0) : null,
+      quotaBlindReason:
+        quotaBlind && parserKey === "meta" && cooldownExhaustedUntil
+          ? quotaBlindReasonWithExhaustedUntil(parserKey, cooldownExhaustedUntil)
+          : baseBlindReason,
       // Cache age: the sync's own fetch time. It drives the bounded fail-open
       // then unknown when sync dies — never the passive observed_at, which
       // only refreshes when the account serves traffic (an idle healthy

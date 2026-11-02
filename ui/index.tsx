@@ -6,13 +6,70 @@
  * actions (`cliproxy-resync`, `cliproxy-reenable`) run worker-side.
  * This bundle never sees the management key.
  */
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { usePluginAction, usePluginData } from "@paperclipai/plugin-sdk/ui";
 import type {
   PluginPageProps,
   PluginWidgetProps,
 } from "@paperclipai/plugin-sdk/ui";
 import type { PageData, ProviderAccountDetail, UsagePageData, WidgetData } from "../src/ui-data.js";
+
+/**
+ * Client clock anchored to the worker stamp: the offset between the
+ * worker's `generatedAt` and this client at mount is applied to every tick,
+ * so countdowns run against the worker clock (not skewed client time).
+ */
+function useWorkerNow(generatedAt: string | null, intervalMs = 30_000): number {
+  const offsetRef = useRef<number | null>(null);
+  if (offsetRef.current === null && generatedAt) {
+    const stamped = Date.parse(generatedAt);
+    offsetRef.current = Number.isNaN(stamped) ? 0 : stamped - Date.now();
+  }
+  const [tick, setTick] = useState(0);
+  useEffect(() => {
+    const timer = setInterval(() => setTick((t) => t + 1), intervalMs);
+    return () => clearInterval(timer);
+  }, [intervalMs]);
+  void tick;
+  return Date.now() + (offsetRef.current ?? 0);
+}
+
+/** Client-side countdown from a worker-stamped ISO time. */
+function formatCountdown(iso: string | null, nowMs: number): string | null {
+  if (!iso) return null;
+  const t = Date.parse(iso);
+  if (Number.isNaN(t)) return null;
+  const diff = t - nowMs;
+  if (diff <= 0) return "now";
+  const mins = Math.floor(diff / 60_000);
+  if (mins < 60) return `${mins}m`;
+  const hours = Math.floor(mins / 60);
+  if (hours < 48) return `${hours}h ${mins % 60}m`;
+  return `${Math.floor(hours / 24)}d ${hours % 24}h`;
+}
+
+/**
+ * Re-fetch cached plugin data (never resync, never api-call) at most once
+ * per minute when a shown reset passes, so a passed countdown refreshes.
+ */
+function useRefreshOnPassedReset(
+  resets: Array<string | null>,
+  refresh: () => void,
+  nowMs: number,
+) {
+  const lastRefetch = useRef(0);
+  useEffect(() => {
+    const passed = resets.some((r) => {
+      if (!r) return false;
+      const t = Date.parse(r);
+      return !Number.isNaN(t) && t <= nowMs;
+    });
+    if (passed && Date.now() - lastRefetch.current > 60_000) {
+      lastRefetch.current = Date.now();
+      refresh();
+    }
+  });
+}
 
 function useCompanyId(context: PluginPageProps["context"]): string | null {
   return context.companyId;
@@ -43,6 +100,12 @@ export function CliProxyPage({ context }: PluginPageProps) {
   const { data, loading, error, refresh } = usePluginData<PageData>("cliproxy-page", { companyId });
   const resync = usePluginAction("cliproxy-resync");
   const reenable = usePluginAction("cliproxy-reenable");
+  const nowMs = useWorkerNow(data?.generatedAt ?? null);
+  useRefreshOnPassedReset(
+    data?.providers.flatMap((p) => [p.retryAt, p.nextReset]) ?? [],
+    refresh,
+    nowMs,
+  );
 
   if (!companyId) return <div>No company context.</div>;
   if (loading) return <div>Loading CLIProxy provider state…</div>;
@@ -156,7 +219,7 @@ export function CliProxyPage({ context }: PluginPageProps) {
       {data.providers.map((p) => (
         <div key={p.provider} style={{ border: "1px solid #444", borderRadius: 6, padding: 12 }}>
           <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
-            <strong>{p.provider}</strong>
+            <strong title={p.provider !== p.displayName ? p.provider : undefined}>{p.displayName}</strong>
             <StateBadge state={p.state} />
             <FreshnessBadge freshness={p.freshness} />
             {p.waitResumeOff && <span>wait/resume off: inventory not confirmed complete</span>}
@@ -165,12 +228,24 @@ export function CliProxyPage({ context }: PluginPageProps) {
             connection {p.connectionId} · completeInventory {p.completeInventory ? "confirmed" : "not confirmed"} ·{" "}
             {p.enabledAccounts} enabled account{p.enabledAccounts === 1 ? "" : "s"}
             {p.headroomAccounts > 0 ? `, ${p.headroomAccounts} with headroom` : ""}
-            {p.retryAt ? ` · retry ${p.retryAt} (${p.retryIn})` : ""}
+            {p.retryAt ? (
+              <span title={p.retryAt}> · retry {p.retryAt} ({formatCountdown(p.retryAt, nowMs)})</span>
+            ) : (
+              ""
+            )}
           </div>
           <div>
             {p.models.length > 0 ? (
               <span>
-                Proven models ({p.models.length}): <code>{p.models.join(", ")}</code>
+                Proven models ({p.models.length}):{" "}
+                {p.models.map((m, i) => (
+                  <span key={m}>
+                    {i > 0 && ", "}
+                    <code title={p.modelNames[m] && p.modelNames[m] !== m ? m : undefined}>
+                      {p.modelNames[m] ?? m}
+                    </code>
+                  </span>
+                ))}
               </span>
             ) : (
               <span>No proven models yet — unknown until the model catalog confirms them.</span>
@@ -183,18 +258,27 @@ export function CliProxyPage({ context }: PluginPageProps) {
               <ul>
                 {p.accounts.map((a) => (
                   <li key={a.key}>
-                    <code>{a.key}</code> · {a.status}
+                    <code title={a.displayLabel ?? undefined}>{a.displayLabel ?? a.maskedLabel}</code> · {a.status}
+                    {a.needsSignIn && (
+                      <span style={{ background: "#78350f", color: "#fde68a", borderRadius: 4, padding: "1px 6px", fontSize: 12 }}>
+                        {" "}needs sign-in{a.needsSignInHint ? `: ${a.needsSignInHint}` : ""}
+                      </span>
+                    )}
                     {a.statusMessage ? ` — ${a.statusMessage}` : ""}
                     {a.planType ? ` · plan ${a.planType}` : ""}
                     {a.priority !== null ? ` · priority ${a.priority}` : ""} · checked {a.checkedAt}
-                    {a.quotaBlind && " · quota-blind"}
-                    {a.coolingDown && ` · cooling down${a.cooldownUntil ? ` until ${a.cooldownUntil}` : ""}`}
+                    {a.quotaBlind && ` · quota-blind${a.quotaBlindReason ? `: ${a.quotaBlindReason}` : ""}`}
+                    {a.coolingDown && (
+                      <span title={a.cooldownUntil ?? undefined}>
+                        {` · cooling down${a.cooldownUntil ? ` until ${a.cooldownUntil} (${formatCountdown(a.cooldownUntil, nowMs)})` : ""}`}
+                      </span>
+                    )}
                     {a.limits.length > 0 && (
                       <ul>
                         {a.limits.map((l) => (
-                          <li key={l.id}>
+                          <li key={l.id} title={l.resetsAt ?? undefined}>
                             {l.label}: {l.remainingPercent ?? "?"}% remaining
-                            {l.resetsAt ? ` · resets ${l.resetsAt} (${l.resetIn})` : " · no reset known"}
+                            {l.resetsAt ? ` · resets ${l.resetsAt} (${formatCountdown(l.resetsAt, nowMs)})` : " · no reset known"}
                             {!l.gating && " (informational, not gating)"}
                             {l.allowed === false && " · not admitted"}
                             {l.models && l.models.length > 0 && ` · models ${l.models.join(", ")}`}
@@ -262,6 +346,12 @@ export function CliProxyUsagePage({ context }: PluginPageProps) {
   const [blindOnly, setBlindOnly] = useState<boolean>(false);
   const [sortKey, setSortKey] = useState<UsageSortKey>("remaining");
   const [sortDir, setSortDir] = useState<"asc" | "desc">("asc");
+  const nowMs = useWorkerNow(data?.generatedAt ?? null);
+  useRefreshOnPassedReset(
+    data?.providers.flatMap((p) => [p.retryAt, p.nextReset, ...p.accounts.map((a) => a.nextReset)]) ?? [],
+    refresh,
+    nowMs,
+  );
 
   if (!companyId) return <div>No company context.</div>;
   if (loading) return <div>Loading usage &amp; quota…</div>;
@@ -325,8 +415,8 @@ export function CliProxyUsagePage({ context }: PluginPageProps) {
         </button>
       </div>
       {data.earliestReset && (
-        <div>
-          Earliest known reset: {data.earliestReset} ({data.earliestResetIn})
+        <div title={data.earliestReset}>
+          Earliest known reset: {data.earliestReset} ({formatCountdown(data.earliestReset, nowMs)})
         </div>
       )}
       {data.quotaFetchedAt && <div>Quota windows fetched {data.quotaFetchedAt}.</div>}
@@ -357,16 +447,6 @@ export function CliProxyUsagePage({ context }: PluginPageProps) {
           {data.usage.note && <div>{data.usage.note}</div>}
         </div>
       )}
-      <div style={{ border: "1px solid #444", borderRadius: 6, padding: 12 }}>
-        <strong>Lane map</strong>
-        <div style={{ fontSize: 12 }}>{data.laneMap.flag}</div>
-        {data.laneMap.lanes.map((lane) => (
-          <div key={lane.lane}>
-            {lane.lane}: {lane.agents} agents → {lane.provider}/{lane.model}
-          </div>
-        ))}
-        <div>Derived {data.laneMap.derivedAt}.</div>
-      </div>
       <div>
         Native cost views: <a href={data.links.costsUrl}>Costs</a> ·{" "}
         <a href={data.links.budgetsUrl}>Budgets</a>
@@ -374,7 +454,7 @@ export function CliProxyUsagePage({ context }: PluginPageProps) {
       {data.providers.map((p) => (
         <div key={p.provider} style={{ border: "1px solid #444", borderRadius: 6, padding: 12 }}>
           <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
-            <strong>{p.provider}</strong>
+            <strong title={p.provider !== p.displayName ? p.provider : undefined}>{p.displayName}</strong>
             <StateBadge state={p.state} />
             <FreshnessBadge freshness={p.freshness} />
             {p.blindAccounts > 0 && (
@@ -387,11 +467,36 @@ export function CliProxyUsagePage({ context }: PluginPageProps) {
           <div>
             {p.headroomAccounts} of {p.enabledAccounts} enabled account{p.enabledAccounts === 1 ? "" : "s"} with
             headroom
-            {p.nextReset ? ` · earliest known reset ${p.nextReset} (${p.nextResetIn})` : ""}
-            {p.retryAt && p.retryAt !== p.nextReset ? ` · retry ${p.retryAt} (${p.retryIn})` : ""}
+            {p.nextReset ? (
+              <span title={p.nextReset}>
+                {" "}· earliest known reset {p.nextReset} ({formatCountdown(p.nextReset, nowMs)})
+              </span>
+            ) : (
+              ""
+            )}
+            {p.retryAt && p.retryAt !== p.nextReset ? (
+              <span title={p.retryAt}>
+                {" "}· retry {p.retryAt} ({formatCountdown(p.retryAt, nowMs)})
+              </span>
+            ) : (
+              ""
+            )}
             {` · sync ${p.freshness}`}
           </div>
           <div>{p.reason}</div>
+          {p.models.length > 0 && (
+            <div style={{ fontSize: 12 }}>
+              Proven models:{" "}
+              {p.models.map((m, i) => (
+                <span key={m}>
+                  {i > 0 && ", "}
+                  <code title={p.modelNames[m] && p.modelNames[m] !== m ? m : undefined}>
+                    {p.modelNames[m] ?? m}
+                  </code>
+                </span>
+              ))}
+            </div>
+          )}
         </div>
       ))}
       <div>
@@ -438,9 +543,17 @@ export function CliProxyUsagePage({ context }: PluginPageProps) {
         {sorted.map(({ provider, account: a }) => (
           <div key={a.key} style={{ border: "1px solid #333", borderRadius: 6, padding: 10, margin: "6px 0" }}>
             <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
-              <code>{a.maskedLabel}</code>
+              <code title={a.displayLabel ?? undefined}>{a.displayLabel ?? a.maskedLabel}</code>
               <span>{provider}</span>
               <span>{a.status}</span>
+              {a.needsSignIn && (
+                <span
+                  style={{ background: "#78350f", color: "#fde68a", borderRadius: 4, padding: "1px 6px", fontSize: 12 }}
+                  title="Re-authenticate this account in the CLIProxy Management Center (loopback-only; remote hosts may not reach it)."
+                >
+                  needs sign-in{a.needsSignInHint ? `: ${a.needsSignInHint}` : " — see CLIProxy Management Center"}
+                </span>
+              )}
               {a.quotaBlind && (
                 <span
                   style={{ background: "#78350f", color: "#fde68a", borderRadius: 4, padding: "1px 6px", fontSize: 12 }}
@@ -451,14 +564,14 @@ export function CliProxyUsagePage({ context }: PluginPageProps) {
               {a.planType && <span>plan {a.planType}</span>}
               {a.priority !== null && <span>priority {a.priority}</span>}
               {a.coolingDown && (
-                <span>cooling down{a.cooldownUntil ? ` until ${a.cooldownUntil}${a.cooldownIn ? ` (${a.cooldownIn})` : ""}` : ""}</span>
+                <span title={a.cooldownUntil ?? undefined}>cooling down{a.cooldownUntil ? ` until ${a.cooldownUntil} (${formatCountdown(a.cooldownUntil, nowMs)})` : ""}</span>
               )}
             </div>
             {a.statusMessage && <div>Note: {a.statusMessage}</div>}
             {a.limits.length === 0 && <div>No quota windows — unknown.</div>}
             {a.limits.map((l) => (
-              <div key={l.id}>
-                <WindowBar label={l.label} remaining={l.remainingPercent} resetIn={l.resetIn} />
+              <div key={l.id} title={l.resetsAt ?? undefined}>
+                <WindowBar label={l.label} remaining={l.remainingPercent} resetIn={formatCountdown(l.resetsAt, nowMs)} />
                 {!l.gating && <span style={{ fontSize: 12 }}>(informational, not gating)</span>}
                 {l.viaProviderApi && <span style={{ fontSize: 12 }}> · via provider API</span>}
                 {l.allowed === false && <span style={{ fontSize: 12 }}> · not admitted</span>}

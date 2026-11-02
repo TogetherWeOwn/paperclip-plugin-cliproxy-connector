@@ -2,13 +2,21 @@ import { describe, expect, it } from "vitest";
 import {
   hasAdmissionSignal,
   hashIdentity,
+  isEmailLike,
+  isGatingCooldown,
   isGatingWindow,
+  isModelGatingCooldown,
   normalizeProvider,
+  parseAccountLabel,
   parseAuthFiles,
+  parseCooldowns,
   parseHeaderSignals,
   parseLegacySignalList,
   parsePluginQuota,
+  parseSignInFields,
+  quotaBlindReasonWithExhaustedUntil,
   sanitizeStatusMessage,
+  tokenContainsEmail,
 } from "./parsers.js";
 import { DEFAULT_PROVIDER_WINDOWS } from "./config.js";
 
@@ -498,9 +506,13 @@ describe("parseAuthFiles (redacted fixture)", () => {
       expect(a.key).toMatch(/^acct-[0-9a-f]{16}$/);
     }
     const blob = JSON.stringify(accounts);
-    for (const secret of ["REDACTED-EMAIL", "REDACTED-TOKEN", "REDACTED-LABEL", "REDACTED-PROJECT", "/REDACTED/PATH"]) {
+    // Emails, tokens, project ids and paths never persist. The operator-set
+    // label is intentionally surfaced (scrubbed) as displayLabel — it is
+    // display-only and never a routing key.
+    for (const secret of ["REDACTED-EMAIL", "REDACTED-TOKEN", "REDACTED-PROJECT", "/REDACTED/PATH"]) {
       expect(blob).not.toContain(secret);
     }
+    expect(accounts[0]?.displayLabel).toBe("REDACTED-LABEL");
     expect(warnings).toEqual([]);
   });
 
@@ -927,6 +939,55 @@ describe("parsePluginQuota (lowercase wire shape)", () => {
   });
 });
 
+describe("isEmailLike", () => {
+  it("spots email-shaped strings without a backtracking regex", () => {
+    expect(isEmailLike("user@example.com")).toBe(true);
+    expect(isEmailLike("a@x.test")).toBe(true);
+    expect(isEmailLike("Claude Opus 4.5")).toBe(false);
+    expect(isEmailLike("not an email")).toBe(false);
+    expect(isEmailLike("a@b")).toBe(false);
+    expect(isEmailLike("a@@b.com")).toBe(false);
+    expect(isEmailLike("@x.com")).toBe(false);
+    expect(isEmailLike("")).toBe(false);
+  });
+
+  it("stays linear on adversarial repetition (CodeQL js/polynomial-redos)", () => {
+    const start = Date.now();
+    expect(isEmailLike(`${"%".repeat(10_000)}@example.com`)).toBe(true);
+    expect(isEmailLike(`${"a.".repeat(5_000)}com`)).toBe(false);
+    expect(Date.now() - start).toBeLessThan(1000);
+  });
+});
+
+describe("tokenContainsEmail", () => {
+  it("spots email-shaped pieces glued to other text", () => {
+    for (const tok of [
+      "user@example.com's",
+      "a@x.com,b@y.com",
+      "email=a@b.com&retry",
+      "a@x.test/path",
+      "user@example.com:443",
+      "(user@example.com)",
+    ]) {
+      expect(tokenContainsEmail(tok)).toBe(true);
+    }
+    for (const tok of ["gpt-4o-mini", "claude-3.5-sonnet", "error=429", "2026-11-01T12:00:00Z", "ok"]) {
+      expect(tokenContainsEmail(tok)).toBe(false);
+    }
+  });
+
+  it("stays linear on adversarial repetition (CodeQL js/polynomial-redos)", () => {
+    const start = Date.now();
+    expect(tokenContainsEmail(`${"a".repeat(10_000)}@example.com,`)).toBe(true);
+    expect(tokenContainsEmail("x".repeat(10_000))).toBe(false);
+    // Leading-punctuation flood before an address: the shape that tripped
+    // the old anchored regex trims.
+    expect(tokenContainsEmail(`${"/".repeat(10_000)}a@b.co`)).toBe(true);
+    expect(tokenContainsEmail(`${"(".repeat(10_000)}a@b.co${")".repeat(10_000)}`)).toBe(true);
+    expect(Date.now() - start).toBeLessThan(1000);
+  });
+});
+
 describe("sanitizeStatusMessage", () => {
   it("keeps short operational notes unchanged", () => {
     expect(sanitizeStatusMessage("ok")).toBe("ok");
@@ -940,6 +1001,20 @@ describe("sanitizeStatusMessage", () => {
     expect(scrubbed).not.toContain("abcdefghijklmnopqrstu");
     expect(scrubbed).toContain("[redacted-email]");
     expect(scrubbed).toContain("[redacted]");
+  });
+
+  it("redacts emails glued to other text inside a token", () => {
+    for (const [note, leaked] of [
+      ["contact user@example.com's soon", "example.com"],
+      ["notify a@x.com,b@y.com now", "x.com"],
+      ["retry email=a@b.com&retry later", "a@b.com"],
+      ["see a@x.test/path here", "a@x.test"],
+      ["dial user@example.com:443 now", "example.com"],
+    ] as Array<[string, string]>) {
+      const scrubbed = sanitizeStatusMessage(note) ?? "";
+      expect(scrubbed).toContain("[redacted-email]");
+      expect(scrubbed).not.toContain(leaked);
+    }
   });
 
   it("redacts short credential-like tokens but keeps hyphenated operational words", () => {
@@ -1989,5 +2064,166 @@ describe("parseMetaQuota (panel parseMetaQuotaPayload shape)", () => {
     const blob = JSON.stringify(parsed);
     expect(blob).not.toContain("sk-planted-secret-key");
     expect(blob).not.toContain("someone@example.com");
+  });
+});
+
+describe("Group A: cooldowns[], sign-in badge, account labels", () => {
+  const FUTURE = iso(NOW_MS + 3_600_000);
+  const PAST = iso(NOW_MS - 3_600_000);
+
+  it("quota cooldowns gate until retry_at; unknown and payment_required are display-only", () => {
+    const entry = {
+      cooldowns: [
+        { reason: "quota", retry_at: FUTURE },
+        { reason: "payment_required", retry_at: FUTURE },
+        { reason: "mystery_reason", retry_at: FUTURE },
+        { reason: "quota", retry_at: PAST },
+      ],
+    };
+    const cooldowns = parseCooldowns(entry as never);
+    expect(cooldowns).toHaveLength(4);
+    const [quota, pay, mystery, expired] = cooldowns;
+    expect(isGatingCooldown(quota, NOW_MS)).toBe(true);
+    expect(isGatingCooldown(pay, NOW_MS)).toBe(false);
+    expect(isGatingCooldown(mystery, NOW_MS)).toBe(false);
+    expect(isGatingCooldown(expired, NOW_MS)).toBe(false);
+  });
+
+  it("model-scoped quota cooldowns gate per model via models: [model_key]", () => {
+    const cooldowns = parseCooldowns({
+      cooldowns: [{ scope: "model", model_key: "claude-opus-4-5", reason: "quota", retry_at: FUTURE }],
+    } as never);
+    expect(cooldowns).toHaveLength(1);
+    expect(isModelGatingCooldown(cooldowns[0], NOW_MS)).toBe(true);
+    expect(isGatingCooldown(cooldowns[0], NOW_MS)).toBe(false);
+  });
+
+  it("dated model ids gate model-scoped cooldowns; email-shaped keys do not", () => {
+    const cooldowns = parseCooldowns({
+      cooldowns: [
+        { scope: "model", model_key: "claude-sonnet-4-5-20250929", reason: "quota", retry_at: FUTURE },
+        { scope: "model", model_key: "claude-3-5-sonnet-20241022", reason: "quota", retry_at: FUTURE },
+        { scope: "model", model_key: "user@example.com", reason: "quota", retry_at: FUTURE },
+      ],
+    } as never);
+    expect(cooldowns).toHaveLength(3);
+    const [dated, dotted, email] = cooldowns;
+    expect(dated.modelKey).toBe("claude-sonnet-4-5-20250929");
+    expect(isModelGatingCooldown(dated, NOW_MS)).toBe(true);
+    expect(dotted.modelKey).toBe("claude-3-5-sonnet-20241022");
+    expect(isModelGatingCooldown(dotted, NOW_MS)).toBe(true);
+    expect(email.modelKey).toBeNull();
+    expect(isModelGatingCooldown(email, NOW_MS)).toBe(false);
+  });
+
+  it("credential-shaped model keys never gate and never render in labels", () => {
+    const cooldowns = parseCooldowns({
+      cooldowns: [
+        { scope: "model", model_key: "sk-live-a1b2c3d4", reason: "quota", retry_at: FUTURE },
+        { scope: "model", model_key: "AKIA1234", reason: "quota", retry_at: FUTURE },
+        { scope: "model", model_key: "ab12cd34ef", reason: "quota", retry_at: FUTURE },
+        { scope: "model", model_key: "claude-sonnet-4-5-20250929", reason: "quota", retry_at: FUTURE },
+        { scope: "model", model_key: "claude-3-5-sonnet-20241022", reason: "quota", retry_at: FUTURE },
+      ],
+    } as never);
+    expect(cooldowns).toHaveLength(5);
+    const [sk, akia, short, dated, dotted] = cooldowns;
+    for (const c of [sk, akia, short]) {
+      expect(c.modelKey).toBeNull();
+      expect(isModelGatingCooldown(c, NOW_MS)).toBe(false);
+    }
+    // Dated model ids keep gating beside the rejected credentials.
+    expect(dated.modelKey).toBe("claude-sonnet-4-5-20250929");
+    expect(isModelGatingCooldown(dated, NOW_MS)).toBe(true);
+    expect(dotted.modelKey).toBe("claude-3-5-sonnet-20241022");
+    expect(isModelGatingCooldown(dotted, NOW_MS)).toBe(true);
+    // End to end: no rendered limit id or label carries the secret material.
+    const { accounts } = parseAuthFiles(
+      [
+        {
+          id: "cred-1",
+          provider: "claude",
+          cooldowns: [
+            { scope: "model", model_key: "sk-live-a1b2c3d4", reason: "quota", retry_at: FUTURE },
+            {
+              scope: "model",
+              model_key: "claude-sonnet-4-5-20250929",
+              reason: "quota",
+              retry_at: FUTURE,
+            },
+          ],
+        },
+      ],
+      { now: NOW, allowLists: { claude: ["5h"] } },
+    );
+    expect(accounts).toHaveLength(1);
+    const text = JSON.stringify(accounts[0]?.limits ?? []);
+    expect(text).not.toContain("sk-live-a1b2c3d4");
+    expect(text).toContain("claude-sonnet-4-5-20250929");
+  });
+
+  it("scrubs the full label note and hint before capping: no partial-email leak", () => {
+    expect(
+      parseAccountLabel({ note: "Spare key for the someone.long@example.com" } as never, "claude"),
+    ).toBeNull();
+    const hint = parseSignInFields({
+      requires_sign_in: true,
+      recovery_hint:
+        "please reauthenticate the spare operator account for someone.long@example.com urgently today",
+    } as never);
+    expect(hint.hint ?? "").not.toContain("example.com");
+    expect(hint.hint ?? "").not.toContain("someone.long");
+  });
+
+  it("sign-in fields raise a read-only badge, never a reset", () => {
+    const badge = parseSignInFields({ requires_sign_in: true, recovery_hint: "reauth in console" } as never);
+    expect(badge.needsSignIn).toBe(true);
+    expect(badge.hint).toMatch(/reauth/);
+    const viaAction = parseSignInFields({ next_action: "reauth in console" } as never);
+    expect(viaAction.needsSignIn).toBe(true);
+    const clear = parseSignInFields({ requires_sign_in: false } as never);
+    expect(clear.needsSignIn).toBe(false);
+  });
+
+  it("prefers the operator note, hides emails by default, shows them only on opt-in", () => {
+    expect(parseAccountLabel({ note: "spare key", label: "other", email: "a@x.test" } as never, "claude")).toBe(
+      "spare key",
+    );
+    expect(parseAccountLabel({ email: "a@x.test" } as never, "claude")).toBeNull();
+    expect(
+      parseAccountLabel({ email: "a@x.test" } as never, "claude", { showEmails: true }),
+    ).toBe("a@x.test");
+    // A label that merely repeats the provider word carries no signal.
+    expect(parseAccountLabel({ label: "claude" } as never, "claude")).toBeNull();
+  });
+
+  it("Meta blind reason names the exhausted-until time when a quota cooldown fired", () => {
+    expect(quotaBlindReasonWithExhaustedUntil("meta", FUTURE)).toMatch(/exhausted until/);
+    expect(quotaBlindReasonWithExhaustedUntil("meta", null)).toBeNull();
+  });
+
+  it("a quota cooldown synthesizes a gating window; sign-in reasons do not", () => {
+    function parse(payload: unknown = [], extra: Record<string, unknown> = {}) {
+      return parseAuthFiles(payload, {
+        now: NOW,
+        allowLists: { claude: ["5h"] },
+        ...extra,
+      });
+    }
+    const { accounts } = parse([
+      {
+        id: "cool-1",
+        provider: "claude",
+        cooldowns: [
+          { reason: "quota", retry_at: FUTURE },
+          { reason: "invalid_grant", retry_at: FUTURE },
+        ],
+      },
+    ]);
+    expect(accounts).toHaveLength(1);
+    const gating = (accounts[0]?.limits ?? []).filter((l) => l.gating);
+    expect(gating.map((l) => l.id)).toContain("claude:quota-cooldown");
+    expect(accounts[0]?.needsSignIn).toBe(true);
+    expect(accounts[0]?.cooldownExhaustedUntil).toBe(FUTURE);
   });
 });
