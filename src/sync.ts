@@ -27,7 +27,7 @@ import {
   CliproxyNotFoundError,
   type ManagementFetch,
 } from "./cliproxy.js";
-import type { ConnectorConfig, ProviderEntry } from "./config.js";
+import { AUTH_FILE_REF_PREFIX, type ConnectorConfig, type ProviderEntry } from "./config.js";
 import {
   deriveProviderModels,
   observedModelKeysByProvider,
@@ -38,11 +38,41 @@ import { hashIdentity, parseAuthFiles, type ParsedAccount } from "./parsers.js";
 import type {
   AccountUsageRow,
   DriftFinding,
+  DriftLedger,
+  DriftLedgerEntry,
   ModelOverlap,
   StrikeBudgetState,
   SyncFailure,
   SyncSummary,
 } from "./types.js";
+
+/**
+ * Stable activity keys. The host stores the plugin `message` verbatim in the
+ * activity `action` column, so the message is a short stable key and the human
+ * sentence rides in `metadata.summary` with structured fields alongside.
+ */
+export const ACTIVITY_DRIFT_DETECTED = "cliproxy_connector.drift_detected";
+export const ACTIVITY_DRIFT_CLEARED = "cliproxy_connector.drift_cleared";
+export const ACTIVITY_DRIFT_REMINDER = "cliproxy_connector.drift_reminder";
+export const ACTIVITY_SYNC_FAILED = "cliproxy_connector.sync_failed";
+export const ACTIVITY_SYNC_RECOVERED = "cliproxy_connector.sync_recovered";
+export const ACTIVITY_STRIKE_REENABLED = "cliproxy_connector.strike_reenabled";
+
+/**
+ * At most one reminder row per drift finding (or per persisting failure) per
+ * 24 h while it stays present. New findings, cleared findings, new failure
+ * signatures and recoveries always log exactly once.
+ */
+export const ACTIVITY_REMINDER_INTERVAL_MS = 24 * 60 * 60_000;
+
+/**
+ * Stable ledger key for a drift finding: `kind + provider + detail`. Details
+ * are count-free and stable, so the key survives across syncs until the
+ * finding genuinely appears or disappears.
+ */
+export function driftKeyFor(finding: Pick<DriftFinding, "kind" | "provider" | "detail">): string {
+  return `${finding.kind}:${finding.provider}:${finding.detail}`;
+}
 
 export const STRIKE_WINDOW_MS = 30 * 60_000;
 export const STRIKE_LIMIT = 2;
@@ -138,6 +168,11 @@ export interface SyncDeps {
    * next retry.
    */
   recordFailure: (failure: SyncFailure | null) => Promise<void>;
+  /** Latest recorded sync failure, for failure dedupe and recovery logging. */
+  loadFailure: () => Promise<SyncFailure | null>;
+  /** Drift ledger for state-change activity logging. */
+  loadDriftLedger: () => Promise<DriftLedger>;
+  saveDriftLedger: (ledger: DriftLedger) => Promise<void>;
   logActivity: (message: string, metadata?: Record<string, unknown>) => Promise<void>;
   /**
    * Last provider-API call time per CLIProxy origin + credential `auth_index`
@@ -164,6 +199,7 @@ function summary(
     accountsSeen: 0,
     rowsWritten: 0,
     drift: [],
+    acceptedDrift: [],
     errors: [],
     ...partial,
     startedAt,
@@ -238,14 +274,12 @@ export async function runSync(deps: SyncDeps, inFlight: { running: boolean }): P
       key = await deps.resolveSecret(deps.config.managementSecretRef);
     } catch (err) {
       const message = `could not resolve the CLIProxy management secret: ${err instanceof Error ? err.message : "unknown error"}`;
-      await deps.recordFailure({ attemptedAt: startedAt, message });
-      await deps.logActivity(`cliproxy-connector: ${message}`, { companyId: deps.companyId });
+      await logSyncFailure(deps, { kind: "secret-unresolvable", message });
       return finish({ skipped: true, skipReason: message, errors: [message] });
     }
     if (!key) {
       const message = "CLIProxy management secret resolved empty; refusing to probe without a key.";
-      await deps.recordFailure({ attemptedAt: startedAt, message });
-      await deps.logActivity(`cliproxy-connector: ${message}`, { companyId: deps.companyId });
+      await logSyncFailure(deps, { kind: "secret-empty", message });
       return finish({ skipped: true, skipReason: message, errors: [message] });
     }
 
@@ -451,7 +485,11 @@ export async function runSync(deps: SyncDeps, inFlight: { running: boolean }): P
         if (!byKey.has(a.key)) byKey.set(a.key, a);
       }
 
-      const { rows, drift } = accountsToRows(byKey, deps.config.providers, unkeyed);
+      const {
+        rows,
+        drift,
+        accepted: acceptedDrift,
+      } = accountsToRows(byKey, deps.config.providers, unkeyed, deps.config.ignoredProviders);
 
       // Per-credential live served sets (best-effort): one pinned
       // `GET auth-files/models?name=<file>` per enabled auth file, grouped by
@@ -463,9 +501,15 @@ export async function runSync(deps: SyncDeps, inFlight: { running: boolean }): P
       // Refused served-set names are leftover non-account state (retired
       // plugins), not a fetch failure: one quiet drift finding per file and
       // provider, never a per-run sync error. The name check stays as-is.
+      // Findings the operator explicitly accepted stay out of the drift list
+      // (and the activity feed) and are reported as accepted instead.
       for (const r of servedSets.refused) {
+        const hash = r.fileRef.startsWith(AUTH_FILE_REF_PREFIX)
+          ? r.fileRef.slice(AUTH_FILE_REF_PREFIX.length)
+          : r.fileRef;
+        const target = deps.config.ignoredAuthFileRefs.includes(hash) ? acceptedDrift : drift;
         for (const provider of r.providers) {
-          drift.push({
+          target.push({
             kind: "untrusted-auth-file",
             provider,
             detail:
@@ -543,36 +587,46 @@ export async function runSync(deps: SyncDeps, inFlight: { running: boolean }): P
         catalog.available ? derivation.providerModels : undefined;
       const modelOverlaps: ModelOverlap[] | undefined =
         catalog.available ? derivation.overlaps : undefined;
-      for (const d of drift) {
-        await deps.logActivity(`cliproxy-connector drift [${d.kind}] ${d.provider}: ${d.detail}`, {
-          companyId: deps.companyId,
-        });
-      }
+      // State-change logging only: new findings log once, cleared findings log
+      // once, and persistent findings remind at most daily. Accepted findings
+      // never reach the ledger or the feed.
+      const ledger = await reconcileDriftLedger(deps, drift);
+      await deps.saveDriftLedger(ledger);
       const result = finish({
         skipped: false,
         skipReason: null,
         accountsSeen: accounts.length,
         rowsWritten: Object.keys(rows).length,
         drift,
+        acceptedDrift,
         errors,
         providerModels,
         modelOverlaps,
       });
       await deps.saveSync(rows, result);
-      // A success clears the last failure so the page stops showing it.
+      // A success clears the last failure so the page stops showing it — and
+      // logs the recovery exactly once when there was a recorded failure.
+      const prevFailure = await deps.loadFailure();
+      if (prevFailure) {
+        await deps.logActivity(ACTIVITY_SYNC_RECOVERED, {
+          companyId: deps.companyId,
+          summary: `sync recovered (previous failure: ${prevFailure.message})`,
+          failureKind: prevFailure.failureKind ?? "unknown",
+          detail: prevFailure.message,
+        });
+      }
       await deps.recordFailure(null);
       return result;
     } catch (err) {
       if (err instanceof CliproxyAuthError) {
-        return await recordAuthFailure(deps, strike, nowMs, finish, err, startedAt);
+        return await recordAuthFailure(deps, strike, nowMs, finish, err);
       }
       // Non-auth failures (CLIProxy down, schema errors, …) never reached
-      // last-sync and were never logged: the page kept showing the last
-      // successful run. Record the failure under its own key (leaving
-      // `finishedAt` — and the min-interval check — untouched) and log it.
+      // last-sync: record the failure under its own key (leaving `finishedAt`
+      // — and the min-interval check — untouched) and log it deduped, so the
+      // page shows the failure instead of a stale "last successful run".
       const message = `sync failed: ${err instanceof Error ? err.message : "unknown error"}`;
-      await deps.recordFailure({ attemptedAt: startedAt, message });
-      await deps.logActivity(`cliproxy-connector: ${message}`, { companyId: deps.companyId });
+      await logSyncFailure(deps, { kind: "sync-error", message });
       return finish({ skipped: true, skipReason: message, errors: [message] });
     } finally {
       // Drop the only in-memory reference to resolved key material.
@@ -787,10 +841,13 @@ export function accountsToRows(
   byKey: Map<string, ParsedAccount>,
   providers: ProviderEntry[],
   unkeyed: number,
-): { rows: Record<string, AccountUsageRow>; drift: DriftFinding[] } {
+  ignoredProviders: readonly string[] = [],
+): { rows: Record<string, AccountUsageRow>; drift: DriftFinding[]; accepted: DriftFinding[] } {
   const rows: Record<string, AccountUsageRow> = {};
   const drift: DriftFinding[] = [];
+  const accepted: DriftFinding[] = [];
   const configured = new Map(providers.map((p) => [p.provider, p]));
+  const ignored = new Set(ignoredProviders.map((p) => p.toLowerCase()));
   const enabledByProvider = new Map<string, number>();
   const discovered = new Set<string>();
 
@@ -824,7 +881,10 @@ export function accountsToRows(
   }
   for (const provider of [...discovered].sort()) {
     if (!configured.has(provider)) {
-      drift.push({
+      // Findings the operator explicitly accepted never alert: they are
+      // reported as accepted (page) instead of drift (feed).
+      const target = ignored.has(provider.toLowerCase()) ? accepted : drift;
+      target.push({
         kind: "unconfigured-provider",
         provider,
         detail: `CLIProxy reports ${provider} accounts but no providers[] row maps it to a connection; the router cannot trust quota for ${provider} and treats it as unknown.`,
@@ -840,7 +900,130 @@ export function accountsToRows(
       });
     }
   }
-  return { rows, drift };
+  return { rows, drift, accepted };
+}
+
+/**
+ * Reconcile the current drift findings against the persisted ledger and log
+ * exactly the state changes: one `drift_detected` per new key, one
+ * `drift_cleared` per vanished key, and at most one `drift_reminder` per
+ * 24 h per key that stays present. Findings that only became accepted (via a
+ * config edit) leave the ledger silently — they did not clear, they were
+ * accepted. Returns the updated ledger for the caller to persist.
+ *
+ * First run after upgrade logs one `drift_detected` per existing finding (the
+ * ledger starts empty): a one-time burst, then silence until something
+ * changes.
+ */
+export async function reconcileDriftLedger(
+  deps: Pick<SyncDeps, "now" | "companyId" | "logActivity" | "loadDriftLedger">,
+  drift: DriftFinding[],
+): Promise<DriftLedger> {
+  const nowMs = Date.parse(deps.now);
+  const ledger = await deps.loadDriftLedger();
+  const current = new Set(drift.map(driftKeyFor));
+  for (const finding of drift) {
+    const key = driftKeyFor(finding);
+    const entry = ledger[key];
+    if (!entry) {
+      const next: DriftLedgerEntry = {
+        kind: finding.kind,
+        provider: finding.provider,
+        detail: finding.detail,
+        firstSeenAt: deps.now,
+        lastSeenAt: deps.now,
+        lastLoggedAt: deps.now,
+      };
+      ledger[key] = next;
+      await deps.logActivity(ACTIVITY_DRIFT_DETECTED, {
+        companyId: deps.companyId,
+        summary: `drift detected [${finding.kind}] ${finding.provider}: ${finding.detail}`,
+        kind: finding.kind,
+        provider: finding.provider,
+        detail: finding.detail,
+        driftKey: key,
+      });
+      continue;
+    }
+    entry.lastSeenAt = deps.now;
+    const lastLoggedMs = Date.parse(entry.lastLoggedAt);
+    if (Number.isNaN(lastLoggedMs) || nowMs - lastLoggedMs >= ACTIVITY_REMINDER_INTERVAL_MS) {
+      entry.lastLoggedAt = deps.now;
+      await deps.logActivity(ACTIVITY_DRIFT_REMINDER, {
+        companyId: deps.companyId,
+        summary:
+          `drift still present [${finding.kind}] ${finding.provider}: ${finding.detail} ` +
+          `(first seen ${entry.firstSeenAt})`,
+        kind: finding.kind,
+        provider: finding.provider,
+        detail: finding.detail,
+        driftKey: key,
+        firstSeenAt: entry.firstSeenAt,
+      });
+    }
+  }
+  for (const key of Object.keys(ledger)) {
+    if (current.has(key)) continue;
+    const entry = ledger[key] as DriftLedgerEntry;
+    delete ledger[key];
+    await deps.logActivity(ACTIVITY_DRIFT_CLEARED, {
+      companyId: deps.companyId,
+      summary: `drift cleared [${entry.kind}] ${entry.provider}: ${entry.detail}`,
+      kind: entry.kind,
+      provider: entry.provider,
+      detail: entry.detail,
+      driftKey: key,
+      firstSeenAt: entry.firstSeenAt,
+    });
+  }
+  return ledger;
+}
+
+/**
+ * Log a sync failure under the stable `sync_failed` key, deduped by failure
+ * signature (kind + message): the first occurrence logs once, an identical
+ * failure persisting across runs only refreshes the recorded attempt, with at
+ * most one reminder row per 24 h. A changed message (or kind) is a new failure
+ * and logs anew — e.g. the escalation from first rejection to hard-disable.
+ */
+export async function logSyncFailure(
+  deps: Pick<SyncDeps, "now" | "companyId" | "logActivity" | "loadFailure" | "recordFailure">,
+  failure: { kind: string; message: string },
+): Promise<void> {
+  const nowMs = Date.parse(deps.now);
+  const prev = await deps.loadFailure();
+  if (prev && prev.failureKind === failure.kind && prev.message === failure.message) {
+    const lastLoggedMs = Date.parse(prev.lastLoggedAt ?? prev.attemptedAt);
+    const reminderDue =
+      Number.isNaN(lastLoggedMs) || nowMs - lastLoggedMs >= ACTIVITY_REMINDER_INTERVAL_MS;
+    await deps.recordFailure({
+      ...prev,
+      attemptedAt: deps.now,
+      lastLoggedAt: reminderDue ? deps.now : (prev.lastLoggedAt ?? prev.attemptedAt),
+    });
+    if (reminderDue) {
+      await deps.logActivity(ACTIVITY_SYNC_FAILED, {
+        companyId: deps.companyId,
+        summary: failure.message,
+        failureKind: failure.kind,
+        detail: failure.message,
+        reminder: true,
+      });
+    }
+    return;
+  }
+  await deps.recordFailure({
+    attemptedAt: deps.now,
+    message: failure.message,
+    failureKind: failure.kind,
+    lastLoggedAt: deps.now,
+  });
+  await deps.logActivity(ACTIVITY_SYNC_FAILED, {
+    companyId: deps.companyId,
+    summary: failure.message,
+    failureKind: failure.kind,
+    detail: failure.message,
+  });
 }
 
 async function recordAuthFailure(
@@ -849,7 +1032,6 @@ async function recordAuthFailure(
   nowMs: number,
   finish: (p: Partial<SyncSummary> & { skipped: boolean; skipReason: string | null }) => SyncSummary,
   err: CliproxyAuthError,
-  startedAt: string,
 ): Promise<SyncSummary> {
   const failures = pruneFailures([...strike.failures, new Date(nowMs).toISOString()], nowMs);
   const overBudget = failures.length >= STRIKE_LIMIT;
@@ -869,8 +1051,7 @@ async function recordAuthFailure(
   // Auth failures are already surfaced via the strike block, but the page's
   // sync section should name the latest failure too (same key, same rule:
   // `last-sync.finishedAt` stays untouched).
-  await deps.recordFailure({ attemptedAt: startedAt, message: setupError });
-  await deps.logActivity(`cliproxy-connector setup error: ${setupError}`, { companyId: deps.companyId });
+  await logSyncFailure(deps, { kind: "auth-rejected", message: setupError });
   return finish({ skipped: true, skipReason: setupError, errors: [setupError] });
 }
 

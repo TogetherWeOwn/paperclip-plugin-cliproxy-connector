@@ -109,6 +109,35 @@ describe("page data (per-provider)", () => {
     expect(page.earliestReset).toBeNull();
   });
 
+  it("surfaces accepted findings as accepted, not as drift", () => {
+    const page = buildPageData({
+      now: NOW,
+      config: testConfig(),
+      rows: {},
+      lastSync: {
+        ...LAST_SYNC,
+        drift: [{ kind: "unconfigured-provider", provider: "kimi", detail: "no row for kimi" }],
+        acceptedDrift: [
+          { kind: "unconfigured-provider", provider: "openrouter", detail: "accepted row" },
+        ],
+      },
+      strike: emptyStrikeBudget(),
+    });
+    expect(page.drift.map((d) => d.provider)).toEqual(["kimi"]);
+    expect(page.accepted.map((d) => d.provider)).toEqual(["openrouter"]);
+  });
+
+  it("defaults accepted to empty on summaries written before the ignore config", () => {
+    const page = buildPageData({
+      now: NOW,
+      config: testConfig(),
+      rows: {},
+      lastSync: LAST_SYNC,
+      strike: emptyStrikeBudget(),
+    });
+    expect(page.accepted).toEqual([]);
+  });
+
   it("surfaces proven models, overlaps, and the catalog note", () => {
     const page = buildPageData({
       now: NOW,

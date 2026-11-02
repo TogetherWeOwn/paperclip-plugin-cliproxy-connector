@@ -140,6 +140,19 @@ export function CliProxyPage({ context }: PluginPageProps) {
           </ul>
         </div>
       )}
+      {data.accepted.length > 0 && (
+        <div>
+          <strong>Accepted findings ({data.accepted.length})</strong> — explicitly accepted in
+          config, not alerted:
+          <ul>
+            {data.accepted.map((d, i) => (
+              <li key={i}>
+                [{d.kind}] {d.provider}: {d.detail}
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
       {data.providers.map((p) => (
         <div key={p.provider} style={{ border: "1px solid #444", borderRadius: 6, padding: 12 }}>
           <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
