@@ -401,7 +401,7 @@ describe("usage page data", () => {
       rows: { "acct-bbb": withoutReason },
       lastSync: LAST_SYNC,
     });
-    expect(usage.providers[0]?.blindReason).toBe("panel-only (needs the downloaded auth file)");
+    expect(usage.providers[0]?.blindReason).toBe("Meta live read unavailable (see sync warnings)");
   });
 
   it("ignores spent window resets when selecting the next known reset", () => {

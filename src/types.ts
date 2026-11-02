@@ -50,9 +50,10 @@ export interface UsageLimitRow {
   models?: string[] | null;
   /**
    * True when this window came from a live provider API call through the
-   * pinned `POST /v0/management/api-call` templates (Meta,
-   * Antigravity, Devin) rather than passive `auth-files` signals or a plugin
-   * quota route. Display only — the router gates on `gating` either way; the
+   * pinned `POST /v0/management/api-call` shapes (frozen templates for
+   * Antigravity and Devin, the dedicated download + literal-header key call
+   * for Meta) rather than passive `auth-files` signals or a plugin quota
+   * route. Display only — the router gates on `gating` either way; the
    * "Usage & quota" page labels these windows "via provider API".
    */
   viaProviderApi?: boolean | null;

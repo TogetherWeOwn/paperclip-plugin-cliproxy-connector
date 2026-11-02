@@ -3,6 +3,7 @@ import {
   effectiveReservePercent,
   isLiveQuotaEnabled,
   isLoopbackUrl,
+  isMetaQuotaEnabled,
   parseConfig,
   stripTrailingSlashes,
 } from "./config.js";
@@ -122,6 +123,45 @@ describe("apiCallEnabled kill switch", () => {
     expect(padded.validation.ok).toBe(true);
     expect(padded.config.apiCallEnabled).toEqual({ antigravity: false });
     expect(isLiveQuotaEnabled(padded.config, "antigravity")).toBe(false);
+  });
+});
+
+describe("metaQuota toggle (Meta download + key call)", () => {
+  it("defaults enabled so Meta live quota runs out of the box", () => {
+    const { config, validation } = parseConfig(base({ providers: [] }));
+    expect(validation.ok).toBe(true);
+    expect(config.metaQuota).toEqual({ enabled: true });
+    expect(isMetaQuotaEnabled(config)).toBe(true);
+  });
+
+  it("accepts an explicit false and then Meta live quota stays off", () => {
+    const off = parseConfig(base({ providers: [], metaQuota: { enabled: false } }));
+    expect(off.validation.ok).toBe(true);
+    expect(off.config.metaQuota).toEqual({ enabled: false });
+    expect(isMetaQuotaEnabled(off.config)).toBe(false);
+  });
+
+  it("stays off when either switch disagrees (both must agree)", () => {
+    // metaQuota on but the family kill switch off: off wins.
+    const killed = parseConfig(
+      base({ providers: [], metaQuota: { enabled: true }, apiCallEnabled: { meta: false } }),
+    );
+    expect(killed.validation.ok).toBe(true);
+    expect(isMetaQuotaEnabled(killed.config)).toBe(false);
+    // Family kill switch on but metaQuota off: still off.
+    const toggled = parseConfig(
+      base({ providers: [], metaQuota: { enabled: false }, apiCallEnabled: { meta: true } }),
+    );
+    expect(toggled.validation.ok).toBe(true);
+    expect(isMetaQuotaEnabled(toggled.config)).toBe(false);
+  });
+
+  it("rejects non-object and non-boolean shapes loudly", () => {
+    for (const metaQuota of [true, "no", { enabled: "no" }, { enabled: 1 }]) {
+      const bad = parseConfig(base({ providers: [], metaQuota }));
+      expect(bad.validation.ok).toBe(false);
+      expect(bad.validation.errors.some((e) => e.includes("metaQuota"))).toBe(true);
+    }
   });
 });
 

@@ -5,9 +5,10 @@
  * §4 safe path (pinned GET allow-list plus the pinned `api-call` POST
  * templates for Antigravity/Devin — one subscription call per account per
  * sync, plus one winning quota-summary call for Antigravity accounts that
- * carry a project id; Meta is panel-only and never called), groups accounts
- * by provider, and normalises into `AiConnectionUsage`-shaped rows in the
- * plugin's own namespace. No core changes, no fork.
+ * carry a project id — and the dedicated Meta download + literal-header key
+ * call, at most every 45 minutes per account plus manual refresh), groups
+ * accounts by provider, and normalises into `AiConnectionUsage`-shaped rows
+ * in the plugin's own namespace. No core changes, no fork.
  *
  * Security properties (all tested):
  * - the management key is resolved per run and kept in memory only;
@@ -28,9 +29,16 @@ import {
   CliproxyManagementClient,
   CliproxyNotFoundError,
   isSafeApiCallProjectId,
+  readDcaTokenFromAuthFile,
   type ManagementFetch,
 } from "./cliproxy.js";
-import { AUTH_FILE_REF_PREFIX, isLiveQuotaEnabled, type ConnectorConfig, type ProviderEntry } from "./config.js";
+import {
+  AUTH_FILE_REF_PREFIX,
+  isLiveQuotaEnabled,
+  isMetaQuotaEnabled,
+  type ConnectorConfig,
+  type ProviderEntry,
+} from "./config.js";
 import {
   deriveProviderModels,
   observedModelKeysByProvider,
@@ -113,6 +121,26 @@ export const API_CALL_MIN_INTERVAL_MS = 4 * 60_000;
  * immediately instead of inheriting a stale ban.
  */
 export const API_CALL_AUTH_BACKOFF_MS = 60 * 60_000;
+
+/**
+ * Minimum gap between two Meta live-quota reads (download + key call) for
+ * the same CLIProxy origin + credential. The panel only reads this endpoint
+ * on user refresh, never on a poll loop — the connector polls it at most
+ * every 45 minutes per account (mid-point of the required 30–60 minute
+ * band) with the last 2xx answer cached and reused between polls, plus an
+ * explicit manual refresh. The scheduled 5-minute cadence serves the cache
+ * on every run in between, so steady state costs ~32 Meta reads per
+ * account per day, not ~288.
+ */
+export const META_QUOTA_MIN_INTERVAL_MS = 45 * 60_000;
+
+/**
+ * Cache-namespace key for the Meta Muse-key answer inside the shared
+ * `apiCallCache` map (`${accountKey} ${META_API_CACHE_KEY}`). Meta has no
+ * frozen template, so it cannot reuse a template key — this constant keeps
+ * the Meta envelope in its own bucket.
+ */
+export const META_API_CACHE_KEY = "meta-muse-code-key";
 
 /**
  * Last known-good live provider-API answer per CLIProxy origin + credential
@@ -248,6 +276,14 @@ export interface SyncDeps {
    * one quota call per account per sync. In memory only, never persisted.
    */
   apiCallQuotaChoice?: Map<string, string>;
+  /**
+   * Manual-refresh bypass for the Meta quota throttle only (the board resync
+   * action sets it): a forced run re-reads every Meta account even inside
+   * `META_QUOTA_MIN_INTERVAL_MS`. Scheduled runs leave it unset and serve
+   * the cache between polls. The upstream-auth backoff is never bypassed — a
+   * backed-off account still waits out its hour.
+   */
+  forceMetaRefresh?: boolean;
 }
 
 function summary(
@@ -456,26 +492,30 @@ export async function runSync(deps: SyncDeps, inFlight: { running: boolean }): P
 
       // Live provider-API quota: pinned `POST /v0/management/api-call`
       // calls for the enabled, configured antigravity/devin accounts — the
-      // families with templates. Meta accounts are never called (no template
-      // exists: the pinned request could not authenticate — Meta stays
-      // panel-only) and count toward one summary warning. The template comes
-      // from an exact allow-map on the auth file's raw provider word, never
-      // from fuzzy matching: a `gemini` account must not send its credential
-      // through the Antigravity request. Disabled accounts are never called;
-      // cooling accounts keep their cooldown (no probe while the provider
-      // says wait); one subscription round per index per sync bounds the rate
-      // to the sync cadence (every 5 min), and the per-credential throttle
-      // below holds that bound across back-to-back resyncs. Antigravity
-      // accounts with a project id add a quota-summary round (remembered
-      // winning URL first, so usually one extra call). Raw envelopes ride
-      // along by `auth_index` and attach to their own account row at parse
-      // time. An UPSTREAM 401/403 backs the account off for an hour (one
-      // warning, no per-sync retry — a bad endpoint must never poll every 5
-      // minutes); other failed calls warn per file and stay quota-blind; only
-      // a rejected key (management 401/403) stops the run.
+      // families with templates — plus the dedicated Meta download + key
+      // call per Meta account (auth-file download, `dca_token` extraction,
+      // literal-header `muse-code/key`; see the block below). The template
+      // comes from an exact allow-map on the auth file's raw provider word,
+      // never from fuzzy matching: a `gemini` account must not send its
+      // credential through the Antigravity request. Disabled accounts are
+      // never called; cooling accounts keep their cooldown (no probe while
+      // the provider says wait); one subscription round per index per sync
+      // bounds the rate to the sync cadence (every 5 min), and the
+      // per-credential throttle below holds that bound across back-to-back
+      // resyncs. Meta polls at most every 45 minutes per account (plus
+      // manual refresh) with the last 2xx answer cached between polls.
+      // Antigravity accounts with a project id add a quota-summary round
+      // (remembered winning URL first, so usually one extra call). Raw
+      // envelopes ride along by `auth_index` and attach to their own
+      // account row at parse time. An UPSTREAM 401/403 backs the account off
+      // for an hour (one warning, no per-sync retry — a bad endpoint must
+      // never poll every 5 minutes); other failed calls warn per file and
+      // stay quota-blind; only a rejected key (management 401/403) stops
+      // the run.
       const apiCallPayloadByAuthIndex = new Map<string, { statusCode: number; body: unknown; observedAt: string }>();
       const apiCallQuotaPayloadByAuthIndex = new Map<string, { statusCode: number; body: unknown; observedAt: string }>();
       const fetchedApiCallIndexes = new Set<string>();
+      const fetchedMetaIndexes = new Set<string>();
       const apiOrigin = apiCallOriginKey(deps.config.cliproxyBaseUrl);
       const configuredProviders = new Set(deps.config.providers.map((p) => p.provider));
       // Auth indexes are opaque tokens, but never persist one raw in a
@@ -484,15 +524,180 @@ export async function runSync(deps: SyncDeps, inFlight: { running: boolean }): P
       // the value, so the scrub below is defense-in-depth.
       const apiFileRef = (authIndex: string) =>
         `auth ${hashIdentity([authIndex])?.slice(0, 8) ?? "unknown"}`;
-      let metaSkipped = 0;
+      let metaQuotaDisabled = 0;
       let liveQuotaDisabled = 0;
+      // Arms the per-account upstream-auth backoff and warns once. The
+      // 401/403 payload is deliberately NOT attached: the parser would warn
+      // a second time for the same event, and the backoff owns this episode.
+      // Parameterized (not a loop-variable closure) so both the template
+      // rounds and the Meta download + key call below share it.
+      const backOffAccount = (provider: string, fileRef: string, key: string, status: number) => {
+        deps.apiCallAuthBackoffUntil?.set(key, nowMs + API_CALL_AUTH_BACKOFF_MS);
+        deps.apiCallLastCall?.set(key, nowMs);
+        pluginErrors.push(
+          `${provider} (provider API, ${fileRef}): ` +
+            `provider API returned upstream HTTP ${status}; backing off for 1 hour (no live quota until then).`,
+        );
+      };
       for (const a of discovered.accounts) {
         if (a.status === "disabled" || a.status === "cooling") continue;
         if (!a.authIndex || !configuredProviders.has(a.provider)) continue;
-        // Meta is panel-only: no template can authenticate, so calling would
-        // only ever return an upstream 401. Count and skip without a call.
+        // Meta live quota (panel-equivalent, stock only): download the
+        // account's auth file, extract its `dca_token`, and call
+        // `muse-code/key` with a literal bearer — the same read the
+        // Management Center panel makes. The token lives in memory for that
+        // one call only and the downloaded body is dropped right after
+        // extraction; neither is ever logged, persisted, or attached to
+        // activity, metrics, errors, plugin state or UI payloads. Polls run
+        // at most every 45 minutes per account (plus manual refresh) with
+        // the last 2xx answer cached between polls; an upstream 401/403
+        // parks the account for an hour like every other family.
         if (a.provider === "meta") {
-          metaSkipped += 1;
+          // Either switch off disables the download and the key call for
+          // the whole Meta family; the account stays on passive signals.
+          if (!isMetaQuotaEnabled(deps.config)) {
+            metaQuotaDisabled += 1;
+            continue;
+          }
+          const authIndex: string = a.authIndex;
+          if (!a.fileName) {
+            pluginErrors.push(
+              `meta (provider API, ${apiFileRef(authIndex)}): ` +
+                `auth-files entry carries no file name; live Meta quota unavailable.`,
+            );
+            continue;
+          }
+          // Cross-run per-credential throttle, keyed by origin + index like
+          // every other family. The Meta interval is 45 minutes, not 4: the
+          // panel only reads this endpoint on user refresh, never on poll.
+          const metaAccountKey = `${apiOrigin} ${authIndex}`;
+          const backoffUntil = deps.apiCallAuthBackoffUntil?.get(metaAccountKey);
+          if (backoffUntil !== undefined) {
+            if (backoffUntil > nowMs) continue;
+            deps.apiCallAuthBackoffUntil?.delete(metaAccountKey);
+          }
+          // One download + key call per credential per run: distinct
+          // auth-files rows can share an `auth_index`, and a forced refresh
+          // bypasses the throttle below — without this set one resync would
+          // hit the provider twice for the same credential. The single
+          // envelope attaches to every row by `auth_index` at parse time, so
+          // skipping here loses no row (mirrors fetchedApiCallIndexes in the
+          // template branch). The index is marked only once its file has
+          // downloaded AND yielded a token (below): a failed download or a
+          // token-less file must not block a later row naming a usable file
+          // for the same credential.
+          if (fetchedMetaIndexes.has(authIndex)) continue;
+          const lastCall = deps.apiCallLastCall?.get(metaAccountKey);
+          if (
+            deps.forceMetaRefresh !== true &&
+            lastCall !== undefined &&
+            nowMs - lastCall < META_QUOTA_MIN_INTERVAL_MS
+          ) {
+            // Throttled: reuse the last known-good answer with its original
+            // observation time instead of blanking this run's live windows.
+            // A missing cache (never fetched, or the last fetch failed)
+            // leaves the account unknown this run — never headroom.
+            const cached = deps.apiCallCache?.get(`${metaAccountKey} ${META_API_CACHE_KEY}`);
+            if (cached !== undefined) {
+              apiCallPayloadByAuthIndex.set(authIndex, {
+                statusCode: cached.statusCode,
+                body: cached.body,
+                observedAt: cached.observedAt,
+              });
+            }
+            continue;
+          }
+          let dcaToken = "";
+          try {
+            let authText: string;
+            try {
+              authText = await client.getAuthFileText(a.fileName);
+            } catch (err) {
+              if (err instanceof CliproxyAuthError) throw err; // stop after first rejected key
+              // No throttle stamp here: the failure names this row's file, not
+              // the credential, so a later row sharing the auth_index must still
+              // get to try its own file below. Only an actual key-call attempt
+              // consumes the credential's 45-minute budget (set below). The
+              // message quotes nothing from the file: the client reports
+              // pathnames only, and the scrub below is defense-in-depth.
+              const rawMessage = err instanceof Error ? err.message : "fetch failed";
+              const safeMessage = rawMessage.split(authIndex).join(apiFileRef(authIndex));
+              pluginErrors.push(
+                `meta (provider API, ${apiFileRef(authIndex)}): ` +
+                  `auth-file download failed (${safeMessage}); live Meta quota unavailable.`,
+              );
+              continue;
+            }
+            try {
+              dcaToken = readDcaTokenFromAuthFile(authText);
+            } catch (err) {
+              if (err instanceof CliproxyAuthError) throw err; // stop after first rejected key
+              // No throttle stamp here either: a token-less file says nothing
+              // about the credential, so a later row sharing the auth_index
+              // must still get to try its own file below. The message is a
+              // fixed literal: nothing from the file is ever quoted into a
+              // warning.
+              pluginErrors.push(
+                `meta (provider API, ${apiFileRef(authIndex)}): ` +
+                  `auth-file download carries no usable dca_token; live Meta quota unavailable.`,
+              );
+              continue;
+            } finally {
+              // The downloaded body is dropped the moment the token is out.
+              authText = "";
+            }
+            // The credential is now in hand: one key call per index from here
+            // on, so later rows sharing it reuse this run's envelope at parse
+            // time instead of hitting the provider again.
+            fetchedMetaIndexes.add(authIndex);
+            let result;
+            try {
+              result = await client.postMetaMuseCodeKey(authIndex, dcaToken);
+            } catch (err) {
+              if (err instanceof CliproxyAuthError) throw err; // stop after first rejected key
+              deps.apiCallLastCall?.set(metaAccountKey, nowMs);
+              const rawMessage = err instanceof Error ? err.message : "fetch failed";
+              // The client already scrubs the bearer out of its own errors;
+              // the split/join here keeps the account index (an opaque
+              // token) and the bearer out of the persisted warning either
+              // way. Both scrub from the same message so neither can leak
+              // through the other.
+              const safeMessage = rawMessage
+                .split(authIndex)
+                .join(apiFileRef(authIndex))
+                .split(dcaToken)
+                .join(apiFileRef(authIndex));
+              pluginErrors.push(
+                `meta (provider API, ${apiFileRef(authIndex)}): ` +
+                  `${safeMessage}; live Meta quota unavailable.`,
+              );
+              continue;
+            } finally {
+              // The bearer lives in memory for the one call above only.
+              dcaToken = "";
+            }
+            deps.apiCallLastCall?.set(metaAccountKey, nowMs);
+            const observedAt = deps.now;
+            if (result.statusCode === 401 || result.statusCode === 403) {
+              backOffAccount("meta", apiFileRef(authIndex), metaAccountKey, result.statusCode);
+              continue;
+            }
+            if (result.statusCode >= 200 && result.statusCode < 300) {
+              deps.apiCallCache?.set(`${metaAccountKey} ${META_API_CACHE_KEY}`, {
+                statusCode: result.statusCode,
+                body: result.body,
+                observedAt,
+              });
+            }
+            apiCallPayloadByAuthIndex.set(authIndex, {
+              statusCode: result.statusCode,
+              body: result.body,
+              observedAt,
+            });
+          } finally {
+            // Belt and braces: no exit path above may retain the bearer.
+            dcaToken = "";
+          }
           continue;
         }
         const templateKey = apiCallTemplateKeyForProvider(a.provider);
@@ -553,23 +758,12 @@ export async function runSync(deps: SyncDeps, inFlight: { running: boolean }): P
           }
           continue;
         }
-        // Arms the per-account upstream-auth backoff and warns once. The
-        // 401/403 payload is deliberately NOT attached: the parser would warn
-        // a second time for the same event, and the backoff owns this episode.
-        const backOffAccount = (status: number) => {
-          deps.apiCallAuthBackoffUntil?.set(accountKey, nowMs + API_CALL_AUTH_BACKOFF_MS);
-          deps.apiCallLastCall?.set(accountKey, nowMs);
-          pluginErrors.push(
-            `${a.provider} (provider API, ${apiFileRef(authIndex)}): ` +
-              `provider API returned upstream HTTP ${status}; backing off for 1 hour (no live quota until then).`,
-          );
-        };
         try {
           const result = await client.postApiCall(templateKey, authIndex);
           deps.apiCallLastCall?.set(accountKey, nowMs);
           const observedAt = deps.now;
           if (result.statusCode === 401 || result.statusCode === 403) {
-            backOffAccount(result.statusCode);
+            backOffAccount(a.provider, apiFileRef(authIndex), accountKey, result.statusCode);
             continue;
           }
           if (result.statusCode >= 200 && result.statusCode < 300) {
@@ -632,7 +826,7 @@ export async function runSync(deps: SyncDeps, inFlight: { running: boolean }): P
           deps.apiCallLastCall?.set(accountKey, nowMs);
           const observedAt = deps.now;
           if (result.statusCode === 401 || result.statusCode === 403) {
-            backOffAccount(result.statusCode);
+            backOffAccount(a.provider, apiFileRef(authIndex), accountKey, result.statusCode);
             grouplessOk = null;
             warnable = null;
             break;
@@ -684,10 +878,10 @@ export async function runSync(deps: SyncDeps, inFlight: { running: boolean }): P
           });
         }
       }
-      if (metaSkipped > 0) {
+      if (metaQuotaDisabled > 0) {
         pluginErrors.push(
-          `meta: ${metaSkipped} account(s) skipped — live Meta quota is panel-only ` +
-            `(the connector never calls it); the Management Center panel remains the live read.`,
+          `meta quota disabled by config (metaQuota.enabled/apiCallEnabled) for ${metaQuotaDisabled} account(s); ` +
+            `no auth-file download or provider-API call was made for them this run.`,
         );
       }
       if (liveQuotaDisabled > 0) {

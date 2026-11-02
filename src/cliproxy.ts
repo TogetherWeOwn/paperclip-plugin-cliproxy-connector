@@ -40,6 +40,16 @@ export const AUTH_FILES_PATH = "/v0/management/auth-files";
 const PLUGIN_QUOTA_SHAPE = /^\/v0\/management\/plugins\/[A-Za-z0-9][A-Za-z0-9_-]*\/quota$/;
 
 /**
+ * Pinned auth-file download path (stock CLIProxy `DownloadAuthFile`): the raw
+ * file bytes for one auth file, addressed by exactly one `name` query value.
+ * Stock 400s on unsafe names and on names without a `.json` suffix, 404s when
+ * the file is absent. The response is credential-bearing by nature (refresh
+ * tokens, `dca_token`), so callers extract the one field they need and drop
+ * the text immediately — it is never logged, persisted or attached to state.
+ */
+export const AUTH_FILE_DOWNLOAD_PATH = "/v0/management/auth-files/download";
+
+/**
  * Pinned request-count shape: `GET /v0/management/api-key-usage` (v8:
  * `/observability/usage/api-keys`, same handler — the v0 path stays the only
  * admitted one). Per-provider request counts (success/failed + recent
@@ -127,12 +137,16 @@ function copyApiCallTemplate(template: ApiCallTemplate): ApiCallTemplate {
  * file (`downloadText(file.name)` → `JSON.parse` → `dca_token`, which must
  * match `/^dca:[^\s]+$/`) — never with the backend's server-side `$TOKEN$`
  * substitution (`resolveTokenForAuth` → `metaTokenFromAuth`), which never
- * yields that downloaded token. The connector never downloads auth files
- * (credential-bearing by policy), so a pinned `muse-code/key` template with
- * `Bearer $TOKEN$` can only ever return HTTP 401 (proven 3/3 on live
- * accounts). Meta quota stays panel-only; the parser says so instead of
- * calling. The panel itself calls this endpoint only on a user refresh, never
- * on a poll loop.
+ * yields that downloaded token. A frozen `muse-code/key` template with
+ * `Bearer $TOKEN$` could only ever return HTTP 401, so Meta rides a dedicated
+ * method instead (`postMetaMuseCodeKey`): the caller downloads the auth file,
+ * extracts the `dca_token`, and the method sends it as a literal per-call
+ * `Authorization` header. Stock `api_tools.go` passes headers without
+ * `$TOKEN$` through untouched, so the literal bearer reaches the provider
+ * exactly as the panel sends it. The token lives in memory for that one call
+ * only — never persisted, logged, or placed in errors, activity, metrics,
+ * plugin state or UI payloads — and the downloaded body is dropped right
+ * after extraction.
  *
  * - Antigravity subscription: the Code Assist subscription call (panel
  *   `src/services/api/antigravitySubscription.ts`
@@ -291,15 +305,15 @@ export function apiCallTemplateKeys(): ApiCallTemplateKey[] {
 /**
  * Exact subscription-template allow-map from an auth file's raw provider word
  * to its pinned template key. Only `antigravity` and `devin` resolve.
- * `meta` deliberately resolves to null: there is no Meta template (the
- * pinned `muse-code/key` request can never authenticate — see the table
- * comment), so Meta accounts are never called. Anything else — `gemini`,
- * `gemini-cli`, `metafoo`, future provider words — returns null and is never
- * called. This is deliberately NOT `normalizeProvider`: fuzzy/substring
- * matching would send one account's stored credential through another
- * family's request (e.g. a Gemini token as Bearer to the Antigravity Code
- * Assist URL). Callers compare the trimmed, lowercased raw provider string
- * for exact equality only.
+ * `meta` deliberately resolves to null: Meta has no frozen template — it
+ * rides the dedicated `postMetaMuseCodeKey` method with its per-call literal
+ * bearer (see the table comment) — so template dispatch never calls Meta
+ * accounts. Anything else — `gemini`, `gemini-cli`, `metafoo`, future
+ * provider words — returns null and is never called. This is deliberately
+ * NOT `normalizeProvider`: fuzzy/substring matching would send one account's
+ * stored credential through another family's request (e.g. a Gemini token as
+ * Bearer to the Antigravity Code Assist URL). Callers compare the trimmed,
+ * lowercased raw provider string for exact equality only.
  */
 export function apiCallTemplateKeyForProvider(rawProvider: string): ApiCallTemplateKey | null {
   const word = rawProvider.trim().toLowerCase();
@@ -310,7 +324,8 @@ export function apiCallTemplateKeyForProvider(rawProvider: string): ApiCallTempl
 /**
  * Ordered quota-template keys for an auth file's raw provider word. Only
  * `antigravity` resolves (to the panel-order quota keys); every other word —
- * including `meta` — returns an empty array and gets no quota call.
+ * including `meta` (dedicated method, not templates) — returns an empty array
+ * and gets no quota call.
  */
 export function apiCallQuotaTemplateKeysForProvider(rawProvider: string): ApiCallTemplateKey[] {
   if (rawProvider.trim().toLowerCase() === "antigravity") {
@@ -370,6 +385,65 @@ export function authFileModelsPath(name: string): string {
     throw new CliproxyConfigError(`refusing to build a served-set path from an untrusted auth-file name: ${name}`);
   }
   return `${AUTH_FILE_MODELS_PATH}?name=${encodeURIComponent(name)}`;
+}
+
+/**
+ * Pinned auth-file download path for one file name. Stock 400s on names
+ * without a `.json` suffix, so the suffix is required here too — a suffixless
+ * name rejects before any network happens instead of burning a request that
+ * can only fail. The `name` value itself never appears in error messages.
+ */
+export function authFileDownloadPath(name: string): string {
+  if (!isSafeAuthFileName(name)) {
+    throw new CliproxyConfigError(`refusing to build an auth-file download path from an untrusted auth-file name`);
+  }
+  if (!name.toLowerCase().endsWith(".json")) {
+    throw new CliproxyConfigError(`refusing to build an auth-file download path for a name without a .json suffix`);
+  }
+  return `${AUTH_FILE_DOWNLOAD_PATH}?name=${encodeURIComponent(name)}`;
+}
+
+/**
+ * Exact upstream URL for the Meta Muse-key quota read, copied from the panel
+ * (`META_MUSE_QUOTA_URL` in panel
+ * `src/features/quota/providers/meta/requests.ts`). Never built from input.
+ */
+export const META_MUSE_CODE_KEY_URL = "https://api.meta.ai/muse-code/key";
+
+/**
+ * Downloaded `dca_token` shape (panel `readDcaToken`): `dca:` plus a
+ * non-blank remainder, no whitespace. Anything else is "no usable token" —
+ * never a partial credential.
+ */
+export const DCA_TOKEN_PATTERN = /^dca:[^\s]+$/;
+
+/** Upper bound on an accepted `dca_token`, so a hostile file cannot stuff an unbounded bearer into the request. */
+export const DCA_TOKEN_MAX_LENGTH = 4096;
+
+/**
+ * Extract only the `dca_token` field from a downloaded auth-file body — the
+ * panel's `readDcaToken`, minus its error codes (this client reports plain
+ * non-secret messages instead). The caller drops the body right after this
+ * returns; the token itself lives in memory for one `postMetaMuseCodeKey`
+ * call only. Throws `CliproxyBodyError` with messages that never quote the
+ * file: a hostile or screen-scraped body must not smuggle secrets into logs.
+ */
+export function readDcaTokenFromAuthFile(text: string): string {
+  let value: unknown;
+  try {
+    value = JSON.parse(text);
+  } catch {
+    throw new CliproxyBodyError(`auth-file download is not JSON; skipping live Meta quota.`);
+  }
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new CliproxyBodyError(`auth-file download is not an object; skipping live Meta quota.`);
+  }
+  const raw = (value as Record<string, unknown>).dca_token;
+  const token = typeof raw === "string" ? raw.trim() : "";
+  if (!DCA_TOKEN_PATTERN.test(token) || token.length > DCA_TOKEN_MAX_LENGTH) {
+    throw new CliproxyBodyError(`auth-file download carries no usable dca_token; skipping live Meta quota.`);
+  }
+  return token;
 }
 
 /**
@@ -470,6 +544,19 @@ function assertAllowListed(url: URL, what: string): void {
   const pathname = decodedPathname(url, what);
   if (pathname.toLowerCase().includes("api-call")) {
     throw new CliproxyConfigError("`api-call` is excluded from the allow-list and can never be called.");
+  }
+  if (pathname === AUTH_FILE_DOWNLOAD_PATH) {
+    // Pinned download shape: exactly one `name` param, and it must be a
+    // single safe value (validated the same way as at path-build time, so a
+    // hostile redirect target cannot smuggle a traversal past the check).
+    // The suffix is a path-build-time rule only: a redirect target that
+    // drops it still matches this pinned shape and stays a download.
+    const keys = [...url.searchParams.keys()];
+    const names = url.searchParams.getAll("name");
+    if (keys.length !== 1 || keys[0] !== "name" || names.length !== 1 || !isSafeAuthFileName(names[0] as string)) {
+      throw new CliproxyConfigError(`auth-file download has an unsafe name parameter (${what})`);
+    }
+    return;
   }
   if (pathname === AUTH_FILE_MODELS_PATH) {
     // Pinned served-set shape: exactly one `name` param, and it must be a
@@ -586,6 +673,12 @@ async function guardedJson(args: {
   assertAllowed: (url: URL, what: string) => void;
   method: "GET" | "POST";
   bodyText?: string;
+  /**
+   * Raw-text mode for credential-bearing downloads (the auth-file body):
+   * return the capped body as a string instead of JSON-parsing it. The
+   * caller extracts one field and drops the text immediately.
+   */
+  rawText?: boolean;
 }): Promise<unknown> {
   let url = args.startUrl;
   for (let hop = 0; hop <= MANAGEMENT_MAX_REDIRECTS; hop++) {
@@ -650,6 +743,7 @@ async function guardedJson(args: {
     }
     const text = await readCapped(res, url.pathname, args.maxBytes, args.method);
     assertNoKeyLeak(text, args.keyForLeakCheck, url.pathname);
+    if (args.rawText === true) return text;
     try {
       return JSON.parse(text) as unknown;
     } catch {
@@ -765,6 +859,38 @@ export class CliproxyManagementClient {
   }
 
   /**
+   * GET one auth file's raw bytes for Meta quota (`readDcaTokenFromAuthFile`
+   * extracts the `dca_token`; stock serves the stored file verbatim). The
+   * response is credential-bearing, so this returns the raw text and the
+   * caller extracts one field and drops it immediately — nothing here parses
+   * it into a retained object, and no error message quotes it. 401/403 still
+   * throws `CliproxyAuthError` (the key itself was rejected); 404 throws
+   * `CliproxyNotFoundError` (the file vanished between listing and download).
+   */
+  async getAuthFileText(name: string): Promise<string> {
+    // Validated single safe value (plus the stock `.json` suffix rule): the
+    // substituted path always matches the pinned shape. Anything else
+    // rejects before any network happens. (`async` so the validation throw
+    // surfaces as a rejection.)
+    const url = this.resolveTarget(authFileDownloadPath(name));
+    const keyHeader = this.keyHeader;
+    const key = this.key;
+    return (await guardedJson({
+      startUrl: url,
+      baseOrigin: new URL(this.baseUrl).origin,
+      // Attach the key header only after origin validation above.
+      headersFor: () => ({ [keyHeader]: key }),
+      keyForLeakCheck: key,
+      fetchImpl: this.fetchImpl,
+      timeoutMs: this.timeoutMs,
+      maxBytes: this.maxBytes,
+      assertAllowed: assertAllowListed,
+      method: "GET",
+      rawText: true,
+    })) as string;
+  }
+
+  /**
    * GET the per-provider request counts (`api-key` auths only). No query
    * string: the pinned shape above refuses parameters before any network
    * happens. Best-effort like every quota read — the caller decides auth
@@ -856,6 +982,93 @@ export class CliproxyManagementClient {
       bodyText: requestBody,
     });
     return parseApiCallEnvelope(raw);
+  }
+
+  /**
+   * POST the Meta Muse-key quota read for one credential: `auth_index` plus a
+   * literal `Authorization: Bearer <dca>` header carrying the account's
+   * downloaded `dca_token` (see `readDcaTokenFromAuthFile`). Every other field
+   * is a frozen literal copied from the panel
+   * (`src/features/quota/providers/meta/requests.ts`): `POST` to
+   * `META_MUSE_CODE_KEY_URL` with `Accept` / `Content-Type` /
+   * `x-api-version: 1.0.0` headers and `'{}'` data.
+   *
+   * Stock `api_tools.go` passes headers without `$TOKEN$` through untouched,
+   * so the literal bearer reaches the provider exactly as the panel sends it
+   * — this is the only `api-call` shape that can authenticate Meta (server
+   * side `$TOKEN$` substitution skips `dca:` tokens). The token lives in this
+   * call's request body only: it is validated before any network happens,
+   * never logged (error messages are pathname-only), scrubbed out of any
+   * error that quotes it (defense-in-depth — the transport never does), and
+   * the caller drops its own copy right after this resolves.
+   *
+   * Transport semantics match `postApiCall`: 401/403 spends the strike budget
+   * (the key itself was rejected), 404/5xx/network failures are the caller's
+   * cue to warn per file and stay quota-blind. The UPSTREAM status travels
+   * inside the returned envelope and never throws here.
+   */
+  async postMetaMuseCodeKey(authIndex: string, dcaToken: string): Promise<ApiCallResult> {
+    if (!isSafeAuthIndex(authIndex)) {
+      throw new CliproxyConfigError(`refusing a Meta key request with an untrusted auth index`);
+    }
+    if (!DCA_TOKEN_PATTERN.test(dcaToken) || dcaToken.length > DCA_TOKEN_MAX_LENGTH) {
+      throw new CliproxyConfigError(`refusing a Meta key request with an unusable dca token`);
+    }
+    const url = this.resolveApiCallTarget();
+    const requestBody = JSON.stringify({
+      auth_index: authIndex,
+      method: "POST",
+      url: META_MUSE_CODE_KEY_URL,
+      header: {
+        Accept: "application/json",
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${dcaToken}`,
+        "x-api-version": "1.0.0",
+      },
+      data: "{}",
+    });
+    const keyHeader = this.keyHeader;
+    const key = this.key;
+    let raw: unknown;
+    try {
+      raw = await guardedJson({
+        startUrl: url,
+        baseOrigin: new URL(this.baseUrl).origin,
+        // Attach the key header only after origin validation above.
+        headersFor: () => ({ [keyHeader]: key, "Content-Type": "application/json" }),
+        keyForLeakCheck: key,
+        fetchImpl: this.fetchImpl,
+        timeoutMs: this.timeoutMs,
+        maxBytes: this.maxBytes,
+        assertAllowed: assertApiCallAllowListed,
+        method: "POST",
+        bodyText: requestBody,
+      });
+    } catch (err) {
+      // The transport never quotes the request body (messages are
+      // pathname-only), so this scrub is defense-in-depth only — but a
+      // future transport change must not be the day a bearer reaches a log.
+      if (err instanceof Error && dcaToken && err.message.includes(dcaToken)) {
+        err.message = err.message.split(dcaToken).join("[redacted-dca-token]");
+      }
+      throw err;
+    }
+    const result = parseApiCallEnvelope(raw);
+    // The key answer carries a live `api_key` (the account's Muse credential;
+    // the operator's key-mint proof showed it is the stored key, returned
+    // verbatim on every call). Drop it here, at the single choke point, so
+    // neither the 45-minute in-memory cache nor the parser payloads ever hold
+    // it. The quota parser reads only `subs_usage` / `subs_tier_name`, which
+    // are untouched.
+    if (typeof result.body === "object" && result.body !== null && !Array.isArray(result.body)) {
+      delete (result.body as Record<string, unknown>).api_key;
+    } else if (typeof result.body === "string") {
+      // An unparseable upstream body is never quota data (the parser treats
+      // non-objects as unknown) — drop the raw text so no body shape, however
+      // malformed, can carry the live key into the 45-minute cache.
+      result.body = null;
+    }
+    return result;
   }
 
   private resolveApiCallTarget(): URL {
