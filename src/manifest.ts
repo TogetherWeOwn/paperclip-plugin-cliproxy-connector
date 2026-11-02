@@ -1,7 +1,7 @@
 import type { PaperclipPluginManifestV1 } from "@paperclipai/plugin-sdk";
 
 export const PLUGIN_ID = "togetherweown.cliproxy-connector";
-export const PLUGIN_VERSION = "0.2.5";
+export const PLUGIN_VERSION = "0.2.6";
 export const SYNC_JOB_KEY = "cliproxy-sync";
 export const PAGE_DATA_KEY = "cliproxy-page";
 export const USAGE_DATA_KEY = "cliproxy-usage";
@@ -58,7 +58,7 @@ const manifest: PaperclipPluginManifestV1 = {
       jobKey: SYNC_JOB_KEY,
       displayName: "Sync CLIProxy quota",
       description:
-        "Discovers CLIProxy accounts per provider (auth-files) and per-provider quota (plugin quota routes plus the pinned provider-API templates for Meta, Antigravity and Devin, one call per account per run) through the pinned safe path into the plugin cache. Runs every 5 minutes; syncIntervalMinutes above 5 widens the freshness math rather than slowing the cron.",
+        "Discovers CLIProxy accounts per provider (auth-files) and per-provider quota (plugin quota routes plus the pinned provider-API templates for Antigravity and Devin, one call per account per run; Meta stays panel-only) through the pinned safe path into the plugin cache. Runs every 5 minutes; syncIntervalMinutes above 5 widens the freshness math rather than slowing the cron.",
       schedule: "*/5 * * * *",
     },
   ],

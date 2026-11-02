@@ -1284,13 +1284,11 @@ describe("sync failure visibility (S2)", () => {
 
 describe("live provider-API quota (pinned api-call templates)", () => {
   const RESET = Math.floor(Date.parse(NOW) / 1000) + 3600;
-  const metaBody = () => ({
-    subs_usage: {
-      window: { used_percent: 20, resets_at: RESET },
-      weekly: { used_percent: 5, resets_at: RESET + 86400 },
-    },
-    subs_tier_name: "Pro",
-    is_subs_active: true,
+  const antigravitySubBody = () => ({
+    currentTier: { id: "g1-pro-tier", name: "Pro" },
+  });
+  const antigravityQuotaBody = () => ({
+    groups: [{ buckets: [{ window: "daily", remainingFraction: 0.8, resetTime: RESET }] }],
   });
   const devinBody = () => ({
     userStatus: {
@@ -1307,7 +1305,12 @@ describe("live provider-API quota (pinned api-call templates)", () => {
   function apiFetch(
     calls: string[],
     files: unknown[],
-    opts?: { transportStatus?: number; upstreamStatus?: number },
+    opts?: {
+      transportStatus?: number;
+      upstreamStatus?: number;
+      quotaUpstreamStatus?: number;
+      quotaMode?: "groups" | "empty" | "daily-empty";
+    },
   ) {
     return vi.fn(async (input: string, init?: RequestInit): Promise<Response> => {
       const url = new URL(String(input));
@@ -1316,14 +1319,28 @@ describe("live provider-API quota (pinned api-call templates)", () => {
       if (url.pathname.includes("/plugins/")) return jsonResponse(200, { groups: [] });
       if (url.pathname === "/v0/management/api-call") {
         if (opts?.transportStatus) return new Response("denied", { status: opts.transportStatus });
-        const sent = JSON.parse(String(init?.body)) as { url: string; auth_index: string };
+        const sent = JSON.parse(String(init?.body)) as { url: string; auth_index: string; data: string };
         calls.push(`${sent.auth_index} ${sent.url}`);
         expect(sent.auth_index).not.toMatch(/api-call/);
-        const upstream = sent.url.includes("meta.ai") ? metaBody() : devinBody();
-        return jsonResponse(
-          200,
-          { status_code: opts?.upstreamStatus ?? 200, header: {}, body: JSON.stringify(upstream) },
-        );
+        const isQuota = sent.url.includes("retrieveUserQuotaSummary");
+        if (isQuota) {
+          // The quota body must carry the entry's project id — parsed JSON,
+          // never a raw sentinel, never credential material.
+          const data = JSON.parse(sent.data) as Record<string, unknown>;
+          expect(typeof data.project).toBe("string");
+          expect(data.project).not.toBe("PROJECT_ID_SENTINEL");
+        }
+        const quotaUpstream =
+          opts?.quotaMode === "empty" || (opts?.quotaMode === "daily-empty" && !sent.url.includes("sandbox"))
+            ? { groups: [] }
+            : antigravityQuotaBody();
+        const upstream = isQuota
+          ? quotaUpstream
+          : sent.url.includes("loadCodeAssist")
+            ? antigravitySubBody()
+            : devinBody();
+        const status = isQuota ? (opts?.quotaUpstreamStatus ?? 200) : (opts?.upstreamStatus ?? 200);
+        return jsonResponse(200, { status_code: status, header: {}, body: JSON.stringify(upstream) });
       }
       return new Response("not found", { status: 404 });
     });
@@ -1344,34 +1361,36 @@ describe("live provider-API quota (pinned api-call templates)", () => {
     const s = store();
     const calls: string[] = [];
     const files = [
-      { id: "meta-a", provider: "meta", auth_index: "m1" },
-      { id: "meta-b", provider: "meta", auth_index: "m1" },
+      { id: "ag-a", provider: "antigravity", auth_index: "a1", project_id: "proj-a" },
+      { id: "ag-b", provider: "antigravity", auth_index: "a1", project_id: "proj-a" },
       { id: "devin-a", provider: "devin", auth_index: "d1" },
       { id: "claude-a", provider: "claude" },
     ];
     const config = configWith(
       { provider: "claude", connectionId: "conn-claude" },
-      { provider: "meta", connectionId: "conn-meta" },
+      { provider: "antigravity", connectionId: "conn-ag" },
       { provider: "devin", connectionId: "conn-devin" },
     );
     const inFlight = { running: false };
     const summary = await runSync(depsWith(s, config, apiFetch(calls, files) as never), inFlight);
     expect(summary.skipped).toBe(false);
-    // One call per distinct credential: the two meta rows share auth_index m1.
-    expect(calls).toHaveLength(2);
+    // One subscription call per distinct credential (the two antigravity rows
+    // share auth_index a1) plus one winning quota call for that credential.
+    expect(calls).toHaveLength(3);
     expect(calls).toEqual(
       expect.arrayContaining([
-        expect.stringContaining("m1 https://api.meta.ai/muse-code/key"),
+        expect.stringContaining("a1 https://daily-cloudcode-pa.googleapis.com/v1internal:loadCodeAssist"),
+        expect.stringContaining("a1 https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary"),
         expect.stringContaining("d1 https://server.codeium.com/"),
       ]),
     );
     const rows = Object.values(s.savedRows ?? {});
-    const metaRows = rows.filter((r) => r.provider === "meta");
-    expect(metaRows).toHaveLength(2);
-    for (const row of metaRows) {
+    const agRows = rows.filter((r) => r.provider === "antigravity");
+    expect(agRows).toHaveLength(2);
+    for (const row of agRows) {
       expect(row.quotaBlind).toBe(false);
       expect(row.planType).toBe("Pro");
-      expect(row.limits.map((l) => l.id)).toEqual(["meta:window", "meta:weekly"]);
+      expect(row.limits.map((l) => l.id)).toEqual(["antigravity:daily"]);
       expect(row.limits.every((l) => l.viaProviderApi === true)).toBe(true);
     }
     const devinRow = rows.find((r) => r.provider === "devin");
@@ -1380,31 +1399,83 @@ describe("live provider-API quota (pinned api-call templates)", () => {
     assertNoKeyLeak(s);
   });
 
+  it("never calls for meta accounts (panel-only) and says so once", async () => {
+    const s = store();
+    const calls: string[] = [];
+    const files = [
+      { id: "meta-a", provider: "meta", auth_index: "m1" },
+      { id: "meta-b", provider: "meta", auth_index: "m2" },
+    ];
+    const config = configWith({ provider: "meta", connectionId: "conn-meta" });
+    const summary = await runSync(depsWith(s, config, apiFetch(calls, files) as never), {
+      running: false,
+    });
+    expect(summary.skipped).toBe(false);
+    expect(calls).toHaveLength(0);
+    const rows = Object.values(s.savedRows ?? {});
+    expect(rows).toHaveLength(2);
+    for (const row of rows) {
+      expect(row.quotaBlind).toBe(true);
+      expect(row.planType).toBeNull();
+      expect(row.limits).toEqual([]);
+    }
+    expect(summary.errors.join(" ")).toMatch(/meta: 2 account\(s\) skipped.*panel-only/);
+    assertNoKeyLeak(s);
+  });
+
+  it("a disabled kill switch makes no provider call and warns once", async () => {
+    const s = store();
+    const calls: string[] = [];
+    const files = [
+      { id: "ag-a", provider: "antigravity", auth_index: "a1", project_id: "proj-a" },
+      { id: "devin-a", provider: "devin", auth_index: "d1" },
+    ];
+    const raw = baseConfigRaw();
+    raw.providers = [
+      { provider: "antigravity", connectionId: "conn-ag", completeInventory: false },
+      { provider: "devin", connectionId: "conn-devin", completeInventory: false },
+    ];
+    (raw as Record<string, unknown>).apiCallEnabled = { antigravity: false };
+    const config = parseConfig(raw).config;
+    const summary = await runSync(depsWith(s, config, apiFetch(calls, files) as never), {
+      running: false,
+    });
+    expect(summary.skipped).toBe(false);
+    // Only the devin credential called (subscription); the killed antigravity
+    // family made no call at all — not even a quota round.
+    expect(calls).toHaveLength(1);
+    expect(calls[0]).toContain("d1 https://server.codeium.com/");
+    expect(summary.errors.join(" ")).toMatch(/live quota disabled by config/);
+    const rows = Object.values(s.savedRows ?? {});
+    expect(rows.find((r) => r.provider === "devin")?.quotaBlind).toBe(false);
+    assertNoKeyLeak(s);
+  });
+
   it("skips disabled and cooling accounts (no probe while the provider says wait)", async () => {
     const s = store();
     const calls: string[] = [];
     const files = [
-      { id: "meta-off", provider: "meta", auth_index: "m-off", disabled: true },
+      { id: "devin-off", provider: "devin", auth_index: "d-off", disabled: true },
       {
-        id: "meta-cool",
-        provider: "meta",
-        auth_index: "m-cool",
+        id: "devin-cool",
+        provider: "devin",
+        auth_index: "d-cool",
         unavailable: true,
         next_retry_after: new Date(Date.parse(NOW) + 3600_000).toISOString(),
       },
-      { id: "meta-ok", provider: "meta", auth_index: "m-ok" },
+      { id: "devin-ok", provider: "devin", auth_index: "d-ok" },
     ];
-    const config = configWith({ provider: "meta", connectionId: "conn-meta" });
+    const config = configWith({ provider: "devin", connectionId: "conn-devin" });
     await runSync(depsWith(s, config, apiFetch(calls, files) as never), { running: false });
     expect(calls).toHaveLength(1);
-    expect(calls[0]).toContain("m-ok");
+    expect(calls[0]).toContain("d-ok");
   });
 
   it("a rejected key on the api-call path stops the run and marks the secret bad", async () => {
     const s = store();
     const calls: string[] = [];
-    const files = [{ id: "meta-a", provider: "meta", auth_index: "m1" }];
-    const config = configWith({ provider: "meta", connectionId: "conn-meta" });
+    const files = [{ id: "devin-a", provider: "devin", auth_index: "d1" }];
+    const config = configWith({ provider: "devin", connectionId: "conn-devin" });
     const summary = await runSync(
       depsWith(s, config, apiFetch(calls, files, { transportStatus: 401 }) as never),
       { running: false },
@@ -1417,8 +1488,8 @@ describe("live provider-API quota (pinned api-call templates)", () => {
   it("an upstream provider error warns per file and stays quota-blind (fail open)", async () => {
     const s = store();
     const calls: string[] = [];
-    const files = [{ id: "meta-a", provider: "meta", auth_index: "m1" }];
-    const config = configWith({ provider: "meta", connectionId: "conn-meta" });
+    const files = [{ id: "devin-a", provider: "devin", auth_index: "d1" }];
+    const config = configWith({ provider: "devin", connectionId: "conn-devin" });
     const summary = await runSync(
       depsWith(s, config, apiFetch(calls, files, { upstreamStatus: 500 }) as never),
       { running: false },
@@ -1430,6 +1501,89 @@ describe("live provider-API quota (pinned api-call templates)", () => {
     expect(rows[0]?.quotaBlind).toBe(true);
     expect(rows[0]?.limits).toEqual([]);
     expect((summary.errors.join(" ") + (rows[0]?.lastError ?? ""))).toMatch(/500/);
+    assertNoKeyLeak(s);
+  });
+
+  it("an upstream 401 backs the account off for an hour (no per-sync retry)", async () => {
+    const s = store();
+    const calls: string[] = [];
+    const files = [{ id: "devin-a", provider: "devin", auth_index: "d1" }];
+    const config = configWith({ provider: "devin", connectionId: "conn-devin" });
+    const apiCallLastCall = new Map<string, number>();
+    const apiCallCache = new Map<string, { statusCode: number; body: unknown; observedAt: string }>();
+    const apiCallAuthBackoffUntil = new Map<string, number>();
+    const base = { apiCallLastCall, apiCallCache, apiCallAuthBackoffUntil };
+    const first = await runSync(
+      { ...depsWith(s, config, apiFetch(calls, files, { upstreamStatus: 401 }) as never), ...base },
+      { running: false },
+    );
+    expect(first.skipped).toBe(false);
+    expect(calls).toHaveLength(1);
+    expect(first.errors.join(" ")).toMatch(/backing off for 1 hour/);
+    // The 401 payload is never attached, so the parser cannot warn twice:
+    // the row carries no parser warning, only the one backoff warning.
+    const rows = Object.values(s.savedRows ?? {});
+    expect(rows[0]?.quotaBlind).toBe(true);
+    expect(rows[0]?.lastError).toBeNull();
+    // A minute later the account is parked: no retry, no new warning.
+    const later = new Date(Date.parse(NOW) + 60_000).toISOString();
+    const second = await runSync(
+      {
+        ...depsWith(s, config, apiFetch(calls, files, { upstreamStatus: 401 }) as never),
+        now: later,
+        ...base,
+      },
+      { running: false },
+    );
+    expect(second.skipped).toBe(false);
+    expect(calls).toHaveLength(1);
+    // After the hour the endpoint is re-probed and recovers.
+    const after = new Date(Date.parse(NOW) + 61 * 60_000).toISOString();
+    const third = await runSync(
+      { ...depsWith(s, config, apiFetch(calls, files) as never), now: after, ...base },
+      { running: false },
+    );
+    expect(third.skipped).toBe(false);
+    expect(calls).toHaveLength(2);
+    expect(Object.values(s.savedRows ?? {})[0]?.quotaBlind).toBe(false);
+    assertNoKeyLeak(s);
+  });
+
+  it("an upstream 403 on the quota call parks the account with a single warning", async () => {
+    const s = store();
+    const calls: string[] = [];
+    const files = [{ id: "ag-a", provider: "antigravity", auth_index: "a1", project_id: "proj-a" }];
+    const config = configWith({ provider: "antigravity", connectionId: "conn-ag" });
+    const apiCallLastCall = new Map<string, number>();
+    const apiCallCache = new Map<string, { statusCode: number; body: unknown; observedAt: string }>();
+    const apiCallAuthBackoffUntil = new Map<string, number>();
+    const base = { apiCallLastCall, apiCallCache, apiCallAuthBackoffUntil };
+    const first = await runSync(
+      {
+        ...depsWith(s, config, apiFetch(calls, files, { quotaUpstreamStatus: 403 }) as never),
+        ...base,
+      },
+      { running: false },
+    );
+    expect(first.skipped).toBe(false);
+    // Subscription answered (plan evidence), quota rejected (backoff).
+    expect(calls).toHaveLength(2);
+    expect(first.errors.join(" ").match(/403/g)).toHaveLength(1);
+    expect(first.errors.join(" ")).toMatch(/backing off for 1 hour/);
+    const rows = Object.values(s.savedRows ?? {});
+    expect(rows[0]?.planType).toBe("Pro");
+    expect(rows[0]?.limits).toEqual([]);
+    // Parked: the next sync makes no calls at all, not even the subscription.
+    const later = new Date(Date.parse(NOW) + 60_000).toISOString();
+    await runSync(
+      {
+        ...depsWith(s, config, apiFetch(calls, files, { quotaUpstreamStatus: 403 }) as never),
+        now: later,
+        ...base,
+      },
+      { running: false },
+    );
+    expect(calls).toHaveLength(2);
     assertNoKeyLeak(s);
   });
 
@@ -1459,15 +1613,15 @@ describe("live provider-API quota (pinned api-call templates)", () => {
     assertNoKeyLeak(s);
   });
 
-  it("a throttled rerun reuses the cached answer with the first run's observedAt", async () => {
+  it("a throttled rerun reuses the cached answers with the first run's observedAt", async () => {
     const s = store();
     const calls: string[] = [];
     const files = [
-      { id: "meta-a", provider: "meta", auth_index: "m1" },
+      { id: "ag-a", provider: "antigravity", auth_index: "a1", project_id: "proj-a" },
       { id: "devin-a", provider: "devin", auth_index: "d1" },
     ];
     const config = configWith(
-      { provider: "meta", connectionId: "conn-meta" },
+      { provider: "antigravity", connectionId: "conn-ag" },
       { provider: "devin", connectionId: "conn-devin" },
     );
     const apiCallLastCall = new Map<string, number>();
@@ -1477,7 +1631,8 @@ describe("live provider-API quota (pinned api-call templates)", () => {
       { running: false },
     );
     expect(first.skipped).toBe(false);
-    expect(calls).toHaveLength(2);
+    // Two subscription calls plus one winning quota call.
+    expect(calls).toHaveLength(3);
     // A minute later the throttle holds, but the live windows survive with
     // the first run's observation time — not a fresh stamp, not blank.
     const later = new Date(Date.parse(NOW) + 60_000).toISOString();
@@ -1491,15 +1646,15 @@ describe("live provider-API quota (pinned api-call templates)", () => {
       { running: false },
     );
     expect(second.skipped).toBe(false);
-    expect(calls).toHaveLength(2);
+    expect(calls).toHaveLength(3);
     const origin = new URL("http://127.0.0.1:8317").origin;
-    expect([...apiCallLastCall.keys()].sort()).toEqual([`${origin} d1`, `${origin} m1`]);
+    expect([...apiCallLastCall.keys()].sort()).toEqual([`${origin} a1`, `${origin} d1`]);
     const rows = Object.values(s.savedRows ?? {});
-    const metaRow = rows.find((r) => r.provider === "meta");
-    expect(metaRow?.quotaBlind).toBe(false);
-    expect(metaRow?.limits.map((l) => l.id)).toEqual(["meta:window", "meta:weekly"]);
-    expect(metaRow?.limits.every((l) => l.viaProviderApi === true)).toBe(true);
-    expect(metaRow?.limits.every((l) => l.observedAt === NOW)).toBe(true);
+    const agRow = rows.find((r) => r.provider === "antigravity");
+    expect(agRow?.quotaBlind).toBe(false);
+    expect(agRow?.limits.map((l) => l.id)).toEqual(["antigravity:daily"]);
+    expect(agRow?.limits.every((l) => l.viaProviderApi === true)).toBe(true);
+    expect(agRow?.limits.every((l) => l.observedAt === NOW)).toBe(true);
     const devinRow = rows.find((r) => r.provider === "devin");
     expect(devinRow?.quotaBlind).toBe(false);
     expect(devinRow?.limits.every((l) => l.observedAt === NOW)).toBe(true);
@@ -1509,8 +1664,8 @@ describe("live provider-API quota (pinned api-call templates)", () => {
   it("two runs 4m59s apart both call (cron jitter tolerance)", async () => {
     const s = store();
     const calls: string[] = [];
-    const files = [{ id: "meta-a", provider: "meta", auth_index: "m1" }];
-    const config = configWith({ provider: "meta", connectionId: "conn-meta" });
+    const files = [{ id: "devin-a", provider: "devin", auth_index: "d1" }];
+    const config = configWith({ provider: "devin", connectionId: "conn-devin" });
     const apiCallLastCall = new Map<string, number>();
     const apiCallCache = new Map<string, { statusCode: number; body: unknown; observedAt: string }>();
     const first = await runSync(
@@ -1532,7 +1687,7 @@ describe("live provider-API quota (pinned api-call templates)", () => {
     expect(second.skipped).toBe(false);
     expect(calls).toHaveLength(2);
     const rows = Object.values(s.savedRows ?? {});
-    expect(rows.find((r) => r.provider === "meta")?.quotaBlind).toBe(false);
+    expect(rows.find((r) => r.provider === "devin")?.quotaBlind).toBe(false);
     assertNoKeyLeak(s);
   });
 
@@ -1540,8 +1695,8 @@ describe("live provider-API quota (pinned api-call templates)", () => {
     const sA = store();
     const sB = store();
     const calls: string[] = [];
-    const files = [{ id: "meta-a", provider: "meta", auth_index: "m1" }];
-    const config = configWith({ provider: "meta", connectionId: "conn-meta" });
+    const files = [{ id: "devin-a", provider: "devin", auth_index: "d1" }];
+    const config = configWith({ provider: "devin", connectionId: "conn-devin" });
     const apiCallLastCall = new Map<string, number>();
     const apiCallCache = new Map<string, { statusCode: number; body: unknown; observedAt: string }>();
     const base = { apiCallLastCall, apiCallCache };
@@ -1560,13 +1715,134 @@ describe("live provider-API quota (pinned api-call templates)", () => {
     expect(calls).toHaveLength(1);
     for (const s of [sA, sB]) {
       const rows = Object.values(s.savedRows ?? {});
-      const metaRow = rows.find((r) => r.provider === "meta");
-      expect(metaRow?.quotaBlind).toBe(false);
-      expect(metaRow?.limits.map((l) => l.id)).toEqual(["meta:window", "meta:weekly"]);
-      expect(metaRow?.limits.every((l) => l.observedAt === NOW)).toBe(true);
+      const devinRow = rows.find((r) => r.provider === "devin");
+      expect(devinRow?.quotaBlind).toBe(false);
+      expect(devinRow?.limits.map((l) => l.id)).toEqual(["devin:daily", "devin:weekly"]);
+      expect(devinRow?.limits.every((l) => l.observedAt === NOW)).toBe(true);
     }
     assertNoKeyLeak(sA);
     assertNoKeyLeak(sB);
+  });
+
+  it("tries the remembered quota URL first after one discovery round", async () => {
+    const s = store();
+    const calls: string[] = [];
+    const files = [{ id: "ag-a", provider: "antigravity", auth_index: "a1", project_id: "proj-a" }];
+    const config = configWith({ provider: "antigravity", connectionId: "conn-ag" });
+    const apiCallLastCall = new Map<string, number>();
+    const apiCallCache = new Map<string, { statusCode: number; body: unknown; observedAt: string }>();
+    const apiCallQuotaChoice = new Map<string, string>();
+    const quotaCalls = () => calls.filter((c) => c.includes("retrieveUserQuotaSummary"));
+    const first = await runSync(
+      {
+        ...depsWith(s, config, apiFetch(calls, files, { quotaMode: "daily-empty" }) as never),
+        apiCallLastCall,
+        apiCallCache,
+        apiCallQuotaChoice,
+      },
+      { running: false },
+    );
+    expect(first.skipped).toBe(false);
+    // Discovery: daily answers groupless, sandbox wins.
+    expect(quotaCalls()).toHaveLength(2);
+    const origin = new URL("http://127.0.0.1:8317").origin;
+    expect(apiCallQuotaChoice.get(`${origin} a1`)).toBe("antigravity-quota-sandbox");
+    // Next round (throttle cleared, choice kept): subscription plus the
+    // remembered sandbox URL only — no second daily call.
+    apiCallLastCall.clear();
+    const second = await runSync(
+      {
+        ...depsWith(s, config, apiFetch(calls, files, { quotaMode: "daily-empty" }) as never),
+        apiCallLastCall,
+        apiCallCache,
+        apiCallQuotaChoice,
+      },
+      { running: false },
+    );
+    expect(second.skipped).toBe(false);
+    expect(quotaCalls()).toHaveLength(3);
+    expect(quotaCalls()[2]).toContain("sandbox.googleapis.com");
+    const rows = Object.values(s.savedRows ?? {});
+    expect(rows[0]?.quotaBlind).toBe(false);
+    expect(rows[0]?.limits.map((l) => l.id)).toEqual(["antigravity:daily"]);
+    // A throttled third run reuses the remembered winner's groups — the
+    // stale groupless daily entry cached during discovery never shadows it.
+    const later = new Date(Date.parse(NOW) + 60_000).toISOString();
+    const third = await runSync(
+      {
+        ...depsWith(s, config, apiFetch(calls, files, { quotaMode: "daily-empty" }) as never),
+        now: later,
+        apiCallLastCall,
+        apiCallCache,
+        apiCallQuotaChoice,
+      },
+      { running: false },
+    );
+    expect(third.skipped).toBe(false);
+    expect(quotaCalls()).toHaveLength(3);
+    const rows3 = Object.values(s.savedRows ?? {});
+    expect(rows3[0]?.quotaBlind).toBe(false);
+    expect(rows3[0]?.limits.map((l) => l.id)).toEqual(["antigravity:daily"]);
+    expect(rows3[0]?.lastError).toBeNull();
+    assertNoKeyLeak(s);
+  });
+
+  it("an antigravity account without a project id makes no quota call (plan only)", async () => {
+    const s = store();
+    const calls: string[] = [];
+    const files = [{ id: "ag-a", provider: "antigravity", auth_index: "a1" }];
+    const config = configWith({ provider: "antigravity", connectionId: "conn-ag" });
+    const summary = await runSync(depsWith(s, config, apiFetch(calls, files) as never), {
+      running: false,
+    });
+    expect(summary.skipped).toBe(false);
+    // Subscription only; the quota body cannot be shaped without a project id.
+    expect(calls).toHaveLength(1);
+    expect(calls[0]).toContain("loadCodeAssist");
+    const rows = Object.values(s.savedRows ?? {});
+    expect(rows[0]?.planType).toBe("Pro");
+    expect(rows[0]?.limits).toEqual([]);
+    expect(rows[0]?.lastError ?? "").toMatch(/no project id/);
+    assertNoKeyLeak(s);
+  });
+
+  it("an unusable project id is never sent upstream", async () => {
+    const hostile = "proj\"with'quotes and space";
+    const s = store();
+    const calls: string[] = [];
+    const files = [{ id: "ag-a", provider: "antigravity", auth_index: "a1", project_id: hostile }];
+    const config = configWith({ provider: "antigravity", connectionId: "conn-ag" });
+    const summary = await runSync(depsWith(s, config, apiFetch(calls, files) as never), {
+      running: false,
+    });
+    expect(summary.skipped).toBe(false);
+    expect(calls).toHaveLength(1);
+    expect(calls[0]).toContain("loadCodeAssist");
+    expect(summary.errors.join(" ")).toMatch(/unusable project id/);
+    // The hostile value never lands in a warning, error or row.
+    expect(summary.errors.join(" ")).not.toContain(hostile);
+    expect(JSON.stringify(s.savedRows)).not.toContain(hostile);
+    assertNoKeyLeak(s);
+  });
+
+  it("groupless quota answers attach honestly instead of staying quiet", async () => {
+    const s = store();
+    const calls: string[] = [];
+    const files = [{ id: "ag-a", provider: "antigravity", auth_index: "a1", project_id: "proj-a" }];
+    const config = configWith({ provider: "antigravity", connectionId: "conn-ag" });
+    const summary = await runSync(
+      depsWith(s, config, apiFetch(calls, files, { quotaMode: "empty" }) as never),
+      { running: false },
+    );
+    expect(summary.skipped).toBe(false);
+    // Subscription plus all three quota URLs, all groupless.
+    expect(calls).toHaveLength(4);
+    const rows = Object.values(s.savedRows ?? {});
+    expect(rows[0]?.lastError ?? "").toMatch(/carries no quota groups/);
+    expect(rows[0]?.planType).toBe("Pro");
+    expect(rows[0]?.limits).toEqual([]);
+    expect(rows[0]?.quotaBlind).toBe(true);
+    assertNoKeyLeak(s);
   });
 
   it("localhost and 127.0.0.1 spellings share one throttle bucket", () => {

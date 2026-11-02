@@ -2,11 +2,12 @@
  * Sync job (cron 2–5 min + on-demand): CLIProxy → plugin cache.
  *
  * Reads the CLIProxy account list + per-provider quota through the proposal
- * §4 safe path (pinned GET allow-list plus the three pinned
- * `api-call` POST templates for Meta/Antigravity/Devin, one call per account
- * per sync), groups accounts by provider, and normalises into
- * `AiConnectionUsage`-shaped rows in the plugin's own namespace. No core
- * changes, no fork.
+ * §4 safe path (pinned GET allow-list plus the pinned `api-call` POST
+ * templates for Antigravity/Devin — one subscription call per account per
+ * sync, plus one winning quota-summary call for Antigravity accounts that
+ * carry a project id; Meta is panel-only and never called), groups accounts
+ * by provider, and normalises into `AiConnectionUsage`-shaped rows in the
+ * plugin's own namespace. No core changes, no fork.
  *
  * Security properties (all tested):
  * - the management key is resolved per run and kept in memory only;
@@ -19,22 +20,24 @@
  */
 
 import {
+  apiCallQuotaTemplateKeysForProvider,
   apiCallTemplateKeyForProvider,
   CliproxyAuthError,
   CliproxyClientApiClient,
   CliproxyConfigError,
   CliproxyManagementClient,
   CliproxyNotFoundError,
+  isSafeApiCallProjectId,
   type ManagementFetch,
 } from "./cliproxy.js";
-import { AUTH_FILE_REF_PREFIX, type ConnectorConfig, type ProviderEntry } from "./config.js";
+import { AUTH_FILE_REF_PREFIX, isLiveQuotaEnabled, type ConnectorConfig, type ProviderEntry } from "./config.js";
 import {
   deriveProviderModels,
   observedModelKeysByProvider,
   parseModelsPayload,
   type ServedModel,
 } from "./models.js";
-import { hashIdentity, parseAuthFiles, type ParsedAccount } from "./parsers.js";
+import { hasAntigravityQuotaGroups, hashIdentity, parseAuthFiles, type ParsedAccount } from "./parsers.js";
 import type {
   AccountUsageRow,
   DriftFinding,
@@ -79,15 +82,27 @@ export const STRIKE_WINDOW_MS = 30 * 60_000;
 export const STRIKE_LIMIT = 2;
 export const MIN_SYNC_INTERVAL_MS = 60_000;
 /**
- * Minimum gap between two credential-bearing provider-API calls for the same
- * CLIProxy origin + credential (`auth_index`). The scheduled sync runs every 5
- * minutes, so a 4-minute bound keeps at most one call per account per sync even
- * when the on-demand resync action fires back to back — repeated provider hits
- * with stored credentials could otherwise get those accounts flagged — while a
- * 1-minute jitter tolerance keeps a slightly early cron tick from blanking the
- * live windows on alternate runs.
+ * Minimum gap between two credential-bearing provider-API call rounds for the
+ * same CLIProxy origin + credential (`auth_index`). The scheduled sync runs
+ * every 5 minutes, so a 4-minute bound keeps at most one subscription round
+ * per account per sync even when the on-demand resync action fires back to
+ * back — repeated provider hits with stored credentials could otherwise get
+ * those accounts flagged — while a 1-minute jitter tolerance keeps a slightly
+ * early cron tick from blanking the live windows on alternate runs. An
+ * Antigravity account whose round runs also makes its quota-summary call(s)
+ * in the same round (remembered winning URL first, so usually one extra call).
  */
 export const API_CALL_MIN_INTERVAL_MS = 4 * 60_000;
+
+/**
+ * Per-account backoff after an UPSTREAM 401/403 (not a management-key
+ * rejection — that keeps the strike-budget path): epoch millis until which
+ * the origin + credential is skipped without any provider call. One hour
+ * bounds a bad endpoint to ~24 attempts/day instead of ~288, while a fixed
+ * worker-owned map (never persisted) means a restart or resync re-verifies
+ * immediately instead of inheriting a stale ban.
+ */
+export const API_CALL_AUTH_BACKOFF_MS = 60 * 60_000;
 
 /**
  * Last known-good live provider-API answer per CLIProxy origin + credential
@@ -188,11 +203,29 @@ export interface SyncDeps {
   apiCallLastCall?: Map<string, number>;
   /**
    * Last 2xx provider-API answer per CLIProxy origin + credential `auth_index`
-   * (same keying as `apiCallLastCall`). A throttled run reuses the cached
-   * envelope — stamped with its original `observedAt` — instead of blanking
-   * the account's live windows. In memory only, never persisted or logged.
+   * + template key (`${apiCallOriginKey(baseUrl)} ${authIndex} ${templateKey}` —
+   * the subscription answer and each quota answer cache separately). A
+   * throttled run reuses the cached envelopes — stamped with their original
+   * `observedAt` — instead of blanking the account's live windows. In memory
+   * only, never persisted or logged.
    */
   apiCallCache?: Map<string, ApiCallCachedEnvelope>;
+  /**
+   * Per-account upstream-auth backoff: `${apiCallOriginKey(baseUrl)} ${authIndex}`
+   * → epoch millis until which the account is skipped without any provider
+   * call, after an upstream 401/403. The worker owns one shared map across
+   * runs and companies; callers that omit it get no backoff (every sync
+   * retries). Expired entries are dropped on encounter. Tests pass their own
+   * map to assert the bound.
+   */
+  apiCallAuthBackoffUntil?: Map<string, number>;
+  /**
+   * Remembered working Antigravity quota template per CLIProxy origin +
+   * credential `auth_index`. The quota loop tries the remembered key first and
+   * overwrites it whenever a different quota URL wins, so steady state costs
+   * one quota call per account per sync. In memory only, never persisted.
+   */
+  apiCallQuotaChoice?: Map<string, string>;
 }
 
 function summary(
@@ -399,62 +432,132 @@ export async function runSync(deps: SyncDeps, inFlight: { running: boolean }): P
         }
       }
 
-      // Live provider-API quota: one pinned
-      // `POST /v0/management/api-call` per distinct credential index among the
-      // enabled, configured meta/antigravity/devin accounts — the families the
-      // three frozen templates serve. The template comes from an exact
-      // allow-map on the auth file's raw provider word, never from fuzzy
-      // matching: a `gemini` account must not send its credential through the
-      // Antigravity request. Disabled accounts are never called; cooling
-      // accounts keep their cooldown (no probe while the provider says
-      // wait); one call per index per sync bounds the rate to the sync cadence
-      // (every 5 min), and the per-credential throttle below holds that bound
-      // across back-to-back resyncs. Raw envelopes ride along by `auth_index`
-      // and attach to their own account row at parse time. Failed calls warn
-      // per file and stay quota-blind; only a rejected key (401/403) stops
-      // the run.
+      // Live provider-API quota: pinned `POST /v0/management/api-call`
+      // calls for the enabled, configured antigravity/devin accounts — the
+      // families with templates. Meta accounts are never called (no template
+      // exists: the pinned request could not authenticate — Meta stays
+      // panel-only) and count toward one summary warning. The template comes
+      // from an exact allow-map on the auth file's raw provider word, never
+      // from fuzzy matching: a `gemini` account must not send its credential
+      // through the Antigravity request. Disabled accounts are never called;
+      // cooling accounts keep their cooldown (no probe while the provider
+      // says wait); one subscription round per index per sync bounds the rate
+      // to the sync cadence (every 5 min), and the per-credential throttle
+      // below holds that bound across back-to-back resyncs. Antigravity
+      // accounts with a project id add a quota-summary round (remembered
+      // winning URL first, so usually one extra call). Raw envelopes ride
+      // along by `auth_index` and attach to their own account row at parse
+      // time. An UPSTREAM 401/403 backs the account off for an hour (one
+      // warning, no per-sync retry — a bad endpoint must never poll every 5
+      // minutes); other failed calls warn per file and stay quota-blind; only
+      // a rejected key (management 401/403) stops the run.
       const apiCallPayloadByAuthIndex = new Map<string, { statusCode: number; body: unknown; observedAt: string }>();
+      const apiCallQuotaPayloadByAuthIndex = new Map<string, { statusCode: number; body: unknown; observedAt: string }>();
       const fetchedApiCallIndexes = new Set<string>();
       const apiOrigin = apiCallOriginKey(deps.config.cliproxyBaseUrl);
       const configuredProviders = new Set(deps.config.providers.map((p) => p.provider));
+      // Auth indexes are opaque tokens, but never persist one raw in a
+      // warning: the short hash distinguishes files for debugging.
+      // Client messages are pathname-only and the path builder omits
+      // the value, so the scrub below is defense-in-depth.
+      const apiFileRef = (authIndex: string) =>
+        `auth ${hashIdentity([authIndex])?.slice(0, 8) ?? "unknown"}`;
+      let metaSkipped = 0;
+      let liveQuotaDisabled = 0;
       for (const a of discovered.accounts) {
         if (a.status === "disabled" || a.status === "cooling") continue;
         if (!a.authIndex || !configuredProviders.has(a.provider)) continue;
+        // Meta is panel-only: no template can authenticate, so calling would
+        // only ever return an upstream 401. Count and skip without a call.
+        if (a.provider === "meta") {
+          metaSkipped += 1;
+          continue;
+        }
         const templateKey = apiCallTemplateKeyForProvider(a.provider);
         if (!templateKey) continue;
+        // Per-provider kill switch (`apiCallEnabled` in the company config,
+        // on by default for antigravity/devin/meta): a disabled family makes
+        // no credential-bearing calls at all and stays on passive signals.
+        if (!isLiveQuotaEnabled(deps.config, a.provider)) {
+          liveQuotaDisabled += 1;
+          continue;
+        }
         if (fetchedApiCallIndexes.has(a.authIndex)) continue;
         fetchedApiCallIndexes.add(a.authIndex);
+        const authIndex: string = a.authIndex;
         // Cross-run per-credential throttle, keyed by origin + index so two
         // companies on the same CLIProxy share one bucket per credential.
-        const cacheKey = `${apiOrigin} ${a.authIndex}`;
-        const lastCall = deps.apiCallLastCall?.get(cacheKey);
+        const accountKey = `${apiOrigin} ${authIndex}`;
+        // Upstream-auth backoff: a provider-side 401/403 parks the account
+        // (no calls at all) until the stored time. Expired entries are
+        // dropped on encounter so the map cannot grow stale.
+        const backoffUntil = deps.apiCallAuthBackoffUntil?.get(accountKey);
+        if (backoffUntil !== undefined) {
+          if (backoffUntil > nowMs) continue;
+          deps.apiCallAuthBackoffUntil?.delete(accountKey);
+        }
+        const lastCall = deps.apiCallLastCall?.get(accountKey);
         if (lastCall !== undefined && nowMs - lastCall < API_CALL_MIN_INTERVAL_MS) {
-          // Throttled: reuse the last known-good answer with its original
-          // observation time instead of blanking this run's live windows. A
+          // Throttled: reuse the last known-good answers with their original
+          // observation times instead of blanking this run's live windows. A
           // missing cache (never fetched, or the last fetch failed) leaves the
           // account unknown this run — never headroom.
-          const cached = deps.apiCallCache?.get(cacheKey);
+          const cached = deps.apiCallCache?.get(`${accountKey} ${templateKey}`);
           if (cached !== undefined) {
-            apiCallPayloadByAuthIndex.set(a.authIndex, {
+            apiCallPayloadByAuthIndex.set(authIndex, {
               statusCode: cached.statusCode,
               body: cached.body,
               observedAt: cached.observedAt,
             });
           }
+          // Remembered working URL first — same order as the live loop, so
+          // a stale groupless discovery entry never shadows the winner.
+          const rememberedQuota = deps.apiCallQuotaChoice?.get(accountKey);
+          const quotaKeys = apiCallQuotaTemplateKeysForProvider(a.provider);
+          const orderedQuotaKeys =
+            rememberedQuota !== undefined && (quotaKeys as string[]).includes(rememberedQuota)
+              ? [rememberedQuota, ...quotaKeys.filter((k) => k !== rememberedQuota)]
+              : quotaKeys;
+          for (const quotaKey of orderedQuotaKeys) {
+            const cachedQuota = deps.apiCallCache?.get(`${accountKey} ${quotaKey}`);
+            if (cachedQuota !== undefined) {
+              apiCallQuotaPayloadByAuthIndex.set(authIndex, {
+                statusCode: cachedQuota.statusCode,
+                body: cachedQuota.body,
+                observedAt: cachedQuota.observedAt,
+              });
+              break;
+            }
+          }
           continue;
         }
+        // Arms the per-account upstream-auth backoff and warns once. The
+        // 401/403 payload is deliberately NOT attached: the parser would warn
+        // a second time for the same event, and the backoff owns this episode.
+        const backOffAccount = (status: number) => {
+          deps.apiCallAuthBackoffUntil?.set(accountKey, nowMs + API_CALL_AUTH_BACKOFF_MS);
+          deps.apiCallLastCall?.set(accountKey, nowMs);
+          pluginErrors.push(
+            `${a.provider} (provider API, ${apiFileRef(authIndex)}): ` +
+              `provider API returned upstream HTTP ${status}; backing off for 1 hour (no live quota until then).`,
+          );
+        };
         try {
-          const result = await client.postApiCall(templateKey, a.authIndex);
-          deps.apiCallLastCall?.set(cacheKey, nowMs);
+          const result = await client.postApiCall(templateKey, authIndex);
+          deps.apiCallLastCall?.set(accountKey, nowMs);
           const observedAt = deps.now;
+          if (result.statusCode === 401 || result.statusCode === 403) {
+            backOffAccount(result.statusCode);
+            continue;
+          }
           if (result.statusCode >= 200 && result.statusCode < 300) {
-            deps.apiCallCache?.set(cacheKey, {
+            deps.apiCallCache?.set(`${accountKey} ${templateKey}`, {
               statusCode: result.statusCode,
               body: result.body,
               observedAt,
             });
           }
-          apiCallPayloadByAuthIndex.set(a.authIndex, {
+          apiCallPayloadByAuthIndex.set(authIndex, {
             statusCode: result.statusCode,
             body: result.body,
             observedAt,
@@ -463,14 +566,113 @@ export async function runSync(deps: SyncDeps, inFlight: { running: boolean }): P
           if (err instanceof CliproxyAuthError) throw err; // stop after first rejected key
           // A provider hit happened even when it fails (transport error,
           // upstream envelope rejection), so the throttle still records it.
-          deps.apiCallLastCall?.set(cacheKey, nowMs);
-          // Auth indexes are opaque tokens, but never persist one raw in a
-          // warning: the short hash distinguishes files for debugging.
-          const fileRef = `auth ${hashIdentity([a.authIndex])?.slice(0, 8) ?? "unknown"}`;
+          deps.apiCallLastCall?.set(accountKey, nowMs);
           const rawMessage = err instanceof Error ? err.message : "fetch failed";
-          const safeMessage = rawMessage.split(a.authIndex).join(fileRef);
-          pluginErrors.push(`${a.provider} (provider API, ${fileRef}): ${safeMessage}`);
+          const safeMessage = rawMessage.split(authIndex).join(apiFileRef(authIndex));
+          pluginErrors.push(`${a.provider} (provider API, ${apiFileRef(authIndex)}): ${safeMessage}`);
+          continue;
         }
+        // Antigravity quota summary: the winning `retrieveUserQuotaSummary`
+        // answer, tried in panel order with the remembered working URL first.
+        // It needs the account's project id for the `{"project": …}` body;
+        // without one no call is possible and the parser notes plan-only.
+        if (a.provider !== "antigravity") continue;
+        const projectId = a.quotaProjectId;
+        if (projectId === null) continue; // parser warns plan-only
+        if (!isSafeApiCallProjectId(projectId)) {
+          pluginErrors.push(
+            `${a.provider} (provider API quota, ${apiFileRef(authIndex)}): ` +
+              `ignoring an unusable project id; quota windows unavailable (plan evidence only).`,
+          );
+          continue;
+        }
+        const remembered = deps.apiCallQuotaChoice?.get(accountKey);
+        const quotaKeys = apiCallQuotaTemplateKeysForProvider(a.provider);
+        const orderedKeys =
+          remembered !== undefined && (quotaKeys as string[]).includes(remembered)
+            ? [remembered, ...quotaKeys.filter((k) => k !== remembered)]
+            : quotaKeys;
+        let grouplessOk: { key: string; statusCode: number; body: unknown } | null = null;
+        let warnable: { statusCode: number; body: unknown } | null = null;
+        let quotaWon = false;
+        for (const quotaKey of orderedKeys) {
+          let result;
+          try {
+            result = await client.postApiCall(quotaKey, authIndex, { projectId });
+          } catch (err) {
+            if (err instanceof CliproxyAuthError) throw err; // stop after first rejected key
+            deps.apiCallLastCall?.set(accountKey, nowMs);
+            const rawMessage = err instanceof Error ? err.message : "fetch failed";
+            const safeMessage = rawMessage.split(authIndex).join(apiFileRef(authIndex));
+            pluginErrors.push(`${a.provider} (provider API quota, ${apiFileRef(authIndex)}): ${safeMessage}`);
+            break;
+          }
+          deps.apiCallLastCall?.set(accountKey, nowMs);
+          const observedAt = deps.now;
+          if (result.statusCode === 401 || result.statusCode === 403) {
+            backOffAccount(result.statusCode);
+            grouplessOk = null;
+            warnable = null;
+            break;
+          }
+          if (result.statusCode >= 200 && result.statusCode < 300) {
+            if (hasAntigravityQuotaGroups(result.body)) {
+              deps.apiCallCache?.set(`${accountKey} ${quotaKey}`, {
+                statusCode: result.statusCode,
+                body: result.body,
+                observedAt,
+              });
+              deps.apiCallQuotaChoice?.set(accountKey, quotaKey);
+              apiCallQuotaPayloadByAuthIndex.set(authIndex, {
+                statusCode: result.statusCode,
+                body: result.body,
+                observedAt,
+              });
+              quotaWon = true;
+              break;
+            }
+            // A 2xx without groups may mean this backend holds no summary —
+            // remember it as a fallback but keep trying the remaining URLs.
+            if (!grouplessOk) grouplessOk = { key: quotaKey, statusCode: result.statusCode, body: result.body };
+            continue;
+          }
+          // Non-auth upstream error: keep the first for the parser warning,
+          // keep trying the remaining URLs for a usable answer.
+          if (!warnable) warnable = { statusCode: result.statusCode, body: result.body };
+        }
+        if (quotaWon) continue;
+        // No winning URL: attach the best evidence so the parser warns
+        // honestly (a groupless 2xx reads "carries no quota groups"; an error
+        // reads its upstream status). A groupless 2xx caches like any
+        // known-good answer, so throttled runs reuse it instead of going quiet.
+        const fallback = grouplessOk ?? warnable;
+        if (fallback) {
+          const observedAt = deps.now;
+          if (grouplessOk) {
+            deps.apiCallCache?.set(`${accountKey} ${grouplessOk.key}`, {
+              statusCode: grouplessOk.statusCode,
+              body: grouplessOk.body,
+              observedAt,
+            });
+          }
+          apiCallQuotaPayloadByAuthIndex.set(authIndex, {
+            statusCode: fallback.statusCode,
+            body: fallback.body,
+            observedAt,
+          });
+        }
+      }
+      if (metaSkipped > 0) {
+        pluginErrors.push(
+          `meta: ${metaSkipped} account(s) skipped — live Meta quota is panel-only ` +
+            `(the connector never calls it); the Management Center panel remains the live read.`,
+        );
+      }
+      if (liveQuotaDisabled > 0) {
+        pluginErrors.push(
+          `live quota disabled by config (apiCallEnabled) for ${liveQuotaDisabled} account(s); ` +
+            `no provider-API call was made for them this run.`,
+        );
       }
 
       const { accounts, unkeyed, warnings } = parseAuthFiles(authFiles, {
@@ -479,6 +681,7 @@ export async function runSync(deps: SyncDeps, inFlight: { running: boolean }): P
         pluginPayloadByProvider,
         pluginPayloadByAuthIndex,
         apiCallPayloadByAuthIndex,
+        apiCallQuotaPayloadByAuthIndex,
         apiCallObservedAt: deps.now,
       });
 

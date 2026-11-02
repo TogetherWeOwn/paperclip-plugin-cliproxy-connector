@@ -75,6 +75,16 @@ export interface ConnectorConfig {
   providerWindows: Record<string, string[]>;
   /** CLIProxy plugin id per provider for quota fetch (our five plugins). */
   pluginQuotaIds: Record<string, string>;
+  /**
+   * Per-provider kill switch for the pinned live `api-call` rounds. An entry
+   * of `false` disables all credential-bearing provider-API calls for that
+   * provider family (no subscription round, no quota round); anything else —
+   * including a missing entry — falls back to `DEFAULT_LIVE_QUOTA_PROVIDERS`
+   * below (on for antigravity/devin/meta, off for everything else, which has
+   * no template anyway). In-memory Maps (`apiCallLastCall`, backoff) are
+   * untouched by a kill switch flip, so re-enabling re-proves on the next run.
+   */
+  apiCallEnabled: Record<string, boolean>;
   /** Operator confirms the page audience exposure is intended (proposal §4.4). */
   audienceConfirmed: boolean;
 }
@@ -100,10 +110,10 @@ export const DEFAULT_PROVIDER_WINDOWS: Record<string, string[]> = {
   // (`x-codex-primary-used-percent`) alongside namespaced ones (`5h-primary`):
   // both must gate, or stock quotas never constrain routing.
   codex: ["codex", "5h", "weekly", "primary", "secondary"],
-  // Live provider-API windows: the Meta Muse key endpoint serves
-  // `window` + `weekly` (`parseMetaQuota`), the Devin Connect-RPC serves
-  // `daily` + `weekly` (`parseDevinQuota`), and Antigravity quota-summary
-  // buckets gate on their time window (`parseAntigravitySubscription`).
+  // Live provider-API windows: the Devin Connect-RPC serves `daily` +
+  // `weekly` (`parseDevinQuota`), and Antigravity quota-summary buckets gate
+  // on their time window (`parseAntigravityQuota`). Meta stays panel-only
+  // (no connector template), so its row below is window-name parity only.
   meta: ["meta", "window", "weekly"],
   antigravity: ["antigravity", "5h", "weekly", "daily", "monthly"],
   devin: ["devin", "5h", "weekly", "daily"],
@@ -304,6 +314,23 @@ export function parseConfig(raw: unknown): { config: ConnectorConfig; validation
     }
   }
 
+  // Per-provider kill switch for the pinned live `api-call` rounds. Keys are
+  // trimmed and lowercased provider words; values must be booleans. Missing entries fall
+  // back to DEFAULT_LIVE_QUOTA_PROVIDERS (on for antigravity/devin/meta).
+  const apiCallEnabled: Record<string, boolean> = {};
+  const apiCallEnabledIn = (r.apiCallEnabled ?? {}) as Record<string, unknown>;
+  if (isPlainObject(apiCallEnabledIn)) {
+    for (const [provider, enabled] of Object.entries(apiCallEnabledIn)) {
+      if (typeof enabled !== "boolean") {
+        errors.push(`apiCallEnabled[${provider}] must be a boolean; got ${JSON.stringify(enabled)}.`);
+        continue;
+      }
+      apiCallEnabled[provider.trim().toLowerCase()] = enabled;
+    }
+  } else if (r.apiCallEnabled !== undefined) {
+    errors.push("apiCallEnabled must be an object mapping provider words to booleans.");
+  }
+
   const perPoolReservePercent: Record<string, number> = {};
   const perPoolIn = (r.perPoolReservePercent ?? {}) as Record<string, unknown>;
   if (isPlainObject(perPoolIn)) {
@@ -355,11 +382,33 @@ export function parseConfig(raw: unknown): { config: ConnectorConfig; validation
     providers,
     providerWindows,
     pluginQuotaIds,
+    apiCallEnabled,
     audienceConfirmed: r.audienceConfirmed === true,
     ignoredProviders,
     ignoredAuthFileRefs,
   };
   return { config, validation: { ok: errors.length === 0, warnings, errors } };
+}
+
+/**
+ * Default per-provider live `api-call` state. On for the families with pinned
+ * templates (antigravity/devin) and for meta (no template exists, so the entry
+ * documents intent and covers a future Meta template without a config
+ * migration); off for everything else, which has no template anyway. An
+ * explicit `apiCallEnabled` entry always wins over this default.
+ */
+export const DEFAULT_LIVE_QUOTA_PROVIDERS: Record<string, boolean> = {
+  antigravity: true,
+  devin: true,
+  meta: true,
+};
+
+/** Whether the pinned live `api-call` rounds may run for a provider family. */
+export function isLiveQuotaEnabled(config: ConnectorConfig, provider: string): boolean {
+  const word = provider.trim().toLowerCase();
+  const explicit = config.apiCallEnabled[word];
+  if (typeof explicit === "boolean") return explicit;
+  return DEFAULT_LIVE_QUOTA_PROVIDERS[word] ?? false;
 }
 
 /**
