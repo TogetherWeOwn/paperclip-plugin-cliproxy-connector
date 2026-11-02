@@ -925,6 +925,22 @@ describe("Meta live quota (download + literal-header key call)", () => {
     expect(result.statusCode).toBe(200);
   });
 
+  it("drops the live api_key from the key answer before returning it", async () => {
+    // The key endpoint returns the account's live Muse credential verbatim
+    // (operator key-mint proof: identical across calls, equal to the stored
+    // key). The parser needs only subs_usage / subs_tier_name, so the client
+    // strips api_key at this choke point — the 45-minute cache and every
+    // downstream payload receive the scrubbed body.
+    const LIVE_KEY_FIXTURE = "sk-live-fixture-meta-key-9f8e7d6c5b4a";
+    const fetch = vi.fn(async () =>
+      envelope(200, { api_key: LIVE_KEY_FIXTURE, subs_tier_name: "Pro", subs_usage: {} }),
+    );
+    const result = await client(fetch).postMetaMuseCodeKey("m1", DCA_FIXTURE);
+    expect(result.statusCode).toBe(200);
+    expect(result.body).toEqual({ subs_tier_name: "Pro", subs_usage: {} });
+    expect(JSON.stringify(result.body)).not.toContain(LIVE_KEY_FIXTURE);
+  });
+
   it("refuses an unusable token or index before any network happens", async () => {
     for (const badToken of ["", "not-a-dca-token", "dca:has whitespace", `dca:${"x".repeat(4096)}`]) {
       const fetch = vi.fn(async () => envelope(200, {}));

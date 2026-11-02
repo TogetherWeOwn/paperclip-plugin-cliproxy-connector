@@ -1423,7 +1423,12 @@ describe("live provider-API quota (pinned api-call templates)", () => {
   // real `dca:` token and must never reach activity, summaries, rows,
   // strike state or failures — every Meta test below asserts that.
   const DCA_FIXTURE = "dca:fixture-meta-token-abc123";
+  // Stand-in for the live Muse credential the key endpoint returns verbatim
+  // (operator key-mint proof): the client strips it before caching or parsing,
+  // so no test below may let it reach stored state either.
+  const API_KEY_FIXTURE = "sk-live-fixture-meta-key-9f8e7d6c5b4a";
   const metaKeyBody = () => ({
+    api_key: API_KEY_FIXTURE,
     subs_tier_name: "Pro",
     subs_usage: {
       tier: "Pro",
@@ -1491,6 +1496,20 @@ describe("live provider-API quota (pinned api-call templates)", () => {
     expect(blob).not.toContain(encodeURIComponent(DCA_FIXTURE));
   }
 
+  function assertNoApiKeyLeak(s: Store) {
+    const blob = JSON.stringify([
+      s.activity,
+      s.savedSummary,
+      s.savedRows,
+      s.strike,
+      s.failure,
+      s.savedSpend,
+      s.savedCounts,
+    ]);
+    expect(blob).not.toContain(API_KEY_FIXTURE);
+    expect(blob).not.toContain(encodeURIComponent(API_KEY_FIXTURE));
+  }
+
   function metaFiles() {
     return [
       { id: "meta-a", provider: "meta", name: "meta-a.json", auth_index: "m1" },
@@ -1532,6 +1551,7 @@ describe("live provider-API quota (pinned api-call templates)", () => {
     }
     assertNoKeyLeak(s);
     assertNoDcaLeak(s);
+    assertNoApiKeyLeak(s);
   });
 
   it("skips per file when the auth file carries no usable dca token (no key call, stays blind)", async () => {
@@ -1559,6 +1579,7 @@ describe("live provider-API quota (pinned api-call templates)", () => {
     expect(summary.errors.join(" ")).toMatch(/no usable dca_token/);
     assertNoKeyLeak(s);
     assertNoDcaLeak(s);
+    assertNoApiKeyLeak(s);
   });
 
   it("warns per file when the auth-file download fails (no key call, stays blind)", async () => {
@@ -1577,6 +1598,7 @@ describe("live provider-API quota (pinned api-call templates)", () => {
     expect(summary.errors.join(" ")).toMatch(/auth-file download failed/);
     assertNoKeyLeak(s);
     assertNoDcaLeak(s);
+    assertNoApiKeyLeak(s);
   });
 
   it("an upstream 401 on the key call backs the account off for an hour", async () => {
@@ -1614,6 +1636,7 @@ describe("live provider-API quota (pinned api-call templates)", () => {
     expect(downloads).toHaveLength(1);
     assertNoKeyLeak(s);
     assertNoDcaLeak(s);
+    assertNoApiKeyLeak(s);
   });
 
   it("reuses the cached key answer within 45 minutes and refetches after (or on manual refresh)", async () => {
@@ -1654,6 +1677,7 @@ describe("live provider-API quota (pinned api-call templates)", () => {
     expect(calls).toHaveLength(3);
     assertNoKeyLeak(s);
     assertNoDcaLeak(s);
+    assertNoApiKeyLeak(s);
   });
 
   it("makes no download or key call when metaQuota is disabled and says so once", async () => {
@@ -1675,6 +1699,7 @@ describe("live provider-API quota (pinned api-call templates)", () => {
     expect(summary.errors.join(" ")).toMatch(/meta quota disabled by config/);
     assertNoKeyLeak(s);
     assertNoDcaLeak(s);
+    assertNoApiKeyLeak(s);
   });
 
   it("keeps the fixture token out of errors on 4xx/5xx and on parse failures", async () => {
@@ -1694,6 +1719,7 @@ describe("live provider-API quota (pinned api-call templates)", () => {
     const failedRows = Object.values(s.savedRows ?? {});
     expect(failed.errors.join(" ") + (failedRows[0]?.lastError ?? "")).toMatch(/upstream HTTP 500/);
     assertNoDcaLeak(s);
+    assertNoApiKeyLeak(s);
     // Unparseable key body on a 2xx: the parser warns, the row stays blind.
     const callsBad: string[] = [];
     const downloadsBad: string[] = [];
@@ -1710,6 +1736,7 @@ describe("live provider-API quota (pinned api-call templates)", () => {
     expect(Object.values(s.savedRows ?? {})[0]?.quotaBlind).toBe(true);
     assertNoKeyLeak(s);
     assertNoDcaLeak(s);
+    assertNoApiKeyLeak(s);
   });
 
   it("a disabled kill switch makes no provider call and warns once", async () => {

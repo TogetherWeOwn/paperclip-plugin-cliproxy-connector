@@ -1053,7 +1053,17 @@ export class CliproxyManagementClient {
       }
       throw err;
     }
-    return parseApiCallEnvelope(raw);
+    const result = parseApiCallEnvelope(raw);
+    // The key answer carries a live `api_key` (the account's Muse credential;
+    // the operator's key-mint proof showed it is the stored key, returned
+    // verbatim on every call). Drop it here, at the single choke point, so
+    // neither the 45-minute in-memory cache nor the parser payloads ever hold
+    // it. The quota parser reads only `subs_usage` / `subs_tier_name`, which
+    // are untouched.
+    if (typeof result.body === "object" && result.body !== null && !Array.isArray(result.body)) {
+      delete (result.body as Record<string, unknown>).api_key;
+    }
+    return result;
   }
 
   private resolveApiCallTarget(): URL {
