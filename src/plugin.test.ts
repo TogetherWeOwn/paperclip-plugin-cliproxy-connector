@@ -156,7 +156,7 @@ describe("sync job", () => {
     expect(strike.disabled).toBe(false);
   });
 
-  it("re-enable action logs the stable strike_reenabled key with the sentence in metadata", async () => {
+  it("re-enable action logs the stable strike_budget_reenabled key with the sentence in metadata", async () => {
     const { harness } = await setup();
     const spy = vi.spyOn(harness.ctx.activity, "log");
     await harness.performAction(
@@ -166,7 +166,7 @@ describe("sync job", () => {
     );
     expect(spy).toHaveBeenCalledTimes(1);
     const call = spy.mock.calls[0]?.[0] as { message: string; metadata?: Record<string, unknown> };
-    expect(call.message).toBe("cliproxy_connector.strike_reenabled");
+    expect(call.message).toBe("cliproxy_connector.strike_budget_reenabled");
     expect(call.message).toMatch(/^cliproxy_connector\.[a-z_]+$/);
     expect(typeof call.metadata?.summary).toBe("string");
     expect(call.metadata?.summary).toContain("u-1");

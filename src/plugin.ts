@@ -31,7 +31,7 @@ import {
 import type { PluginPerformActionContext } from "@paperclipai/plugin-sdk";
 import { route, type RouterCandidate } from "./router.js";
 import {
-  ACTIVITY_STRIKE_REENABLED,
+  ACTIVITY_STRIKE_BUDGET_REENABLED,
   emptyStrikeBudget,
   reenableAfterStrike,
   runSync,
@@ -172,12 +172,14 @@ async function loadLastFailure(ctx: PluginContext, companyId: string): Promise<S
   return null;
 }
 
-async function loadDriftLedger(ctx: PluginContext, companyId: string): Promise<DriftLedger> {
+async function loadDriftLedger(ctx: PluginContext, companyId: string): Promise<DriftLedger | null> {
   const raw = await ctx.state.get(key(companyId, DRIFT_LEDGER_STATE_KEY));
   if (raw !== null && typeof raw === "object" && !Array.isArray(raw)) {
     return raw as DriftLedger;
   }
-  return {};
+  // Null (never persisted) is distinct from an empty ledger (all findings
+  // cleared): only null triggers silent upgrade seeding in reconcileDriftLedger.
+  return null;
 }
 
 async function resolveCompany(
@@ -276,8 +278,9 @@ const plugin = definePlugin({
       );
       await ctx.activity.log({
         companyId,
-        message: ACTIVITY_STRIKE_REENABLED,
+        message: ACTIVITY_STRIKE_BUDGET_REENABLED,
         metadata: {
+          event: ACTIVITY_STRIKE_BUDGET_REENABLED,
           summary: `strike budget re-enabled by board user ${userId}.`,
           actor: `board user ${userId}`,
           via: "board-action",
@@ -318,8 +321,9 @@ const plugin = definePlugin({
           : `agent ${input.actor.agentId ?? "unknown"}`;
       await ctx.activity.log({
         companyId,
-        message: ACTIVITY_STRIKE_REENABLED,
+        message: ACTIVITY_STRIKE_BUDGET_REENABLED,
         metadata: {
+          event: ACTIVITY_STRIKE_BUDGET_REENABLED,
           summary: `strike budget re-enabled via board API route by ${actorLabel}.`,
           actor: actorLabel,
           via: "api-route",

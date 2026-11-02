@@ -28,13 +28,15 @@ export {
   strikeWaitUntil,
   reconcileDriftLedger,
   logSyncFailure,
+  activityKeyForFailureKind,
   driftKeyFor,
   ACTIVITY_DRIFT_DETECTED,
   ACTIVITY_DRIFT_CLEARED,
-  ACTIVITY_DRIFT_REMINDER,
+  ACTIVITY_DRIFT_STILL_PRESENT,
   ACTIVITY_SYNC_FAILED,
   ACTIVITY_SYNC_RECOVERED,
-  ACTIVITY_STRIKE_REENABLED,
+  ACTIVITY_SETUP_ERROR,
+  ACTIVITY_STRIKE_BUDGET_REENABLED,
   ACTIVITY_REMINDER_INTERVAL_MS,
 } from "./sync.js";
 export { parseConfig, effectiveReservePercent } from "./config.js";

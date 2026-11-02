@@ -121,8 +121,9 @@ The plugin ships two pages over the same sync cache:
   per-account detail. Findings suppressed by `ignoredProviders` /
   `ignoredAuthFileRefs` render in a separate accepted section, never as drift.
 - The **activity feed** stays quiet by design: every plugin row uses a stable key
-  (`cliproxy_connector.drift_detected` / `.drift_cleared` / `.drift_reminder` /
-  `sync_failed` / `sync_recovered` / `strike_reenabled`) with the human sentence
+  (`cliproxy_connector.drift_detected` / `.drift_cleared` /
+  `.drift_still_present` / `sync_failed` / `sync_recovered` / `.setup_error` /
+  `.strike_budget_reenabled`) with the human sentence
   in `metadata.summary` plus structured fields. Drift logs only on state changes
   (new key, cleared key, at most one reminder per 24 h per finding); repeated
   identical sync failures log once with the same daily reminder bound. Expect

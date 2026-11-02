@@ -53,10 +53,11 @@ import type {
  */
 export const ACTIVITY_DRIFT_DETECTED = "cliproxy_connector.drift_detected";
 export const ACTIVITY_DRIFT_CLEARED = "cliproxy_connector.drift_cleared";
-export const ACTIVITY_DRIFT_REMINDER = "cliproxy_connector.drift_reminder";
+export const ACTIVITY_DRIFT_STILL_PRESENT = "cliproxy_connector.drift_still_present";
 export const ACTIVITY_SYNC_FAILED = "cliproxy_connector.sync_failed";
 export const ACTIVITY_SYNC_RECOVERED = "cliproxy_connector.sync_recovered";
-export const ACTIVITY_STRIKE_REENABLED = "cliproxy_connector.strike_reenabled";
+export const ACTIVITY_SETUP_ERROR = "cliproxy_connector.setup_error";
+export const ACTIVITY_STRIKE_BUDGET_REENABLED = "cliproxy_connector.strike_budget_reenabled";
 
 /**
  * At most one reminder row per drift finding (or per persisting failure) per
@@ -170,8 +171,12 @@ export interface SyncDeps {
   recordFailure: (failure: SyncFailure | null) => Promise<void>;
   /** Latest recorded sync failure, for failure dedupe and recovery logging. */
   loadFailure: () => Promise<SyncFailure | null>;
-  /** Drift ledger for state-change activity logging. */
-  loadDriftLedger: () => Promise<DriftLedger>;
+  /**
+   * Drift ledger for state-change activity logging. Null when no ledger was
+   * ever persisted (pre-upgrade state): the first successful sync seeds it
+   * silently instead of emitting a burst for pre-existing findings.
+   */
+  loadDriftLedger: () => Promise<DriftLedger | null>;
   saveDriftLedger: (ledger: DriftLedger) => Promise<void>;
   logActivity: (message: string, metadata?: Record<string, unknown>) => Promise<void>;
   /**
@@ -610,9 +615,10 @@ export async function runSync(deps: SyncDeps, inFlight: { running: boolean }): P
       if (prevFailure) {
         await deps.logActivity(ACTIVITY_SYNC_RECOVERED, {
           companyId: deps.companyId,
+          event: ACTIVITY_SYNC_RECOVERED,
           summary: `sync recovered (previous failure: ${prevFailure.message})`,
           failureKind: prevFailure.failureKind ?? "unknown",
-          detail: prevFailure.message,
+          error: prevFailure.message,
         });
       }
       await deps.recordFailure(null);
@@ -906,21 +912,39 @@ export function accountsToRows(
 /**
  * Reconcile the current drift findings against the persisted ledger and log
  * exactly the state changes: one `drift_detected` per new key, one
- * `drift_cleared` per vanished key, and at most one `drift_reminder` per
- * 24 h per key that stays present. Findings that only became accepted (via a
- * config edit) leave the ledger silently — they did not clear, they were
- * accepted. Returns the updated ledger for the caller to persist.
+ * `drift_cleared` per vanished key, and at most one `drift_still_present`
+ * reminder per 24 h per key that stays present. Findings that only became
+ * accepted (via a config edit) leave the ledger silently — they did not
+ * clear, they were accepted. Returns the updated ledger for the caller to
+ * persist.
  *
- * First run after upgrade logs one `drift_detected` per existing finding (the
- * ledger starts empty): a one-time burst, then silence until something
- * changes.
+ * First run after upgrade (no ledger persisted yet — null, as opposed to a
+ * persisted-but-empty ledger after an all-clear): seed every current finding
+ * as notified "now" and log nothing, so the upgrade itself emits no burst.
+ * Only successful syncs reach this function, so a failed or skipped run never
+ * seeds, clears or re-detects findings.
  */
 export async function reconcileDriftLedger(
   deps: Pick<SyncDeps, "now" | "companyId" | "logActivity" | "loadDriftLedger">,
   drift: DriftFinding[],
 ): Promise<DriftLedger> {
   const nowMs = Date.parse(deps.now);
-  const ledger = await deps.loadDriftLedger();
+  const stored = await deps.loadDriftLedger();
+  if (stored === null) {
+    const seeded: DriftLedger = {};
+    for (const finding of drift) {
+      seeded[driftKeyFor(finding)] = {
+        kind: finding.kind,
+        provider: finding.provider,
+        detail: finding.detail,
+        firstSeenAt: deps.now,
+        lastSeenAt: deps.now,
+        lastLoggedAt: deps.now,
+      };
+    }
+    return seeded;
+  }
+  const ledger = stored;
   const current = new Set(drift.map(driftKeyFor));
   for (const finding of drift) {
     const key = driftKeyFor(finding);
@@ -937,6 +961,7 @@ export async function reconcileDriftLedger(
       ledger[key] = next;
       await deps.logActivity(ACTIVITY_DRIFT_DETECTED, {
         companyId: deps.companyId,
+        event: ACTIVITY_DRIFT_DETECTED,
         summary: `drift detected [${finding.kind}] ${finding.provider}: ${finding.detail}`,
         kind: finding.kind,
         provider: finding.provider,
@@ -949,8 +974,9 @@ export async function reconcileDriftLedger(
     const lastLoggedMs = Date.parse(entry.lastLoggedAt);
     if (Number.isNaN(lastLoggedMs) || nowMs - lastLoggedMs >= ACTIVITY_REMINDER_INTERVAL_MS) {
       entry.lastLoggedAt = deps.now;
-      await deps.logActivity(ACTIVITY_DRIFT_REMINDER, {
+      await deps.logActivity(ACTIVITY_DRIFT_STILL_PRESENT, {
         companyId: deps.companyId,
+        event: ACTIVITY_DRIFT_STILL_PRESENT,
         summary:
           `drift still present [${finding.kind}] ${finding.provider}: ${finding.detail} ` +
           `(first seen ${entry.firstSeenAt})`,
@@ -968,6 +994,7 @@ export async function reconcileDriftLedger(
     delete ledger[key];
     await deps.logActivity(ACTIVITY_DRIFT_CLEARED, {
       companyId: deps.companyId,
+      event: ACTIVITY_DRIFT_CLEARED,
       summary: `drift cleared [${entry.kind}] ${entry.provider}: ${entry.detail}`,
       kind: entry.kind,
       provider: entry.provider,
@@ -980,17 +1007,24 @@ export async function reconcileDriftLedger(
 }
 
 /**
- * Log a sync failure under the stable `sync_failed` key, deduped by failure
+ * Failure kinds that are setup problems (bad secret, rejected key) log under
+ * the stable `setup_error` key; anything else (CLIProxy down, schema errors)
+ * logs under `sync_failed`. Either way the log is deduped by failure
  * signature (kind + message): the first occurrence logs once, an identical
  * failure persisting across runs only refreshes the recorded attempt, with at
  * most one reminder row per 24 h. A changed message (or kind) is a new failure
  * and logs anew — e.g. the escalation from first rejection to hard-disable.
  */
+export function activityKeyForFailureKind(kind: string): string {
+  return kind === "sync-error" ? ACTIVITY_SYNC_FAILED : ACTIVITY_SETUP_ERROR;
+}
+
 export async function logSyncFailure(
   deps: Pick<SyncDeps, "now" | "companyId" | "logActivity" | "loadFailure" | "recordFailure">,
   failure: { kind: string; message: string },
 ): Promise<void> {
   const nowMs = Date.parse(deps.now);
+  const activityKey = activityKeyForFailureKind(failure.kind);
   const prev = await deps.loadFailure();
   if (prev && prev.failureKind === failure.kind && prev.message === failure.message) {
     const lastLoggedMs = Date.parse(prev.lastLoggedAt ?? prev.attemptedAt);
@@ -1002,11 +1036,12 @@ export async function logSyncFailure(
       lastLoggedAt: reminderDue ? deps.now : (prev.lastLoggedAt ?? prev.attemptedAt),
     });
     if (reminderDue) {
-      await deps.logActivity(ACTIVITY_SYNC_FAILED, {
+      await deps.logActivity(activityKey, {
         companyId: deps.companyId,
+        event: activityKey,
         summary: failure.message,
         failureKind: failure.kind,
-        detail: failure.message,
+        error: failure.message,
         reminder: true,
       });
     }
@@ -1018,11 +1053,12 @@ export async function logSyncFailure(
     failureKind: failure.kind,
     lastLoggedAt: deps.now,
   });
-  await deps.logActivity(ACTIVITY_SYNC_FAILED, {
+  await deps.logActivity(activityKey, {
     companyId: deps.companyId,
+    event: activityKey,
     summary: failure.message,
     failureKind: failure.kind,
-    detail: failure.message,
+    error: failure.message,
   });
 }
 
