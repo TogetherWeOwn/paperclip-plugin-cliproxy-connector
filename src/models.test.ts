@@ -4,6 +4,7 @@ import {
   namespaceOfModelId,
   observedModelKeysByProvider,
   parseModelsPayload,
+  scrubDisplayName,
 } from "./models.js";
 
 function keysFor(provider: string, models: string[]) {
@@ -39,6 +40,16 @@ describe("parseModelsPayload", () => {
     expect(warnings).toEqual([]);
     // Routing still keys on the id: displayName never appears in the id set.
     expect(models.map((m) => m.id)).toEqual(["claude-opus-4-5"]);
+  });
+
+  it("rejects display names with an email glued inside other text", () => {
+    expect(scrubDisplayName("Available for user@example.com")).toBeNull();
+    expect(scrubDisplayName("user@example.com")).toBeNull();
+    expect(scrubDisplayName("Claude Opus 4.5")).toBe("Claude Opus 4.5");
+    const { models } = parseModelsPayload({
+      data: [{ id: "claude-opus-4-5", display_name: "Available for user@example.com" }],
+    });
+    expect(models).toEqual([{ id: "claude-opus-4-5", ownedBy: null, displayName: null }]);
   });
 
   it("warns on an empty payload instead of claiming models", () => {

@@ -141,8 +141,29 @@ export function isEmailLike(s: string): boolean {
 }
 
 /**
+ * True when a whitespace-delimited token holds an email-shaped piece glued to
+ * other text (`user@example.com's`, `a@x.com,b@y.com`, `email=a@b.com&retry`,
+ * `a@x.test/path`, `user@example.com:443`). The token is split on characters
+ * that cannot appear in an address and each piece is judged with the linear
+ * `isEmailLike` scan — no backtracking pattern (CodeQL js/polynomial-redos).
+ * Tokens without `@` return false without splitting.
+ */
+export function tokenContainsEmail(tok: string): boolean {
+  if (!tok.includes("@")) return false;
+  const core = tok.replace(/^[^A-Za-z0-9]+/, "").replace(/[^A-Za-z0-9]+$/, "");
+  if (isEmailLike(core)) return true;
+  const pieces = core.split(/[^A-Za-z0-9._%+@-]+/);
+  for (const piece of pieces) {
+    const p = piece.replace(/^[^A-Za-z0-9]+/, "").replace(/[^A-Za-z0-9]+$/, "");
+    if (p.length > 0 && p !== core && isEmailLike(p)) return true;
+  }
+  return false;
+}
+
+/**
  * Scrub an upstream `status_message` before it reaches the plugin page.
- * Emails become `[redacted-email]`; any whitespace-delimited token that
+ * Emails become `[redacted-email]` — whole tokens and addresses glued to
+ * other text alike; any whitespace-delimited token that
  * looks credential-like — a 20+ word-char run, or 8+ chars mixing letters
  * with digits (short API keys, session ids) — becomes `[redacted]`. Tokens
  * with operational shapes (timestamps, versions, benign `k=v` pairs like
@@ -159,10 +180,11 @@ export function sanitizeStatusMessage(raw: string | null): string | null {
     .map((tok) => {
       // Judge the punctuation-stripped core: real notes attach commas and
       // periods ("for gpt-4o-mini, retry"), which must not defeat the
-      // operational-shape exemption. Email-like cores redact as a whole
-      // token, which also covers addresses glued to punctuation.
+      // operational-shape exemption. Email-shaped pieces glued inside the
+      // token (`a@x.com,b@y.com`, `email=a@b.com&retry`) redact as a whole
+      // token, so a suffix cannot smuggle an address past the check.
       const core = tok.replace(/^[^A-Za-z0-9]+/, "").replace(/[^A-Za-z0-9]+$/, "");
-      if (isEmailLike(core)) return "[redacted-email]";
+      if (tokenContainsEmail(tok)) return "[redacted-email]";
       if (/[A-Za-z0-9_\-]{20,}/.test(tok)) return "[redacted]";
       if (isCredentialCore(core)) return "[redacted]";
       return tok;
@@ -517,7 +539,10 @@ function summarizeMetrics(value: unknown): string[] | null {
   const out: string[] = [];
   for (const item of value.slice(0, 32)) {
     const push = (raw: string) => {
-      const clean = sanitizeStatusMessage(raw.slice(0, 240));
+      // Scrub the full string first: truncating before scrubbing can leave a
+      // partial email the scrubber no longer recognizes. The sanitizer caps
+      // at 120 chars itself.
+      const clean = sanitizeStatusMessage(raw);
       if (clean) out.push(clean);
     };
     if (typeof item === "string" && item.trim()) push(item.trim());
@@ -610,13 +635,22 @@ const GATING_COOLDOWN_REASONS = new Set(["credential_quota", "quota"]);
 /** Reasons that surface a read-only "needs sign-in" badge (never a reset). */
 const SIGN_IN_COOLDOWN_REASONS = new Set(["invalid_grant", "unauthorized"]);
 
-/** Scrub an upstream cooldown token (model key / reason): scrubber + 64 cap. */
+/**
+ * A cooldown token (model key / reason) is an identifier, not free text:
+ * allow-list pattern, email-shaped values rejected. The status-message
+ * scrubber redacted dated model ids (`claude-sonnet-4-5-20250929` trips the
+ * 20+ word-char rule) and silently disabled model-scoped gating, so model
+ * keys never go through it. A rejected model key yields no model gating;
+ * callers keep the raw trimmed word for display-only reasons.
+ */
+const COOLDOWN_TOKEN_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$/;
+
 function scrubCooldownToken(raw: unknown): string | null {
   if (typeof raw !== "string") return null;
   const s = raw.trim();
   if (!s) return null;
-  const scrubbed = sanitizeStatusMessage(s.length > 64 ? s.slice(0, 64) : s);
-  return scrubbed && scrubbed !== "[redacted]" && scrubbed !== "[redacted-email]" ? scrubbed : null;
+  if (isEmailLike(s) || !COOLDOWN_TOKEN_PATTERN.test(s)) return null;
+  return s;
 }
 
 /**
@@ -707,9 +741,11 @@ export function parseAccountLabel(
       // Explicit operator opt-in: render the email label verbatim (capped).
       return s.length > 40 ? s.slice(0, 40) : s;
     }
-    const scrubbed = sanitizeStatusMessage(s.length > 40 ? s.slice(0, 40) : s);
+    // Scrub the full note before capping: truncating first can leave a
+    // partial email (`...someone.long@example.c`) the scrubber misses.
+    const scrubbed = sanitizeStatusMessage(s);
     if (!scrubbed || scrubbed.includes("[redacted-email]") || scrubbed === "[redacted]") continue;
-    return scrubbed;
+    return scrubbed.length > 40 ? scrubbed.slice(0, 40) : scrubbed;
   }
   if (opts?.showEmails && email) {
     // Explicit operator opt-in with no usable note/label: fall back to the
@@ -741,7 +777,9 @@ export function parseSignInFields(entry: Json): ParsedSignIn {
   const refreshObj = getObj(entry, "refresh_error", "refreshError");
   const refreshMessage = refreshObj ? getStr(refreshObj, "message", "Message", "error") : null;
   const hintRaw = recoveryHint ?? refreshMessage ?? null;
-  const hint = hintRaw ? sanitizeStatusMessage(hintRaw.length > 120 ? hintRaw.slice(0, 120) : hintRaw) : null;
+  // Scrub the full hint: the sanitizer already caps at 120 chars, and
+  // truncating first can leave a partial email it no longer recognizes.
+  const hint = hintRaw ? sanitizeStatusMessage(hintRaw) : null;
   const tokenExpiresAt = toIsoTimestamp(
     entry.access_token_expires_at ?? entry.accessTokenExpiresAt ?? null,
   );

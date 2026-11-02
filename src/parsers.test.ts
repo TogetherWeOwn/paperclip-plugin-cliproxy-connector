@@ -16,6 +16,7 @@ import {
   parseSignInFields,
   quotaBlindReasonWithExhaustedUntil,
   sanitizeStatusMessage,
+  tokenContainsEmail,
 } from "./parsers.js";
 import { DEFAULT_PROVIDER_WINDOWS } from "./config.js";
 
@@ -958,6 +959,31 @@ describe("isEmailLike", () => {
   });
 });
 
+describe("tokenContainsEmail", () => {
+  it("spots email-shaped pieces glued to other text", () => {
+    for (const tok of [
+      "user@example.com's",
+      "a@x.com,b@y.com",
+      "email=a@b.com&retry",
+      "a@x.test/path",
+      "user@example.com:443",
+      "(user@example.com)",
+    ]) {
+      expect(tokenContainsEmail(tok)).toBe(true);
+    }
+    for (const tok of ["gpt-4o-mini", "claude-3.5-sonnet", "error=429", "2026-11-01T12:00:00Z", "ok"]) {
+      expect(tokenContainsEmail(tok)).toBe(false);
+    }
+  });
+
+  it("stays linear on adversarial repetition (CodeQL js/polynomial-redos)", () => {
+    const start = Date.now();
+    expect(tokenContainsEmail(`${"a".repeat(10_000)}@example.com,`)).toBe(true);
+    expect(tokenContainsEmail("x".repeat(10_000))).toBe(false);
+    expect(Date.now() - start).toBeLessThan(1000);
+  });
+});
+
 describe("sanitizeStatusMessage", () => {
   it("keeps short operational notes unchanged", () => {
     expect(sanitizeStatusMessage("ok")).toBe("ok");
@@ -971,6 +997,20 @@ describe("sanitizeStatusMessage", () => {
     expect(scrubbed).not.toContain("abcdefghijklmnopqrstu");
     expect(scrubbed).toContain("[redacted-email]");
     expect(scrubbed).toContain("[redacted]");
+  });
+
+  it("redacts emails glued to other text inside a token", () => {
+    for (const [note, leaked] of [
+      ["contact user@example.com's soon", "example.com"],
+      ["notify a@x.com,b@y.com now", "x.com"],
+      ["retry email=a@b.com&retry later", "a@b.com"],
+      ["see a@x.test/path here", "a@x.test"],
+      ["dial user@example.com:443 now", "example.com"],
+    ] as Array<[string, string]>) {
+      const scrubbed = sanitizeStatusMessage(note) ?? "";
+      expect(scrubbed).toContain("[redacted-email]");
+      expect(scrubbed).not.toContain(leaked);
+    }
   });
 
   it("redacts short credential-like tokens but keeps hyphenated operational words", () => {
@@ -2052,6 +2092,37 @@ describe("Group A: cooldowns[], sign-in badge, account labels", () => {
     expect(cooldowns).toHaveLength(1);
     expect(isModelGatingCooldown(cooldowns[0], NOW_MS)).toBe(true);
     expect(isGatingCooldown(cooldowns[0], NOW_MS)).toBe(false);
+  });
+
+  it("dated model ids gate model-scoped cooldowns; email-shaped keys do not", () => {
+    const cooldowns = parseCooldowns({
+      cooldowns: [
+        { scope: "model", model_key: "claude-sonnet-4-5-20250929", reason: "quota", retry_at: FUTURE },
+        { scope: "model", model_key: "claude-3-5-sonnet-20241022", reason: "quota", retry_at: FUTURE },
+        { scope: "model", model_key: "user@example.com", reason: "quota", retry_at: FUTURE },
+      ],
+    } as never);
+    expect(cooldowns).toHaveLength(3);
+    const [dated, dotted, email] = cooldowns;
+    expect(dated.modelKey).toBe("claude-sonnet-4-5-20250929");
+    expect(isModelGatingCooldown(dated, NOW_MS)).toBe(true);
+    expect(dotted.modelKey).toBe("claude-3-5-sonnet-20241022");
+    expect(isModelGatingCooldown(dotted, NOW_MS)).toBe(true);
+    expect(email.modelKey).toBeNull();
+    expect(isModelGatingCooldown(email, NOW_MS)).toBe(false);
+  });
+
+  it("scrubs the full label note and hint before capping: no partial-email leak", () => {
+    expect(
+      parseAccountLabel({ note: "Spare key for the someone.long@example.com" } as never, "claude"),
+    ).toBeNull();
+    const hint = parseSignInFields({
+      requires_sign_in: true,
+      recovery_hint:
+        "please reauthenticate the spare operator account for someone.long@example.com urgently today",
+    } as never);
+    expect(hint.hint ?? "").not.toContain("example.com");
+    expect(hint.hint ?? "").not.toContain("someone.long");
   });
 
   it("sign-in fields raise a read-only badge, never a reset", () => {
