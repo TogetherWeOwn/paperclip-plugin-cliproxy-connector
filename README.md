@@ -70,6 +70,11 @@ the operator. You read redacted output only.
    note its `secret_ref`. The plugin uses it only for `GET /v1/models`; the management key
    is never sent to `/v1` paths. (Without it the sync still runs, but model → provider
    derivation and overlap detection stay off.)
+3b. Optional, for the provider-spend section: create a **dedicated** board secret holding
+   an OpenRouter API key — never reuse a CLIProxy key for a public host — and set
+   `openRouterSecretRef` to its `secret_ref`. Without it the spend section reads
+   "not configured", never an error. Deploy step (not code): the host `http.outbound`
+   egress policy must allow `openrouter.ai`; verify on staging before relying on the read.
 4. Create one Paperclip connection per CLIProxy provider family (stock model ids, one
    single-member pool per provider), and configure the company (plugin settings page):
    ```json
@@ -78,10 +83,14 @@ the operator. You read redacted output only.
      "managementKeyHeader": "X-Management-Key",
      "managementSecretRef": { "type": "secret_ref", "secretId": "<board secret id>", "version": "latest" },
      "clientApiKeySecretRef": { "type": "secret_ref", "secretId": "<board client-key secret id>", "version": "latest" },
+     "openRouterSecretRef": { "type": "secret_ref", "secretId": "<board openrouter secret id>", "version": "latest" },
+     "apiKeyUsageEnabled": true,
      "providers": [{ "provider": "claude", "connectionId": "<connection-id>", "completeInventory": true }],
      "audienceConfirmed": true
    }
    ```
+   `apiKeyUsageEnabled` defaults to `false`: the request-count read is opt-in (see the
+   Usage & Quota section below).
    `managementKeyHeader` has no default on purpose; legacy string-UUID secrets fail closed.
    `completeInventory: true` means you confirm this provider has no hidden config-key
    credentials (default `false`: the provider can only be `allowed`/`unknown`, never
@@ -137,10 +146,35 @@ The plugin ships two pages over the same sync cache:
   masked account label (`acct-<13 shown>…`, full key never rendered), plan, priority,
   status, cooldown countdown, per-window bars and the display-only `metrics`.
   `summary[]` text is scrubbed like status notes (emails and credential-like tokens
-  redacted) before it reaches the page. Request/token counters are intentionally
-  absent: CLIProxy exposes no read-only per-account counters. Both pages are
+  redacted) before it reaches the page. Both pages are
   read-only over already synced state; the connector never calls the destructive
   `/v0/management/usage-queue` endpoint (asserted in tests).
+
+  The Usage & Quota page adds four read-model sections over the same cache
+  (every section shows its own fetch timestamp; a failed fetch keeps the
+  last-known snapshot with a soft note instead of blanking):
+
+  - **Provider spend (OpenRouter)**: `total_credits` / `total_usage` from one
+    worker-side `GET https://openrouter.ai/api/v1/credits` per sync, stored as
+    four fields only (`provider, totalCredits, totalUsage, fetchedAt`). Without
+    `openRouterSecretRef` the section reads "not configured", never an error.
+  - **Per-lane usage**: request counts from one `GET /v0/management/api-key-usage`
+    per sync (opt-in via `apiKeyUsageEnabled`, off by default; paused for
+    30 minutes after a 401/403), aggregated by
+    provider in the worker — the composite `base_url|api_key` keys are discarded
+    before any state write, so lanes carry provider words and counts only.
+    Labelled "requests": there is no per-lane token split from any lawful
+    read-only source, and OAuth lanes are invisible to the endpoint, so the page
+    says both outright. The quota section timestamp is the latest per-window
+    quota observation (`observedAt`, else the row fetch), never the sync
+    finish time — a passive window observed hours ago keeps its own age even
+    when its cache row was refreshed minutes ago.
+  - **Lane map**: the static agent-lane → provider/model table derived from the
+    cost-integration plan §1.3 on 2026-11-01, flagged verbatim
+    "Config-derived mapping (derived 2026-11-01). Not ledger data." Re-deriving
+    the table (and its date) is the only way it changes.
+  - **Native cost views**: literal link-outs to `/costs` and `/budgets/overview`
+    (write-path policy and budgets stay out of this connector by design).
 
 ## Config reference
 
@@ -150,6 +184,8 @@ The plugin ships two pages over the same sync cache:
 | `managementKeyHeader` | — (required) | Exact header name CLIProxy expects. No default. |
 | `managementSecretRef` | — (required) | `secret_ref` object (`{ "type": "secret_ref", "secretId": "…", "version": "latest" }`). Never persisted, never leaves the worker. |
 | `clientApiKeySecretRef` | — (warns when missing) | `secret_ref` object (same shape) for the client API key (`GET /v1/models`). Same never-persisted rule. Missing → derivation + overlap detection off. |
+| `openRouterSecretRef` | — (page shows "not configured") | Dedicated `secret_ref` object for the OpenRouter key (spend read only). Never a CLIProxy key; resolved per run, never persisted. |
+| `apiKeyUsageEnabled` | `false` | Opt-in request-count read (`GET /v0/management/api-key-usage`, aggregated by provider in the worker). Non-boolean fails closed. |
 | `syncIntervalMinutes` | `5` | The cron runs every 5 min; larger values make runs skip. Range 1–60. |
 | `reservePercent` | `10` | Default reserve; per-pool `thresholdPercent` derives `100 − t`. |
 | `perPoolReservePercent` | `{}` | Per-pool override, wins over everything. |
@@ -194,6 +230,23 @@ like every management GET; any other provider-side error travels inside the retu
 envelope and only warns per file (fail open). Live windows are labelled "via provider
 API" on the Usage & quota page. If your CLIProxy build
 differs, change the pinned constants in `src/cliproxy.ts` — everything else follows.
+
+Two usage-page reads ride the same sync cadence (at most one fetch each per run,
+both fail soft with last-known kept):
+
+- `GET https://openrouter.ai/api/v1/credits` (worker-side `ctx.http.fetch`, fixed
+  endpoint constant — never config-supplied, so no config edit can steer the
+  `Authorization` header). `{"data": {"total_credits", "total_usage"}}` projects to
+  four stored fields; anything else is a body error, never spend data. The host
+  `http.outbound` egress policy must allow `openrouter.ai` (verify on staging).
+- `GET /v0/management/api-key-usage` (pinned allow-list entry, no query string;
+  the v8 `/observability/usage/api-keys` route shares the handler, but the v0 path
+  stays the only admitted one). The payload's `base_url|api_key` composite keys are
+  iterated for their counter values only and never copied past the parse boundary;
+  a 401/403 fails closed with one warning, spends no strikes (the management key
+  already proved good against `auth-files` this run), and pauses further probes
+  for 30 minutes (persisted rejection time; the page keeps showing the pause
+  note while probes are off).
 The quota-fetch wire shape is the lowercase CLIProxyAPI `sdk/pluginapi`
 `QuotaFetchResponse`: `groups[]` → `buckets[]`, with per-bucket `window`,
 `remainingFraction`, `resetTime` and a payload-level `summary[]` surfaced as a
@@ -228,6 +281,16 @@ tests mirrors the public CLIProxyAPI source shapes.
   shares one budget whatever the loopback spelling (the CLIProxy lockout bans the whole
   host). Re-enable keeps the rolling failures and refuses to probe while the window is
   full — the page says "wait until \<time\>". Config edits never reset the budget.
+- Read-model secrets: the OpenRouter key lives behind its own dedicated `secret_ref`
+  (never a reused CLIProxy key), resolves per run, travels only as the
+  `Authorization` header to the fixed `openrouter.ai` constant (no config-supplied
+  URL — no SSRF-by-config), and never reaches persisted state, logs, or error text
+  (asserted in tests; the stored note is scrubbed with the live value split out
+  first as defense-in-depth).
+- Request counts are provider-aggregated in the worker: the `base_url|api_key`
+  composite keys are dropped at the parse boundary and structurally cannot reach
+  state, UI payloads, logs, or tests (key-absence asserted on the serialized output).
+  No `lastError` text is stored unscrubbed.
 - Single-flight + minimum 60 s interval between runs.
 - Router never calls CLIProxy inline; provider trust comes from the operator `providers[]`
   rows, verified per candidate binding at route time.
@@ -248,7 +311,11 @@ fetch, best-effort `/v1/models` fetch that never spends strikes, redaction),
 fixtures incl. the 60%-remaining regression test, bucket-less warnings, `summary[]` →
 `metrics`, Devin `daily`/`weekly` percents, empty-shell quiet, per-parser blind reasons,
 `openrouter` display-only key, `quota_plugin_id` discovery, redacted auth-files fixture,
-Devin quota grouped by auth-file provider), `models.test.ts` (served-list parsing,
+Devin quota grouped by auth-file provider, spend/counts integration incl. T1 key-absence,
+T3 auth-failure fail-closed without strikes, and T5 email scrubbing),
+`openrouter.test.ts` (fixed-endpoint credits fetch, shape validation, rotate-secret errors),
+`request-counts.test.ts` (composite-key aggregation with key-absence asserted),
+`models.test.ts` (served-list parsing,
 namespace-first attribution, Devin `owned_by: anthropic` case, colliding bare-id overlap),
 `cliproxy.test.ts` (management + client allow-lists, redirects, caps, redaction),
 `loopback-fetch.test.ts` (worker-local loopback transport: off-loopback/off-origin/other-method

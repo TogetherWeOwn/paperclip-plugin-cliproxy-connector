@@ -26,7 +26,10 @@ import type {
   AccountUsageRow,
   DriftFinding,
   Freshness,
+  ProviderRequestCounts,
   ProviderState,
+  StoredRequestCounts,
+  StoredSpend,
   StrikeBudgetState,
   SyncFailure,
   SyncSummary,
@@ -187,11 +190,91 @@ export interface WidgetData {
 }
 
 /**
+ * Provider spend section: the last-known OpenRouter credits snapshot. When no
+ * secret is configured the page shows "not configured", never an error; when a
+ * fetch fails the last-known figures stay with their timestamp plus the soft
+ * note (T9). `remaining` is plain arithmetic on the two stored figures.
+ */
+export interface SpendSection {
+  configured: boolean;
+  totalCredits: number | null;
+  totalUsage: number | null;
+  remaining: number | null;
+  fetchedAt: string | null;
+  note: string | null;
+}
+
+/**
+ * Per-lane usage section at request-count fidelity (labelled "requests", never
+ * tokens): the worker-aggregated `api-key-usage` lanes. Composite
+ * `base_url|api_key` keys were discarded at the parse boundary, so lanes carry
+ * provider words and counts only. Off by default (`apiKeyUsageEnabled`).
+ */
+export interface UsageCountsSection {
+  enabled: boolean;
+  lanes: ProviderRequestCounts[];
+  fetchedAt: string | null;
+  note: string | null;
+  fidelityNote: string;
+}
+
+/** Request-count fidelity disclaimer: shown verbatim under the usage section. */
+export const REQUEST_COUNT_FIDELITY_NOTE =
+  "Request counts only (api-key lanes). No per-lane token split exists from a lawful read-only source; " +
+  "OAuth lanes are invisible to this endpoint and are not represented here.";
+
+/**
+ * Static lane map, derived from the cost-integration plan §1.3 on
+ * 2026-11-01 — not from the ledger. The flag travels with the data so the page
+ * can never render the map without its provenance, and `derivedAt` is the
+ * section's timestamp. Any change to the underlying agent lanes means
+ * re-deriving this table (and its date), not editing numbers in place.
+ */
+export const LANE_MAP_DERIVED_AT = "2026-11-01";
+export const LANE_MAP_FLAG = `Config-derived mapping (derived ${LANE_MAP_DERIVED_AT}). Not ledger data.`;
+
+export interface LaneMapRow {
+  lane: string;
+  agents: number;
+  provider: string;
+  model: string;
+}
+
+export const LANE_MAP: LaneMapRow[] = [
+  { lane: "wonder-full", agents: 7, provider: "anthropic", model: "opus" },
+  { lane: "spark", agents: 3, provider: "anthropic", model: "opus" },
+  { lane: "opus", agents: 2, provider: "anthropic", model: "opus" },
+];
+
+export interface LaneMapSection {
+  derivedAt: string;
+  flag: string;
+  lanes: LaneMapRow[];
+}
+
+/**
+ * Native cost views live outside this plugin (write-path and budget policy are
+ * out of scope by design): the page links out with literal path constants, so
+ * no payload-derived href can ever steer navigation (T4).
+ */
+export const NATIVE_COSTS_URL = "/costs";
+export const NATIVE_BUDGETS_URL = "/budgets/overview";
+
+export interface NativeLinksSection {
+  costsUrl: string;
+  budgetsUrl: string;
+}
+
+/**
  * "Usage & quota" page data: the sync summary plus one card per provider
  * with headroom counts, the earliest reset, freshness, blind badges, and the
  * per-account table rows (masked labels, bars per window, cooldowns).
  * Derived entirely from the already-synced cache — never a live read, and
  * never the destructive usage-queue endpoint.
+ *
+ * Read-model sections (spend, per-lane usage, lane map, native links) ride the
+ * same cache: every section carries its own timestamp (`quotaFetchedAt` for
+ * the provider cards, whose per-account `checkedAt` fields give finer grain).
  */
 export interface UsagePageData {
   audienceNotice: string;
@@ -201,6 +284,12 @@ export interface UsagePageData {
   providers: ProviderCard[];
   earliestReset: string | null;
   earliestResetIn: string | null;
+  /** Latest per-window observation behind `providers` (observedAt, else row fetch). */
+  quotaFetchedAt: string | null;
+  spend: SpendSection;
+  usage: UsageCountsSection;
+  laneMap: LaneMapSection;
+  links: NativeLinksSection;
 }
 
 export function resetIn(resetAt: string | null, nowMs: number): string | null {
@@ -435,6 +524,43 @@ function earliestKnownReset(providers: ProviderCard[]): string | null {
   return earliestTime(providers.flatMap((p) => [p.retryAt, p.nextReset]));
 }
 
+/**
+ * Latest per-window observation across cached rows that carry quota windows.
+ * Each window contributes its `observedAt` (passive `auth-files` signals carry
+ * their own observation time, which only refreshes when the account serves
+ * traffic), falling back to the row's `checkedAt` for rows cached before
+ * per-window `observedAt` existed. Rows without limits (quota-blind providers,
+ * best-effort quota failures) never contribute, and windows with no parseable
+ * time never contribute: the section timestamp must reflect the age of the
+ * displayed figures, not a cache refresh that left them untouched. Candidates
+ * later than `nowMs + futureSkewMs` are untrusted (same budget as the router's
+ * `windowObservationAgeMs`): `observedAt` runs on the upstream clock, so one
+ * skewed host must not stamp the section with a future time.
+ */
+function latestQuotaCheckedAt(
+  rows: Record<string, AccountUsageRow>,
+  nowMs: number,
+  futureSkewMs: number,
+): string | null {
+  let latest: string | null = null;
+  let latestMs = NaN;
+  for (const row of Object.values(rows)) {
+    if (row.limits.length === 0) continue;
+    const rowMs = Date.parse(row.checkedAt);
+    for (const window of row.limits) {
+      const candidate = window.observedAt ?? row.checkedAt;
+      const ms = window.observedAt != null ? Date.parse(window.observedAt) : rowMs;
+      if (candidate == null || Number.isNaN(ms)) continue;
+      if (ms > nowMs + futureSkewMs) continue;
+      if (latest === null || ms > latestMs) {
+        latest = candidate;
+        latestMs = ms;
+      }
+    }
+  }
+  return latest;
+}
+
 function isFailureNewer(lastSync: SyncSummary | null, lastFailure?: SyncFailure | null): boolean {
   return Boolean(
     lastFailure &&
@@ -467,11 +593,17 @@ export function buildUsageData(args: {
   rows: Record<string, AccountUsageRow>;
   lastSync: SyncSummary | null;
   lastFailure?: SyncFailure | null;
+  /** Last-known spend snapshot (null when no sync has stored one). */
+  spend?: StoredSpend | null;
+  /** Last-known request-count aggregates (null when never stored). */
+  counts?: StoredRequestCounts | null;
 }): UsagePageData {
-  const { now, config, rows, lastSync, lastFailure } = args;
+  const { now, config, rows, lastSync, lastFailure, spend, counts } = args;
   const nowMs = Date.parse(now);
   const providers = buildProviderCards({ config, rows, now, nowMs, providerModels: {} });
   const earliestReset = earliestKnownReset(providers);
+  const totalCredits = spend?.data?.totalCredits ?? null;
+  const totalUsage = spend?.data?.totalUsage ?? null;
   return {
     audienceNotice: AUDIENCE_NOTICE,
     audienceConfirmed: config.audienceConfirmed,
@@ -480,6 +612,42 @@ export function buildUsageData(args: {
     providers,
     earliestReset,
     earliestResetIn: resetIn(earliestReset, nowMs),
+    // The quota timestamp comes from the cached rows, not the sync summary:
+    // `finishedAt` is sync completion time (later than the quota reads), and a
+    // best-effort quota failure can still save a successful summary. Only rows
+    // that actually carry quota windows qualify; null when none do. Skipped
+    // runs write no rows, so they can never masquerade as a fresh fetch. Each
+    // window contributes its own observation time (`observedAt`, else the row
+    // fetch), so a passive window observed hours ago is never stamped with a
+    // minutes-old cache refresh.
+    quotaFetchedAt: latestQuotaCheckedAt(rows, nowMs, config.futureSkewSeconds * 1000),
+    spend: {
+      configured: config.openRouterSecretRef !== undefined && config.openRouterSecretRef !== null,
+      totalCredits,
+      totalUsage,
+      remaining:
+        typeof totalCredits === "number" && typeof totalUsage === "number"
+          ? totalCredits - totalUsage
+          : null,
+      fetchedAt: spend?.data?.fetchedAt ?? null,
+      note: spend?.note ?? null,
+    },
+    usage: {
+      enabled: config.apiKeyUsageEnabled === true,
+      lanes: counts?.lanes ?? [],
+      fetchedAt: counts?.fetchedAt ?? null,
+      note: counts?.note ?? null,
+      fidelityNote: REQUEST_COUNT_FIDELITY_NOTE,
+    },
+    laneMap: {
+      derivedAt: LANE_MAP_DERIVED_AT,
+      flag: LANE_MAP_FLAG,
+      lanes: LANE_MAP,
+    },
+    links: {
+      costsUrl: NATIVE_COSTS_URL,
+      budgetsUrl: NATIVE_BUDGETS_URL,
+    },
   };
 }
 
