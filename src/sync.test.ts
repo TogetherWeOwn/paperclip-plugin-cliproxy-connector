@@ -1,13 +1,25 @@
 import { describe, expect, it, vi } from "vitest";
 import { parseConfig } from "./config.js";
 import {
+  ACTIVITY_DRIFT_CLEARED,
+  ACTIVITY_DRIFT_DETECTED,
+  ACTIVITY_DRIFT_STILL_PRESENT,
+  ACTIVITY_SETUP_ERROR,
+  ACTIVITY_SYNC_FAILED,
+  ACTIVITY_SYNC_RECOVERED,
   apiCallOriginKey,
   emptyStrikeBudget,
   reenableAfterStrike,
   runSync,
   type SyncDeps,
 } from "./sync.js";
-import type { AccountUsageRow, StrikeBudgetState, SyncFailure, SyncSummary } from "./types.js";
+import type {
+  AccountUsageRow,
+  DriftLedger,
+  StrikeBudgetState,
+  SyncFailure,
+  SyncSummary,
+} from "./types.js";
 
 const NOW = "2026-11-01T12:00:00.000Z";
 const KEY = "SECRET-KEY-MATERIAL-abc123";
@@ -93,6 +105,8 @@ interface Store {
   lastSync: SyncSummary | null;
   savedSummary: SyncSummary | null;
   failure: SyncFailure | null;
+  /** Null = no ledger ever persisted (pre-upgrade); {} = seeded/cleared. */
+  ledger: DriftLedger | null;
   activity: Array<{ message: string; metadata?: Record<string, unknown> }>;
 }
 
@@ -104,6 +118,7 @@ function store(over?: Partial<Store>): Store {
     lastSync: null,
     savedSummary: null,
     failure: null,
+    ledger: null,
     activity: [],
     ...over,
   };
@@ -130,6 +145,11 @@ function deps(s: Store, fetchImpl?: typeof fetch): SyncDeps {
     },
     recordFailure: async (failure) => {
       s.failure = failure;
+    },
+    loadFailure: async () => s.failure,
+    loadDriftLedger: async () => s.ledger,
+    saveDriftLedger: async (ledger) => {
+      s.ledger = ledger;
     },
     logActivity: async (message, metadata) => {
       s.activity.push({ message, metadata });
@@ -1178,7 +1198,15 @@ describe("run guards", () => {
     expect(summary.skipReason).toMatch(/resolved empty/);
     expect(fetchMock).not.toHaveBeenCalled();
     expect(s.failure?.message).toMatch(/resolved empty/);
-    expect(s.activity.some((a) => a.message.includes("resolved empty"))).toBe(true);
+    // Setup-class failures log under the setup_error key, not sync_failed.
+    expect(
+      s.activity.some(
+        (a) =>
+          a.message === ACTIVITY_SETUP_ERROR &&
+          typeof a.metadata?.summary === "string" &&
+          a.metadata.summary.includes("resolved empty"),
+      ),
+    ).toBe(true);
     assertNoKeyLeak(s);
   });
 
@@ -1219,8 +1247,15 @@ describe("sync failure visibility (S2)", () => {
     expect(s.failure).not.toBeNull();
     expect(s.failure?.attemptedAt).toBe("2026-11-01T12:00:00.000Z");
     expect(s.failure?.message).toMatch(/sync failed/);
-    // …logged…
-    expect(s.activity.some((a) => a.message.includes("sync failed"))).toBe(true);
+    // …logged under the stable key with the sentence in metadata…
+    expect(
+      s.activity.some(
+        (a) =>
+          a.message === ACTIVITY_SYNC_FAILED &&
+          typeof a.metadata?.summary === "string" &&
+          a.metadata.summary.includes("sync failed"),
+      ),
+    ).toBe(true);
     // …and last-sync is untouched (finishedAt still drives min-interval).
     expect(s.savedSummary).toBeNull();
     expect(s.lastSync?.finishedAt).toBe("2026-11-01T11:30:00.000Z");
@@ -1544,5 +1579,332 @@ describe("live provider-API quota (pinned api-call templates)", () => {
     expect(apiCallOriginKey("http://localhost:8318")).not.toBe(
       apiCallOriginKey("http://localhost:8317"),
     );
+  });
+});
+
+describe("stable activity keys + state-change logging", () => {
+  const HOUR = 60 * 60_000;
+
+  function driftConfig(
+    providers: Array<{ provider: string; connectionId: string }>,
+    extra?: Record<string, unknown>,
+  ) {
+    return parseConfig({
+      ...baseConfigRaw(),
+      providers: providers.map((p) => ({ ...p, completeInventory: true })),
+      pluginQuotaIds: {},
+      ...extra,
+    }).config;
+  }
+
+  /** Auth-files fetch with no plugin quota, catalog or served-set traffic. */
+  function driftFetch(files: unknown[], status = 200) {
+    return vi.fn(async (input: string | URL | Request): Promise<Response> => {
+      const url = new URL(String(input));
+      if (url.pathname === "/v0/management/auth-files") {
+        if (status !== 200) return new Response("boom", { status });
+        return jsonResponse(200, files);
+      }
+      if (url.pathname === "/v1/models") return jsonResponse(200, { data: [] });
+      return new Response("not found", { status: 404 });
+    });
+  }
+
+  const claudeOnly = driftConfig([{ provider: "claude", connectionId: "conn-claude" }]);
+  const claudeFiles = [{ id: "c1", provider: "claude" }];
+  const kimiFiles = [...claudeFiles, { id: "k1", provider: "kimi" }];
+
+  function runAt(s: Store, files: unknown[], now: string, status = 200) {
+    const d = deps(s, driftFetch(files, status) as unknown as typeof fetch);
+    return runSync({ ...d, config: claudeOnly, now }, { running: false });
+  }
+
+  it("upgrade seeding: existing drift + no ledger logs nothing, but seeds", async () => {
+    const s = store();
+    expect(s.ledger).toBeNull();
+    const first = await runAt(s, kimiFiles, NOW);
+    expect(first.skipped).toBe(false);
+    expect(first.drift.map((d) => d.kind)).toEqual(["unconfigured-provider"]);
+    // No burst for pre-existing findings…
+    expect(s.activity).toEqual([]);
+    // …but the ledger is seeded as notified now (null becomes non-null)…
+    expect(s.ledger).not.toBeNull();
+    expect(Object.keys(s.ledger ?? {})).toHaveLength(1);
+    // …so the next identical sync stays silent too.
+    await runAt(s, kimiFiles, new Date(Date.parse(NOW) + HOUR).toISOString());
+    expect(s.activity).toEqual([]);
+    assertNoKeyLeak(s);
+  });
+
+  it("repeated identical syncs write zero additional activity rows", async () => {
+    const s = store();
+    const first = await runAt(s, kimiFiles, NOW);
+    expect(first.skipped).toBe(false);
+    // First run after upgrade seeds silently (see above): no rows at all.
+    expect(s.activity).toHaveLength(0);
+    // Same findings on the next syncs: silence.
+    await runAt(s, kimiFiles, new Date(Date.parse(NOW) + HOUR).toISOString());
+    await runAt(s, kimiFiles, new Date(Date.parse(NOW) + 2 * HOUR).toISOString());
+    expect(s.activity).toHaveLength(0);
+    assertNoKeyLeak(s);
+  });
+
+  it("newly appearing drift logs exactly one drift_detected", async () => {
+    const s = store();
+    const clean = await runAt(s, claudeFiles, NOW);
+    expect(clean.skipped).toBe(false);
+    expect(clean.drift).toEqual([]);
+    expect(s.activity).toEqual([]);
+    const drifted = await runAt(s, kimiFiles, new Date(Date.parse(NOW) + HOUR).toISOString());
+    expect(drifted.drift.map((d) => d.kind)).toEqual(["unconfigured-provider"]);
+    expect(s.activity).toHaveLength(1);
+    expect(s.activity[0]?.message).toBe(ACTIVITY_DRIFT_DETECTED);
+    expect(s.activity[0]?.metadata?.event).toBe(ACTIVITY_DRIFT_DETECTED);
+    expect(s.activity[0]?.metadata?.provider).toBe("kimi");
+    expect(s.activity[0]?.metadata?.kind).toBe("unconfigured-provider");
+    expect(typeof s.activity[0]?.metadata?.detail).toBe("string");
+    expect(typeof s.activity[0]?.metadata?.driftKey).toBe("string");
+    assertNoKeyLeak(s);
+  });
+
+  it("cleared drift logs exactly one drift_cleared", async () => {
+    const s = store();
+    await runAt(s, kimiFiles, NOW); // seeds silently
+    expect(s.activity).toHaveLength(0);
+    const cleared = await runAt(s, claudeFiles, new Date(Date.parse(NOW) + HOUR).toISOString());
+    expect(cleared.drift).toEqual([]);
+    expect(s.activity).toHaveLength(1);
+    expect(s.activity[0]?.message).toBe(ACTIVITY_DRIFT_CLEARED);
+    expect(s.activity[0]?.metadata?.provider).toBe("kimi");
+    // The key is gone from the ledger: a later reappearance detects anew.
+    await runAt(s, kimiFiles, new Date(Date.parse(NOW) + 2 * HOUR).toISOString());
+    expect(s.activity).toHaveLength(2);
+    expect(s.activity[1]?.message).toBe(ACTIVITY_DRIFT_DETECTED);
+    assertNoKeyLeak(s);
+  });
+
+  it("accepting a standing finding drops it silently (no drift_cleared)", async () => {
+    const s = store();
+    await runAt(s, kimiFiles, NOW); // seeds silently
+    expect(s.activity).toHaveLength(0);
+    expect(Object.keys(s.ledger ?? {})).toHaveLength(1);
+    // Ignore kimi: the finding moves to acceptedDrift, leaves the ledger
+    // silently, and writes no feed row (not drift_cleared).
+    const ignored = driftConfig([{ provider: "claude", connectionId: "conn-claude" }], {
+      ignoredProviders: ["kimi"],
+    });
+    const dIgnored = deps(s, driftFetch(kimiFiles) as unknown as typeof fetch);
+    dIgnored.config = ignored;
+    const accepted = await runSync(
+      { ...dIgnored, now: new Date(Date.parse(NOW) + HOUR).toISOString() },
+      { running: false },
+    );
+    expect(accepted.skipped).toBe(false);
+    expect(accepted.drift).toEqual([]);
+    expect((accepted.acceptedDrift ?? []).map((d) => d.provider)).toEqual(["kimi"]);
+    expect(s.activity).toEqual([]);
+    expect(s.ledger).not.toBeNull();
+    expect(Object.keys(s.ledger ?? {})).toHaveLength(0);
+    // Un-ignoring re-detects exactly once (symmetric case, desirable).
+    const redetected = await runAt(s, kimiFiles, new Date(Date.parse(NOW) + 2 * HOUR).toISOString());
+    expect(redetected.drift.map((d) => d.provider)).toEqual(["kimi"]);
+    expect(s.activity).toHaveLength(1);
+    expect(s.activity[0]?.message).toBe(ACTIVITY_DRIFT_DETECTED);
+    expect(s.activity[0]?.metadata?.provider).toBe("kimi");
+    assertNoKeyLeak(s);
+  });
+
+  it("a persistent finding reminds at most once per 24 h", async () => {
+    const s = store();
+    await runAt(s, kimiFiles, NOW); // seeds silently (lastLoggedAt = NOW)
+    expect(s.activity).toHaveLength(0);
+    // 23 h later: still present, no reminder yet — but lastSeenAt advances.
+    await runAt(s, kimiFiles, new Date(Date.parse(NOW) + 23 * HOUR).toISOString());
+    expect(s.activity).toHaveLength(0);
+    // 25 h after the seeding: exactly one reminder row.
+    await runAt(s, kimiFiles, new Date(Date.parse(NOW) + 25 * HOUR).toISOString());
+    expect(s.activity).toHaveLength(1);
+    expect(s.activity[0]?.message).toBe(ACTIVITY_DRIFT_STILL_PRESENT);
+    expect(s.activity[0]?.metadata?.event).toBe(ACTIVITY_DRIFT_STILL_PRESENT);
+    expect(s.activity[0]?.metadata?.provider).toBe("kimi");
+    // The reminder resets the clock: 23 h after it, silence again.
+    await runAt(s, kimiFiles, new Date(Date.parse(NOW) + 48 * HOUR).toISOString());
+    expect(s.activity).toHaveLength(1);
+    assertNoKeyLeak(s);
+  });
+
+  it("a repeated identical sync failure logs once, then at most a daily reminder", async () => {
+    const s = store();
+    await runAt(s, kimiFiles, NOW, 500);
+    expect(s.activity).toHaveLength(1);
+    expect(s.activity[0]?.message).toBe(ACTIVITY_SYNC_FAILED);
+    expect(s.failure?.failureKind).toBe("sync-error");
+    // Same failure an hour later: no new row, but the attempt refreshes.
+    await runAt(s, kimiFiles, new Date(Date.parse(NOW) + HOUR).toISOString(), 500);
+    expect(s.activity).toHaveLength(1);
+    expect(s.failure?.attemptedAt).toBe(new Date(Date.parse(NOW) + HOUR).toISOString());
+    // Same failure 25 h after the first row: one reminder row, then silence.
+    await runAt(s, kimiFiles, new Date(Date.parse(NOW) + 25 * HOUR).toISOString(), 500);
+    expect(s.activity).toHaveLength(2);
+    expect(s.activity[1]?.message).toBe(ACTIVITY_SYNC_FAILED);
+    expect(s.activity[1]?.metadata?.reminder).toBe(true);
+    await runAt(s, kimiFiles, new Date(Date.parse(NOW) + 26 * HOUR).toISOString(), 500);
+    expect(s.activity).toHaveLength(2);
+    assertNoKeyLeak(s);
+  });
+
+  it("a new failure signature logs anew; recovery logs exactly one sync_recovered", async () => {
+    const s = store();
+    await runAt(s, kimiFiles, NOW, 500);
+    expect(s.activity).toHaveLength(1);
+    // A success after the recorded failure: the failed run never reached
+    // drift, so this run seeds the drift ledger silently — plus exactly one
+    // recovery row — then the failure clears.
+    const recovered = await runAt(s, kimiFiles, new Date(Date.parse(NOW) + HOUR).toISOString());
+    expect(recovered.skipped).toBe(false);
+    expect(s.activity.map((a) => a.message)).toEqual([
+      ACTIVITY_SYNC_FAILED,
+      ACTIVITY_SYNC_RECOVERED,
+    ]);
+    expect(s.activity[1]?.metadata?.failureKind).toBe("sync-error");
+    expect(typeof s.activity[1]?.metadata?.error).toBe("string");
+    expect(s.failure).toBeNull();
+    // Steady-state success: silence (and no repeated recovery rows).
+    await runAt(s, kimiFiles, new Date(Date.parse(NOW) + 2 * HOUR).toISOString());
+    expect(s.activity).toHaveLength(2);
+    assertNoKeyLeak(s);
+  });
+
+  it("a setup-class failure logs once under setup_error, then recovers once", async () => {
+    const s = store();
+    const d = deps(s, driftFetch(kimiFiles) as unknown as typeof fetch);
+    d.resolveSecret = async () => {
+      throw new Error("no such grant");
+    };
+    await runSync({ ...d, config: claudeOnly, now: NOW }, { running: false });
+    expect(s.activity).toHaveLength(1);
+    expect(s.activity[0]?.message).toBe(ACTIVITY_SETUP_ERROR);
+    expect(s.activity[0]?.metadata?.event).toBe(ACTIVITY_SETUP_ERROR);
+    expect(typeof s.activity[0]?.metadata?.error).toBe("string");
+    // Identical setup failure an hour later: silent (attempt refreshes).
+    await runSync(
+      { ...d, now: new Date(Date.parse(NOW) + HOUR).toISOString() },
+      { running: false },
+    );
+    expect(s.activity).toHaveLength(1);
+    // A success afterwards recovers exactly once (drift seeds silently).
+    const ok = deps(s, driftFetch(kimiFiles) as unknown as typeof fetch);
+    await runSync({ ...ok, config: claudeOnly, now: new Date(Date.parse(NOW) + 2 * HOUR).toISOString() }, { running: false });
+    expect(s.activity.map((a) => a.message)).toEqual([
+      ACTIVITY_SETUP_ERROR,
+      ACTIVITY_SYNC_RECOVERED,
+    ]);
+    expect(s.failure).toBeNull();
+    assertNoKeyLeak(s);
+  });
+
+  it("every activity message is a stable key and carries the sentence in metadata", async () => {
+    const s = store();
+    await runAt(s, kimiFiles, NOW); // seeds silently
+    await runAt(s, kimiFiles, new Date(Date.parse(NOW) + HOUR).toISOString(), 500); // failed
+    await runAt(s, kimiFiles, new Date(Date.parse(NOW) + 2 * HOUR).toISOString()); // recovered
+    await runAt(s, kimiFiles, new Date(Date.parse(NOW) + 30 * HOUR).toISOString()); // reminder
+    await runAt(s, claudeFiles, new Date(Date.parse(NOW) + 31 * HOUR).toISOString()); // cleared
+    expect(s.activity.map((a) => a.message)).toEqual([
+      ACTIVITY_SYNC_FAILED,
+      ACTIVITY_SYNC_RECOVERED,
+      ACTIVITY_DRIFT_STILL_PRESENT,
+      ACTIVITY_DRIFT_CLEARED,
+    ]);
+    for (const entry of s.activity) {
+      expect(entry.message).toMatch(/^cliproxy_connector\.[a-z_]+$/);
+      expect(entry.metadata?.event).toBe(entry.message);
+      expect(typeof entry.metadata?.summary).toBe("string");
+      expect((entry.metadata?.summary as string).length).toBeGreaterThan(0);
+    }
+    // No secret, raw-name or auth-index material rides along in metadata.
+    const metadataBlob = JSON.stringify(s.activity.map((a) => a.metadata));
+    expect(metadataBlob).not.toContain(KEY);
+    expect(metadataBlob).not.toContain("auths/");
+    assertNoKeyLeak(s);
+  });
+
+  it("a simulated day at 5-minute syncs with 7 standing findings emits <= 7 rows", async () => {
+    const s = store();
+    const FIVE_MIN = 5 * 60_000;
+    const base = Date.parse(NOW);
+    // Seven standing unconfigured-provider findings (claude mapped, seven not).
+    const others = ["kimi", "xai", "openrouter", "meta", "antigravity", "devin", "zai"];
+    const files = [{ id: "c1", provider: "claude" }, ...others.map((p, i) => ({ id: `u${i}`, provider: p }))];
+    const d = deps(s, driftFetch(files) as unknown as typeof fetch);
+    d.config = claudeOnly;
+    // 289 syncs: t=0 seed (silent) … t=24h fires one reminder per finding.
+    for (let k = 0; k <= 288; k += 1) {
+      d.now = new Date(base + k * FIVE_MIN).toISOString();
+      const summary = await runSync(d, { running: false });
+      expect(summary.skipped).toBe(false);
+      expect(summary.drift).toHaveLength(7);
+    }
+    expect(s.activity.length).toBeLessThanOrEqual(7);
+    for (const entry of s.activity) {
+      expect(entry.message).toMatch(/^cliproxy_connector\.[a-z_]+$/);
+    }
+    assertNoKeyLeak(s);
+  }, 30_000);
+
+  it("an ignored provider produces no finding and no log row", async () => {
+    const s = store();
+    const d = deps(s, driftFetch(kimiFiles) as unknown as typeof fetch);
+    d.config = driftConfig([{ provider: "claude", connectionId: "conn-claude" }], {
+      // Normalised like the rest of config (provider words are lowercase).
+      ignoredProviders: [" KIMI "],
+    });
+    const summary = await runSync(d, { running: false });
+    expect(summary.skipped).toBe(false);
+    expect(summary.drift).toEqual([]);
+    expect(summary.acceptedDrift).toEqual([
+      expect.objectContaining({ kind: "unconfigured-provider", provider: "kimi" }),
+    ]);
+    expect(s.activity).toEqual([]);
+    assertNoKeyLeak(s);
+  });
+
+  it("an ignored auth-file ref produces no finding and no log row", async () => {
+    const { hashIdentity } = await import("./parsers.js");
+    const evilName = "auths/subscription-pool/manifest.json";
+    const hash = hashIdentity([evilName])?.slice(0, 8) as string;
+    expect(hash).toMatch(/^[0-9a-f]{8}$/);
+    for (const ref of [`auth file ${hash}`, hash]) {
+      const s = store();
+      const d = deps(
+        s,
+        driftFetch([{ id: "stale-1", provider: "claude", name: evilName }] as unknown[]) as unknown as typeof fetch,
+      );
+      d.config = driftConfig([{ provider: "claude", connectionId: "conn-claude" }], {
+        ignoredAuthFileRefs: [ref],
+      });
+      const summary = await runSync(d, { running: false });
+      expect(summary.skipped).toBe(false);
+      expect(summary.drift).toEqual([]);
+      expect(summary.acceptedDrift).toEqual([
+        expect.objectContaining({ kind: "untrusted-auth-file" }),
+      ]);
+      expect(s.activity).toEqual([]);
+      assertNoKeyLeak(s);
+    }
+  });
+
+  it("a non-ignored auth-file ref still drifts and logs", async () => {
+    const s = store();
+    const evil = [{ id: "stale-1", provider: "claude", name: "auths/subscription-pool/manifest.json" }];
+    await runAt(s, claudeFiles, NOW); // seeds the (empty) ledger silently
+    expect(s.activity).toEqual([]);
+    const summary = await runAt(s, evil, new Date(Date.parse(NOW) + HOUR).toISOString());
+    expect(summary.skipped).toBe(false);
+    expect(summary.drift.map((d) => d.kind)).toEqual(["untrusted-auth-file"]);
+    expect(summary.acceptedDrift ?? []).toEqual([]);
+    expect(s.activity).toHaveLength(1);
+    expect(s.activity[0]?.message).toBe(ACTIVITY_DRIFT_DETECTED);
+    assertNoKeyLeak(s);
   });
 });

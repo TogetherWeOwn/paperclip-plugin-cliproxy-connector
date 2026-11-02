@@ -15,6 +15,7 @@ import type {
 import { parseConfig, stripTrailingSlashes, type ConnectorConfig } from "./config.js";
 import { createLoopbackFetch } from "./loopback-fetch.js";
 import {
+  DRIFT_LEDGER_STATE_KEY,
   LAST_ERROR_STATE_KEY,
   LAST_SYNC_STATE_KEY,
   PAGE_DATA_KEY,
@@ -29,8 +30,20 @@ import {
 } from "./manifest.js";
 import type { PluginPerformActionContext } from "@paperclipai/plugin-sdk";
 import { route, type RouterCandidate } from "./router.js";
-import { emptyStrikeBudget, reenableAfterStrike, runSync, type ApiCallCachedEnvelope } from "./sync.js";
-import type { AccountUsageRow, StrikeBudgetState, SyncFailure, SyncSummary } from "./types.js";
+import {
+  ACTIVITY_STRIKE_BUDGET_REENABLED,
+  emptyStrikeBudget,
+  reenableAfterStrike,
+  runSync,
+  type ApiCallCachedEnvelope,
+} from "./sync.js";
+import type {
+  AccountUsageRow,
+  DriftLedger,
+  StrikeBudgetState,
+  SyncFailure,
+  SyncSummary,
+} from "./types.js";
 import { buildPageData, buildUsageData, buildWidgetData } from "./ui-data.js";
 
 const inFlight: { running: boolean } = { running: false };
@@ -159,6 +172,16 @@ async function loadLastFailure(ctx: PluginContext, companyId: string): Promise<S
   return null;
 }
 
+async function loadDriftLedger(ctx: PluginContext, companyId: string): Promise<DriftLedger | null> {
+  const raw = await ctx.state.get(key(companyId, DRIFT_LEDGER_STATE_KEY));
+  if (raw !== null && typeof raw === "object" && !Array.isArray(raw)) {
+    return raw as DriftLedger;
+  }
+  // Null (never persisted) is distinct from an empty ledger (all findings
+  // cleared): only null triggers silent upgrade seeding in reconcileDriftLedger.
+  return null;
+}
+
 async function resolveCompany(
   ctx: PluginContext,
   companyId: string,
@@ -255,7 +278,13 @@ const plugin = definePlugin({
       );
       await ctx.activity.log({
         companyId,
-        message: `cliproxy-connector: strike budget re-enabled by board user ${userId}.`,
+        message: ACTIVITY_STRIKE_BUDGET_REENABLED,
+        metadata: {
+          event: ACTIVITY_STRIKE_BUDGET_REENABLED,
+          summary: `strike budget re-enabled by board user ${userId}.`,
+          actor: `board user ${userId}`,
+          via: "board-action",
+        },
       });
       return next;
     });
@@ -292,7 +321,13 @@ const plugin = definePlugin({
           : `agent ${input.actor.agentId ?? "unknown"}`;
       await ctx.activity.log({
         companyId,
-        message: `cliproxy-connector: strike budget re-enabled via board API route by ${actorLabel}.`,
+        message: ACTIVITY_STRIKE_BUDGET_REENABLED,
+        metadata: {
+          event: ACTIVITY_STRIKE_BUDGET_REENABLED,
+          summary: `strike budget re-enabled via board API route by ${actorLabel}.`,
+          actor: actorLabel,
+          via: "api-route",
+        },
       });
       return { status: 200, body: { strike: next } };
     }
@@ -322,6 +357,7 @@ async function runCompanySync(
       accountsSeen: 0,
       rowsWritten: 0,
       drift: [],
+      acceptedDrift: [],
       errors: ["company config is invalid; fix it on the plugin settings page."],
       skipped: true,
       skipReason: "company config is invalid; fix it on the plugin settings page.",
@@ -369,6 +405,11 @@ async function runCompanySync(
         } else {
           await ctx.state.set(key(companyId, LAST_ERROR_STATE_KEY), failure);
         }
+      },
+      loadFailure: () => loadLastFailure(ctx, companyId),
+      loadDriftLedger: () => loadDriftLedger(ctx, companyId),
+      saveDriftLedger: async (ledger) => {
+        await ctx.state.set(key(companyId, DRIFT_LEDGER_STATE_KEY), ledger);
       },
       logActivity: (message, metadata) => ctx.activity.log({ companyId, message, metadata }),
       apiCallLastCall,
