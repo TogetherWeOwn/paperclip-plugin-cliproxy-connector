@@ -675,7 +675,7 @@ describe("parseAuthFiles (redacted fixture)", () => {
     expect(accounts).toHaveLength(1);
     expect(accounts[0]?.limits).toHaveLength(0);
     expect(accounts[0]?.quotaBlind).toBe(true);
-    expect(accounts[0]?.quotaBlindReason).toBe("upstream exposes nothing");
+    expect(accounts[0]?.quotaBlindReason).toBe("panel-only (needs the downloaded auth file)");
     expect(accounts[0]?.parseWarnings.some((w) => w.includes("no quota signals"))).toBe(false);
   });
 
@@ -702,7 +702,7 @@ describe("parseAuthFiles (redacted fixture)", () => {
     });
     expect(accounts.find((a) => a.provider === "meta")).toMatchObject({
       quotaBlind: true,
-      quotaBlindReason: "upstream exposes nothing",
+      quotaBlindReason: "panel-only (needs the downloaded auth file)",
     });
   });
 
@@ -1063,74 +1063,85 @@ describe("hashIdentity redaction", () => {
   });
 });
 
-describe("parseMetaQuota (panel metaQuota.ts shape)", () => {
-  const metaWindows = () => DEFAULT_PROVIDER_WINDOWS.meta as string[];
-  const body = () => ({
-    subs_usage: {
-      tier: "Pro",
-      window: { used_percent: 25, resets_at: Math.floor(NOW_MS / 1000) + 3600, window_duration_mins: 60 },
-      weekly: { used_percent: 10, resets_at: Math.floor(NOW_MS / 1000) + 86400 },
-    },
-    subs_tier_name: "Pro",
-    is_subs_active: true,
+describe("parseAntigravityQuota (panel retrieveUserQuotaSummary shape)", () => {
+  const antigravityWindows = () => DEFAULT_PROVIDER_WINDOWS.antigravity as string[];
+  const quotaBody = () => ({
+    groups: [
+      {
+        buckets: [
+          { window: "daily", remainingFraction: 0.75, resetTime: iso(NOW_MS + 3600_000) },
+          { window: "weekly", remainingFraction: "40%", resetTime: iso(NOW_MS + 86400_000) },
+        ],
+      },
+    ],
   });
 
-  it("emits window + weekly windows with remaining % and resets, labelled via provider API", async () => {
-    const { parseMetaQuota } = await import("./parsers.js");
-    const parsed = parseMetaQuota(body(), NOW, metaWindows());
+  it("emits quota windows with remaining % and resets, labelled via provider API", async () => {
+    const { parseAntigravityQuota } = await import("./parsers.js");
+    const parsed = parseAntigravityQuota(quotaBody(), NOW, antigravityWindows());
     expect(parsed.warnings).toEqual([]);
-    expect(parsed.planType).toBe("Pro");
-    expect(parsed.limits.map((l) => l.id)).toEqual(["meta:window", "meta:weekly"]);
-    expect(parsed.limits[0]?.remainingPercent).toBe(75);
-    expect(parsed.limits[0]?.usedPercent).toBe(25);
+    expect(parsed.planType).toBeNull();
+    expect(parsed.limits.map((l) => l.id)).toEqual(["antigravity:daily", "antigravity:weekly"]);
+    expect(parsed.limits[0]).toMatchObject({ remainingPercent: 75, usedPercent: 25, allowed: true });
     expect(parsed.limits[0]?.resetsAt).toBe(iso(NOW_MS + 3600_000));
-    expect(parsed.limits[1]?.remainingPercent).toBe(90);
+    expect(parsed.limits[1]).toMatchObject({ remainingPercent: 40, usedPercent: 60 });
     for (const l of parsed.limits) {
       expect(l.viaProviderApi).toBe(true);
       expect(l.gating).toBe(true);
-      expect(l.allowed).toBe(true);
       expect(l.observedAt).toBe(NOW);
     }
   });
 
-  it("marks an expected-but-unusable window unknown instead of implying coverage", async () => {
-    const { parseMetaQuota } = await import("./parsers.js");
-    const payload = body();
-    (payload.subs_usage as Record<string, unknown>).weekly = { used_percent: "not-a-number" };
-    const parsed = parseMetaQuota(payload, NOW, metaWindows());
-    expect(parsed.limits.map((l) => l.id)).toEqual(["meta:window", "meta:weekly"]);
-    expect(parsed.limits[1]?.remainingPercent).toBeNull();
-    expect(parsed.limits[1]?.allowed).toBeNull();
-    expect(parsed.limits[1]?.gating).toBe(true);
-    expect(parsed.limits[1]?.viaProviderApi).toBe(true);
-    expect(parsed.warnings.join(" ")).toMatch(/weekly.*unknown/);
+  it("shapes windows identically to the subscription parser's opportunistic groups", async () => {
+    const { parseAntigravityQuota, parseAntigravitySubscription } = await import("./parsers.js");
+    const groups = quotaBody().groups;
+    const fromQuota = parseAntigravityQuota({ groups }, NOW, antigravityWindows());
+    const fromSub = parseAntigravitySubscription(
+      { currentTier: { id: "g1-pro-tier", name: "Pro" }, groups },
+      NOW,
+      antigravityWindows(),
+    );
+    expect(fromQuota.warnings).toEqual([]);
+    expect(fromSub.limits).toEqual(fromQuota.limits);
   });
 
-  it("forces exhausted windows when the subscription is inactive", async () => {
-    const { parseMetaQuota } = await import("./parsers.js");
-    const parsed = parseMetaQuota({ ...body(), is_subs_active: false }, NOW, metaWindows());
-    expect(parsed.limits.length).toBe(2);
-    for (const l of parsed.limits) {
-      expect(l.limitReached).toBe(true);
-      expect(l.allowed).toBe(false);
+  it("skips an unusable bucket with a warning instead of blinding the rest", async () => {
+    const { parseAntigravityQuota } = await import("./parsers.js");
+    const parsed = parseAntigravityQuota(
+      { groups: [{ buckets: [{ window: "daily", remainingFraction: "not-a-number" }, { window: "weekly", remainingFraction: 0.5 }] }] },
+      NOW,
+      antigravityWindows(),
+    );
+    expect(parsed.limits.map((l) => l.id)).toEqual(["antigravity:weekly"]);
+    expect(parsed.warnings.join(" ")).toMatch(/daily.*no usable percent/);
+  });
+
+  it("warns with zero windows when the answer carries no quota groups", async () => {
+    const { parseAntigravityQuota } = await import("./parsers.js");
+    for (const bad of [{ groups: [] }, { other: true }]) {
+      const parsed = parseAntigravityQuota(bad, NOW, antigravityWindows());
+      expect(parsed.limits).toEqual([]);
+      expect(parsed.warnings.join(" ")).toMatch(/no quota groups/);
     }
-    expect(parsed.warnings.join(" ")).toMatch(/inactive/);
-  });
-
-  it("returns plan-only with zero windows when subs_usage is absent (unknown, not zero)", async () => {
-    const { parseMetaQuota } = await import("./parsers.js");
-    const parsed = parseMetaQuota({ subs_tier_name: "Pro", is_subs_active: true }, NOW, metaWindows());
-    expect(parsed.planType).toBe("Pro");
-    expect(parsed.limits).toEqual([]);
-    expect(parsed.warnings.length).toBeGreaterThan(0);
   });
 
   it("warns with zero windows on a non-object answer", async () => {
-    const { parseMetaQuota } = await import("./parsers.js");
+    const { parseAntigravityQuota } = await import("./parsers.js");
     for (const bad of [null, 42, "not-json{{{"]) {
-      const parsed = parseMetaQuota(bad, NOW, metaWindows());
+      const parsed = parseAntigravityQuota(bad, NOW, antigravityWindows());
       expect(parsed.limits).toEqual([]);
       expect(parsed.warnings.length).toBeGreaterThan(0);
+    }
+  });
+});
+
+describe("hasAntigravityQuotaGroups (quota-URL stop condition)", () => {
+  it("is true only for answers carrying a non-empty groups array", async () => {
+    const { hasAntigravityQuotaGroups } = await import("./parsers.js");
+    expect(hasAntigravityQuotaGroups({ groups: [{ buckets: [] }] })).toBe(true);
+    expect(hasAntigravityQuotaGroups(JSON.stringify({ groups: [{ buckets: [] }] }))).toBe(true);
+    for (const bad of [{ groups: [] }, { other: true }, null, 42, "not-json{{{", "[]"]) {
+      expect(hasAntigravityQuotaGroups(bad)).toBe(false);
     }
   });
 });
@@ -1300,24 +1311,29 @@ describe("parseAuthFiles with live provider-API payloads", () => {
   });
   const allowLists = () => ({ ...DEFAULT_PROVIDER_WINDOWS });
 
-  it("attaches meta windows to their own account and clears quota-blind", async () => {
+  it("combines an antigravity subscription answer (plan) with its quota answer (windows)", async () => {
     const { parseAuthFiles } = await import("./parsers.js");
-    const resetUnix = Math.floor(NOW_MS / 1000) + 3600;
-    const { accounts } = parseAuthFiles(filesFor("meta", "m1"), {
+    const files = filesFor("antigravity", "a1");
+    (files.files[0] as Record<string, unknown>).project_id = "test-project";
+    const { accounts } = parseAuthFiles(files, {
       now: NOW,
       allowLists: allowLists(),
       apiCallPayloadByAuthIndex: new Map([
         [
-          "m1",
+          "a1",
+          {
+            statusCode: 200,
+            body: { currentTier: { id: "g1-pro-tier", name: "Pro" } },
+          },
+        ],
+      ]),
+      apiCallQuotaPayloadByAuthIndex: new Map([
+        [
+          "a1",
           {
             statusCode: 200,
             body: {
-              subs_usage: {
-                window: { used_percent: 20, resets_at: resetUnix },
-                weekly: { used_percent: 5, resets_at: resetUnix + 86400 },
-              },
-              subs_tier_name: "Pro",
-              is_subs_active: true,
+              groups: [{ buckets: [{ window: "daily", remainingFraction: 0.8 }] }],
             },
           },
         ],
@@ -1326,37 +1342,64 @@ describe("parseAuthFiles with live provider-API payloads", () => {
     });
     expect(accounts).toHaveLength(1);
     expect(accounts[0]?.quotaBlind).toBe(false);
+    // Plan evidence comes from the subscription answer; windows from quota.
     expect(accounts[0]?.planType).toBe("Pro");
-    expect(accounts[0]?.limits.map((l) => l.id)).toEqual(["meta:window", "meta:weekly"]);
+    expect(accounts[0]?.limits.map((l) => l.id)).toEqual(["antigravity:daily"]);
     expect(accounts[0]?.limits.every((l) => l.viaProviderApi === true)).toBe(true);
   });
 
-  it("a partial meta answer keeps the expected unknown window without quota-blindness", async () => {
+  it("an antigravity subscription answer without a quota answer warns plan-only, not blind-quiet", async () => {
     const { parseAuthFiles } = await import("./parsers.js");
-    const { accounts } = parseAuthFiles(filesFor("meta", "m3"), {
+    const { accounts } = parseAuthFiles(filesFor("antigravity", "a2"), {
       now: NOW,
       allowLists: allowLists(),
       apiCallPayloadByAuthIndex: new Map([
-        [
-          "m3",
-          {
-            statusCode: 200,
-            body: {
-              subs_usage: {
-                window: { used_percent: 20, resets_at: NOW_MS / 1000 + 3600 },
-                weekly: { used_percent: "not-a-number" },
-              },
-              subs_tier_name: "Pro",
-              is_subs_active: true,
-            },
-          },
-        ],
+        ["a2", { statusCode: 200, body: { currentTier: { id: "free-tier", name: "Free" } } }],
       ]),
       apiCallObservedAt: NOW,
     });
-    expect(accounts[0]?.quotaBlind).toBe(false);
-    expect(accounts[0]?.limits.map((l) => l.id)).toEqual(["meta:window", "meta:weekly"]);
-    expect(accounts[0]?.limits[1]?.allowed).toBeNull();
+    expect(accounts[0]?.planType).toBe("Free");
+    expect(accounts[0]?.limits).toEqual([]);
+    expect(accounts[0]?.parseWarnings.join(" ")).toMatch(/no project id/);
+  });
+
+  it("a quota answer without groups warns honestly instead of implying coverage", async () => {
+    const { parseAuthFiles } = await import("./parsers.js");
+    const files = filesFor("antigravity", "a3");
+    (files.files[0] as Record<string, unknown>).project_id = "test-project";
+    const { accounts } = parseAuthFiles(files, {
+      now: NOW,
+      allowLists: allowLists(),
+      apiCallPayloadByAuthIndex: new Map([
+        ["a3", { statusCode: 200, body: { currentTier: { id: "free-tier", name: "Free" } } }],
+      ]),
+      apiCallQuotaPayloadByAuthIndex: new Map([["a3", { statusCode: 200, body: { groups: [] } }]]),
+      apiCallObservedAt: NOW,
+    });
+    expect(accounts[0]?.quotaBlind).toBe(true);
+    expect(accounts[0]?.parseWarnings.join(" ")).toMatch(/no quota groups/);
+  });
+
+  it("reads the antigravity project id from entry, metadata and attributes", async () => {
+    const { parseAuthFiles } = await import("./parsers.js");
+    const variants = [
+      { id: "v-1", provider: "antigravity", auth_index: "v1", project_id: "top-level" },
+      { id: "v-2", provider: "antigravity", auth_index: "v2", metadata: { projectId: "from-meta" } },
+      {
+        id: "v-3",
+        provider: "antigravity",
+        auth_index: "v3",
+        attributes: { gemini_virtual_project: "from-attrs" },
+      },
+      { id: "v-4", provider: "devin", auth_index: "v4", project_id: "ignored" },
+      { id: "v-5", provider: "antigravity", auth_index: "v5" },
+    ];
+    const { accounts } = parseAuthFiles({ files: variants }, { now: NOW, allowLists: allowLists() });
+    expect(accounts.find((a) => a.authIndex === "v1")?.quotaProjectId).toBe("top-level");
+    expect(accounts.find((a) => a.authIndex === "v2")?.quotaProjectId).toBe("from-meta");
+    expect(accounts.find((a) => a.authIndex === "v3")?.quotaProjectId).toBe("from-attrs");
+    expect(accounts.find((a) => a.authIndex === "v4")?.quotaProjectId).toBeNull();
+    expect(accounts.find((a) => a.authIndex === "v5")?.quotaProjectId).toBeNull();
   });
 
   it("an upstream 429 warns per file and stays quota-blind (fail open)", async () => {
@@ -1372,14 +1415,14 @@ describe("parseAuthFiles with live provider-API payloads", () => {
     expect(accounts[0]?.parseWarnings.join(" ")).toMatch(/429/);
   });
 
-  it("meta without a live answer stays quota-blind with the upstream reason", async () => {
+  it("meta without a live answer stays quota-blind with the panel-only reason", async () => {
     const { parseAuthFiles } = await import("./parsers.js");
     const { accounts } = parseAuthFiles(filesFor("meta", "m2"), {
       now: NOW,
       allowLists: allowLists(),
     });
     expect(accounts[0]?.quotaBlind).toBe(true);
-    expect(accounts[0]?.quotaBlindReason).toBe("upstream exposes nothing");
+    expect(accounts[0]?.quotaBlindReason).toBe("panel-only (needs the downloaded auth file)");
   });
 });
 

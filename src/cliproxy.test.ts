@@ -490,14 +490,53 @@ describe("pinned api-call POST (three frozen templates)", () => {
   });
 
   it("resolves template keys by exact provider word only (no fuzzy matching)", async () => {
-    expect(apiCallTemplateKeyForProvider("meta")).toBe("meta");
     expect(apiCallTemplateKeyForProvider("antigravity")).toBe("antigravity");
     expect(apiCallTemplateKeyForProvider("devin")).toBe("devin");
-    expect(apiCallTemplateKeyForProvider(" Meta ")).toBe("meta");
-    // Fuzzy/substring lookalikes must never resolve: a Gemini credential must
-    // not travel through the Antigravity request, nor a made-up word through Meta.
-    for (const word of ["gemini", "gemini-cli", "metafoo", "metas", "mydevin", "claude", "", "constructor"]) {
+    // Meta is panel-only (no template exists), and fuzzy/substring lookalikes
+    // must never resolve: a Gemini credential must not travel through the
+    // Antigravity request, nor a made-up word through any request.
+    for (const word of ["meta", " Meta ", "gemini", "gemini-cli", "metafoo", "metas", "mydevin", "claude", "", "constructor"]) {
       expect(apiCallTemplateKeyForProvider(word)).toBeNull();
+    }
+  });
+
+  it("resolves antigravity quota keys in panel try order, nothing else", async () => {
+    const { apiCallQuotaTemplateKeysForProvider } = await import("./cliproxy.js");
+    expect(apiCallQuotaTemplateKeysForProvider("antigravity")).toEqual([
+      "antigravity-quota-daily",
+      "antigravity-quota-sandbox",
+      "antigravity-quota-cloudcode",
+    ]);
+    expect(apiCallQuotaTemplateKeysForProvider(" Antigravity ")).toEqual([
+      "antigravity-quota-daily",
+      "antigravity-quota-sandbox",
+      "antigravity-quota-cloudcode",
+    ]);
+    for (const word of ["meta", "devin", "gemini", "", "constructor"]) {
+      expect(apiCallQuotaTemplateKeysForProvider(word)).toEqual([]);
+    }
+  });
+
+  it("validates project ids strictly (GCP-shaped, no substitution games)", async () => {
+    const { isSafeApiCallProjectId } = await import("./cliproxy.js");
+    for (const good of ["my-project-123", "proj:domain/x", "a", "A0._-:/b"]) {
+      expect(isSafeApiCallProjectId(good)).toBe(true);
+    }
+    for (const bad of [
+      "",
+      "has space",
+      "has\"quote",
+      "has'quote",
+      "back\\slash",
+      "semi;colon",
+      "dollar$token",
+      "$TOKEN$",
+      "PROJECT_ID_SENTINEL",
+      "{{project}}",
+      "../traversal",
+      "a".repeat(200),
+    ]) {
+      expect(isSafeApiCallProjectId(bad)).toBe(false);
     }
   });
 
@@ -513,25 +552,25 @@ describe("pinned api-call POST (three frozen templates)", () => {
   });
 
   it("returns a defensive copy that cannot mutate the frozen template table", async () => {
-    const selected = apiCallTemplate("meta");
+    const selected = apiCallTemplate("antigravity");
     selected.url = "https://example.invalid/";
     selected.headers.Authorization = "tampered";
-    const fresh = apiCallTemplate("meta");
-    expect(fresh.url).toBe("https://api.meta.ai/muse-code/key");
+    const fresh = apiCallTemplate("antigravity");
+    expect(fresh.url).toBe("https://daily-cloudcode-pa.googleapis.com/v1internal:loadCodeAssist");
     expect(fresh.headers.Authorization).toBe("Bearer $TOKEN$");
   });
 
   it("rejects untrusted auth indexes before any network happens", async () => {
     for (const bad of ["", "../config", "a/b", "x y", "api-call", "a".repeat(200)]) {
       const fetch = vi.fn(async () => json(200, {}));
-      await expect(client(fetch).postApiCall("meta", bad)).rejects.toThrow(
+      await expect(client(fetch).postApiCall("devin", bad)).rejects.toThrow(
         CliproxyConfigError,
       );
       expect(fetch).not.toHaveBeenCalled();
     }
   });
 
-  it("POSTs the exact frozen meta template with the auth index as the only variable", async () => {
+  it("POSTs the exact frozen devin template with the auth index as the only variable", async () => {
     let seen: { url?: string; method?: string; headers?: Headers; body?: string } = {};
     const fetch = vi.fn(async (url: string, init?: RequestInit) => {
       seen = {
@@ -540,9 +579,9 @@ describe("pinned api-call POST (three frozen templates)", () => {
         headers: new Headers(init?.headers),
         body: init?.body as string,
       };
-      return envelope(200, { subs_usage: { window: { used_percent: 10 } } });
+      return envelope(200, { userStatus: {} });
     });
-    const result = await client(fetch).postApiCall("meta", "abc123");
+    const result = await client(fetch).postApiCall("devin", "abc123");
     expect(seen.url).toBe("http://127.0.0.1:8317/v0/management/api-call");
     expect(seen.method).toBe("POST");
     expect(seen.headers?.get("X-Test-Key")).toBe(KEY);
@@ -551,20 +590,67 @@ describe("pinned api-call POST (three frozen templates)", () => {
     expect(sent).toEqual({
       auth_index: "abc123",
       method: "POST",
-      url: "https://api.meta.ai/muse-code/key",
+      url: "https://server.codeium.com/exa.seat_management_pb.SeatManagementService/GetUserStatus",
       header: {
-        Accept: "application/json",
         "Content-Type": "application/json",
-        Authorization: "Bearer $TOKEN$",
-        "x-api-version": "1.0.0",
+        "Connect-Protocol-Version": "1",
       },
-      data: "{}",
+      data: '{"metadata":{"ideName":"chisel","ideVersion":"3000.10.21","apiKey":"$TOKEN$","locale":"en","os":"darwin","extensionVersion":"3000.10.21","clientName":"chisel"}}',
     });
     // The $TOKEN$ placeholder is substituted server-side by CLIProxy — the
     // plugin sends it verbatim and never handles credential material.
     expect(seen.body).toContain("$TOKEN$");
     expect(result.statusCode).toBe(200);
-    expect(result.body).toEqual({ subs_usage: { window: { used_percent: 10 } } });
+    expect(result.body).toEqual({ userStatus: {} });
+  });
+
+  it("POSTs the exact frozen antigravity quota template with the project id in the body", async () => {
+    let seen: { url?: string; method?: string; body?: string } = {};
+    const fetch = vi.fn(async (url: string, init?: RequestInit) => {
+      seen = { url, method: init?.method, body: init?.body as string };
+      return envelope(200, { groups: [] });
+    });
+    const result = await client(fetch).postApiCall("antigravity-quota-daily", "abc123", {
+      projectId: "my-project-123",
+    });
+    expect(seen.url).toBe("http://127.0.0.1:8317/v0/management/api-call");
+    expect(seen.method).toBe("POST");
+    const sent = JSON.parse(seen.body as string) as Record<string, unknown>;
+    expect(sent).toEqual({
+      auth_index: "abc123",
+      method: "POST",
+      url: "https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary",
+      header: {
+        Accept: "application/json",
+        "Content-Type": "application/json",
+        Authorization: "Bearer $TOKEN$",
+        "User-Agent": "antigravity/hub/2.23.0 darwin/arm64",
+      },
+      // The project id is injected via JSON.stringify — it can never break
+      // out of its JSON string, and the literal sentinel never travels.
+      data: '{"project":"my-project-123"}',
+    });
+    expect(seen.body).toContain("$TOKEN$");
+    expect(seen.body).not.toContain("PROJECT_ID_SENTINEL");
+    expect(result.statusCode).toBe(200);
+  });
+
+  it("rejects quota calls with a missing or untrusted project id before any network happens", async () => {
+    for (const opts of [undefined, {}, { projectId: "" }, { projectId: "../evil" }, { projectId: "has space" }, { projectId: "$TOKEN$" }, { projectId: "PROJECT_ID_SENTINEL" }]) {
+      const fetch = vi.fn(async () => json(200, {}));
+      await expect(
+        client(fetch).postApiCall("antigravity-quota-sandbox", "abc123", opts),
+      ).rejects.toThrow(CliproxyConfigError);
+      expect(fetch).not.toHaveBeenCalled();
+    }
+  });
+
+  it("rejects a project id on a non-quota template (fail closed, no silent ignore)", async () => {
+    const fetch = vi.fn(async () => json(200, {}));
+    await expect(
+      client(fetch).postApiCall("devin", "abc123", { projectId: "my-project-123" }),
+    ).rejects.toThrow(CliproxyConfigError);
+    expect(fetch).not.toHaveBeenCalled();
   });
 
   it("POSTs the exact frozen antigravity and devin templates", async () => {
@@ -604,7 +690,7 @@ describe("pinned api-call POST (three frozen templates)", () => {
     for (const status of [401, 403]) {
       const fetch = vi.fn(async () => new Response("denied", { status }));
       const err = await client(fetch)
-        .postApiCall("meta", "idx1")
+        .postApiCall("devin", "idx1")
         .catch((e: unknown) => e);
       expect(err).toBeInstanceOf(CliproxyAuthError);
       expect((err as Error).message).not.toContain(KEY);
@@ -612,14 +698,14 @@ describe("pinned api-call POST (three frozen templates)", () => {
     {
       const fetch = vi.fn(async () => new Response("missing", { status: 404 }));
       const err = await client(fetch)
-        .postApiCall("meta", "idx1")
+        .postApiCall("devin", "idx1")
         .catch((e: unknown) => e);
       expect(err).toBeInstanceOf(CliproxyNotFoundError);
     }
     {
       const fetch = vi.fn(async () => new Response("boom", { status: 500 }));
       const err = await client(fetch)
-        .postApiCall("meta", "idx1")
+        .postApiCall("devin", "idx1")
         .catch((e: unknown) => e);
       expect(err).toBeInstanceOf(CliproxyNetworkError);
     }
@@ -629,7 +715,7 @@ describe("pinned api-call POST (three frozen templates)", () => {
     for (const payload of [[], "ok", { header: {}, body: "{}" }, { status_code: "200", body: "{}" }]) {
       const fetch = vi.fn(async () => json(200, payload));
       const err = await client(fetch)
-        .postApiCall("meta", "idx1")
+        .postApiCall("devin", "idx1")
         .catch((e: unknown) => e);
       expect(err).toBeInstanceOf(CliproxyBodyError);
     }
@@ -640,7 +726,7 @@ describe("pinned api-call POST (three frozen templates)", () => {
       async () => new Response(null, { status: 302, headers: { location: "/v0/management/auth-files" } }),
     );
     const err = await client(fetch)
-      .postApiCall("meta", "idx1")
+      .postApiCall("devin", "idx1")
       .catch((e: unknown) => e);
     expect(err).toBeInstanceOf(CliproxyRedirectError);
   });

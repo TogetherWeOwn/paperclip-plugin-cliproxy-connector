@@ -41,7 +41,7 @@ const PLUGIN_QUOTA_SHAPE = /^\/v0\/management\/plugins\/[A-Za-z0-9][A-Za-z0-9_-]
 
 /**
  * Pinned `api-call` management path. POST-only, and only reachable
- * through `postApiCall` with one of the three frozen templates below — the
+ * through `postApiCall` with one of the frozen templates below — the
  * GET allow-list (`assertAllowListed`) still refuses this path outright.
  *
  * `POST /v0/management/api-call` proxies one request to the provider using the
@@ -60,20 +60,27 @@ export const API_CALL_PATH = "/v0/management/api-call";
 /**
  * One pinned upstream request behind `POST /v0/management/api-call`. Every
  * field is a frozen literal copied from the Management Center panel source
- * (cited per template); the only per-account variable is `authIndex`, supplied
- * separately at call time and validated by `isSafeAuthIndex` before any
- * network happens.
+ * (cited per template); per-account variables (`authIndex`, and `projectId`
+ * for the Antigravity quota templates) are supplied separately at call time
+ * and validated before any network happens.
  */
 export interface ApiCallTemplate {
-  /** Provider family this template serves (`meta`, `antigravity`, `devin`). */
+  /** Provider family this template serves (`antigravity`, `devin`). */
   provider: string;
   method: "POST";
   /** Exact upstream URL — never built from input. */
   url: string;
   /** Exact upstream headers. `$TOKEN$` is substituted server-side by CLIProxy. */
   headers: Record<string, string>;
-  /** Exact upstream body. `$TOKEN$` is substituted server-side by CLIProxy. */
+  /**
+   * Exact upstream body. `$TOKEN$` is substituted server-side by CLIProxy.
+   * Quota templates carry the placeholder `PROJECT_ID_SENTINEL` instead of a
+   * literal body: `postApiCall` replaces it with the validated project id via
+   * `JSON.stringify`, so the id can never break out of its JSON string.
+   */
   data: string;
+  /** When true, the caller must supply a validated `projectId`. */
+  requiresProjectId?: true;
 }
 
 /**
@@ -95,50 +102,46 @@ function copyApiCallTemplate(template: ApiCallTemplate): ApiCallTemplate {
 }
 
 /**
- * The three pinned `api-call` templates. Frozen: callers select by
- * key (`ApiCallTemplateKey`) and can never supply their own URL, headers or
- * body, so the guarded POST below cannot send an arbitrary upstream request.
+ * The pinned `api-call` templates. Frozen: callers select by key
+ * (`ApiCallTemplateKey`) and can never supply their own URL, headers or body,
+ * so the guarded POST below cannot send an arbitrary upstream request.
  *
- * - Meta: the Muse key endpoint the panel polls for quota (panel
- *   `src/features/quota/providers/meta/requests.ts`: `META_MUSE_QUOTA_URL` and
- *   the `request()` call — method, URL, `Accept`/`Content-Type`/`x-api-version`
- *   headers and `'{}'` body). The panel authorizes with the `dca_token` it
- *   reads from the downloaded auth file; the connector cannot download auth
- *   files (credential-bearing), so the template carries `Bearer $TOKEN$` and
- *   CLIProxy substitutes the stored meta credential server-side (backend
- *   `resolveTokenForAuth` → `resolveMetaToken`). Known backend boundary: the
- *   panel authorizes this exact call with the downloaded `dca_token`, and this
- *   template preserves that request shape, but the connector cannot verify
- *   which stored meta credential form the backend substitutes. An upstream
- *   rejection warns per file and stays unknown; operator resync is the
- *   verification. Backend DCA substitution would be follow-up work.
- * - Antigravity: the Code Assist subscription call (panel
+ * There is deliberately NO Meta template. The panel authorizes its Muse-key
+ * quota call with the `dca_token` it reads from the downloaded auth file, but
+ * the connector never downloads auth files (credential-bearing by policy), and
+ * the backend's server-side `$TOKEN$` substitution (`resolveTokenForAuth` →
+ * `metaTokenFromAuth`) never yields that downloaded token — so a pinned
+ * `muse-code/key` template can only ever return HTTP 401 (proven 3/3 on live
+ * accounts). Meta quota stays panel-only; the parser says so instead of
+ * calling.
+ *
+ * - Antigravity subscription: the Code Assist subscription call (panel
  *   `src/services/api/antigravitySubscription.ts` `antigravitySubscriptionApi.get`
  *   with `ANTIGRAVITY_CODE_ASSIST_URL`, `ANTIGRAVITY_REQUEST_HEADERS` and
  *   `CODE_ASSIST_REQUEST_BODY`; header constants in
  *   `src/utils/quota/constants.ts`, including the pinned
- *   `antigravity/hub/2.23.0 darwin/arm64` user agent). The backend refreshes
- *   the OAuth access token server-side for antigravity credentials.
+ *   `antigravity/hub/2.23.0 darwin/arm64` user agent). Plan evidence only —
+ *   the subscription answer carries no quota windows, so the quota templates
+ *   below supply them. The backend refreshes the OAuth access token
+ *   server-side for antigravity credentials.
+ * - Antigravity quota (×3): the `retrieveUserQuotaSummary` endpoints the panel
+ *   tries in order (panel `src/utils/quota/constants.ts`
+ *   `ANTIGRAVITY_QUOTA_URLS`, tried daily → sandbox → cloudcode by
+ *   `fetchQuotaPayload` in `src/features/quota/providers/antigravity/data.ts`),
+ *   with the panel's quota headers (same file: JSON content type, the pinned
+ *   user agent, `Bearer` token) and body shape `{"project": projectId}`. The
+ *   project id comes from the auth-files list entry (same sources the panel
+ *   uses, minus the auth-file download which the connector never performs);
+ *   `postApiCall` injects it via `JSON.stringify`. Template key order below
+ *   matches the panel's try order.
  * - Devin: the live seat-management RPC (panel
  *   `src/features/quota/providers/devin/requests.ts`
  *   `createDevinQuotaFetcher` — method, `GetUserStatus` URL, `Content-Type` /
  *   `Connect-Protocol-Version` headers and the chisel metadata body whose
  *   `apiKey` is `$TOKEN$`). It reads the live RPC, not auth-file
- *   `quota.signals` — which is why the connector saw nothing for Devin.
+ *   `quota.signals`.
  */
 const API_CALL_TEMPLATES = {
-  meta: freezeApiCallTemplate({
-    provider: "meta",
-    method: "POST",
-    url: "https://api.meta.ai/muse-code/key",
-    headers: {
-      Accept: "application/json",
-      "Content-Type": "application/json",
-      Authorization: "Bearer $TOKEN$",
-      "x-api-version": "1.0.0",
-    },
-    data: "{}",
-  }),
   antigravity: freezeApiCallTemplate({
     provider: "antigravity",
     method: "POST",
@@ -149,6 +152,45 @@ const API_CALL_TEMPLATES = {
       "User-Agent": "antigravity/hub/2.23.0 darwin/arm64",
     },
     data: '{"metadata":{"ideType":"ANTIGRAVITY"}}',
+  }),
+  "antigravity-quota-daily": freezeApiCallTemplate({
+    provider: "antigravity",
+    method: "POST",
+    url: "https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary",
+    headers: {
+      Accept: "application/json",
+      "Content-Type": "application/json",
+      Authorization: "Bearer $TOKEN$",
+      "User-Agent": "antigravity/hub/2.23.0 darwin/arm64",
+    },
+    data: '{"project":"PROJECT_ID_SENTINEL"}',
+    requiresProjectId: true,
+  }),
+  "antigravity-quota-sandbox": freezeApiCallTemplate({
+    provider: "antigravity",
+    method: "POST",
+    url: "https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal:retrieveUserQuotaSummary",
+    headers: {
+      Accept: "application/json",
+      "Content-Type": "application/json",
+      Authorization: "Bearer $TOKEN$",
+      "User-Agent": "antigravity/hub/2.23.0 darwin/arm64",
+    },
+    data: '{"project":"PROJECT_ID_SENTINEL"}',
+    requiresProjectId: true,
+  }),
+  "antigravity-quota-cloudcode": freezeApiCallTemplate({
+    provider: "antigravity",
+    method: "POST",
+    url: "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary",
+    headers: {
+      Accept: "application/json",
+      "Content-Type": "application/json",
+      Authorization: "Bearer $TOKEN$",
+      "User-Agent": "antigravity/hub/2.23.0 darwin/arm64",
+    },
+    data: '{"project":"PROJECT_ID_SENTINEL"}',
+    requiresProjectId: true,
   }),
   devin: freezeApiCallTemplate({
     provider: "devin",
@@ -162,6 +204,44 @@ const API_CALL_TEMPLATES = {
   }),
 } as const satisfies Record<string, ApiCallTemplate>;
 Object.freeze(API_CALL_TEMPLATES);
+
+/**
+ * The `PROJECT_ID_SENTINEL` placeholder inside quota template bodies. It is a
+ * compile-time marker only: `postApiCall` replaces it with the validated
+ * project id via `JSON.stringify`, so the id can never break out of its JSON
+ * string, and a project id that literally equals the sentinel is rejected.
+ */
+const PROJECT_ID_SENTINEL = "PROJECT_ID_SENTINEL";
+
+/**
+ * Single safe Antigravity project id (`{"project": …}` body field). GCP-style
+ * project ids (lowercase letters, digits, hyphens/colons for domain-scoped
+ * ids, dots, slashes for organization paths): starts alphanumeric, bounded,
+ * no whitespace, no quotes, no backslashes, no `$` (no substitution games),
+ * and can never equal the body placeholder above.
+ */
+export const API_CALL_PROJECT_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$/;
+
+export function isSafeApiCallProjectId(value: string): boolean {
+  return (
+    API_CALL_PROJECT_ID_PATTERN.test(value) &&
+    !value.includes("..") &&
+    !value.includes("$") &&
+    value !== PROJECT_ID_SENTINEL
+  );
+}
+
+/**
+ * Ordered Antigravity quota template keys: the panel's try order (panel
+ * `ANTIGRAVITY_QUOTA_URLS`), most likely to answer first. The sync loop tries
+ * them in this order per account per sync and remembers the first key whose
+ * answer carries quota groups.
+ */
+export const ANTIGRAVITY_QUOTA_TEMPLATE_KEYS = [
+  "antigravity-quota-daily",
+  "antigravity-quota-sandbox",
+  "antigravity-quota-cloudcode",
+] as const satisfies readonly ApiCallTemplateKey[];
 
 export type ApiCallTemplateKey = keyof typeof API_CALL_TEMPLATES;
 
@@ -180,9 +260,11 @@ export function apiCallTemplateKeys(): ApiCallTemplateKey[] {
 }
 
 /**
- * Exact template allow-map from an auth file's raw provider word to its pinned
- * template key. Only the three provider words the templates were pinned for
- * (`meta`, `antigravity`, `devin`) resolve; anything else — `gemini`,
+ * Exact subscription-template allow-map from an auth file's raw provider word
+ * to its pinned template key. Only `antigravity` and `devin` resolve.
+ * `meta` deliberately resolves to null: there is no Meta template (the
+ * pinned `muse-code/key` request can never authenticate — see the table
+ * comment), so Meta accounts are never called. Anything else — `gemini`,
  * `gemini-cli`, `metafoo`, future provider words — returns null and is never
  * called. This is deliberately NOT `normalizeProvider`: fuzzy/substring
  * matching would send one account's stored credential through another
@@ -192,8 +274,20 @@ export function apiCallTemplateKeys(): ApiCallTemplateKey[] {
  */
 export function apiCallTemplateKeyForProvider(rawProvider: string): ApiCallTemplateKey | null {
   const word = rawProvider.trim().toLowerCase();
-  if (!Object.prototype.hasOwnProperty.call(API_CALL_TEMPLATES, word)) return null;
-  return word as ApiCallTemplateKey;
+  if (word === "antigravity" || word === "devin") return word;
+  return null;
+}
+
+/**
+ * Ordered quota-template keys for an auth file's raw provider word. Only
+ * `antigravity` resolves (to the panel-order quota keys); every other word —
+ * including `meta` — returns an empty array and gets no quota call.
+ */
+export function apiCallQuotaTemplateKeysForProvider(rawProvider: string): ApiCallTemplateKey[] {
+  if (rawProvider.trim().toLowerCase() === "antigravity") {
+    return [...ANTIGRAVITY_QUOTA_TEMPLATE_KEYS];
+  }
+  return [];
 }
 
 /**
@@ -649,23 +743,45 @@ export class CliproxyManagementClient {
   /**
    * POST one pinned `api-call` template for one credential.
    *
-   * The caller names a template KEY only (`meta`, `antigravity`, `devin`); the
-   * upstream method, URL, headers and body come from the frozen template, so
-   * this method structurally cannot send an arbitrary upstream request. The
-   * only per-account variable is `authIndex`, validated before any network
-   * happens. The template's `$TOKEN$` placeholders are substituted with the
-   * stored credential server-side by CLIProxy — the plugin never sees them.
+   * The caller names a template KEY only; the upstream method, URL, headers
+   * and body come from the frozen template, so this method structurally cannot
+   * send an arbitrary upstream request. The only per-account variables are
+   * `authIndex` (validated before any network happens) and, for the
+   * Antigravity quota templates, `projectId` — validated by
+   * `isSafeApiCallProjectId` and injected via `JSON.stringify`, so it can
+   * never break out of its JSON string. The template's `$TOKEN$` placeholders
+   * are substituted with the stored credential server-side by CLIProxy — the
+   * plugin never sees them.
    *
    * Transport errors keep the GET semantics: 401/403 spends the strike budget
    * (the key itself was rejected), 404/5xx/network failures are the caller's
    * cue to warn per file and stay quota-blind. The UPSTREAM status travels
    * inside the returned envelope (`statusCode`) and never throws here: a
-   * provider-side 4xx/5xx is a per-file warning, not a sync failure.
+   * provider-side 4xx/5xx is a per-file warning (plus per-account backoff for
+   * upstream 401/403, owned by the caller), not a sync failure.
    */
-  async postApiCall(templateKey: string, authIndex: string): Promise<ApiCallResult> {
+  async postApiCall(
+    templateKey: string,
+    authIndex: string,
+    opts?: { projectId?: string },
+  ): Promise<ApiCallResult> {
     const template = apiCallTemplate(templateKey);
     if (!isSafeAuthIndex(authIndex)) {
       throw new CliproxyConfigError(`refusing an api-call request with an untrusted auth index`);
+    }
+    let data = template.data;
+    if (template.requiresProjectId) {
+      const projectId = opts?.projectId;
+      if (typeof projectId !== "string" || !isSafeApiCallProjectId(projectId)) {
+        throw new CliproxyConfigError(
+          `refusing an api-call quota request with a missing or untrusted project id`,
+        );
+      }
+      data = JSON.stringify({ project: projectId });
+    } else if (opts?.projectId !== undefined) {
+      throw new CliproxyConfigError(
+        `refusing an api-call request that passes a project id to a non-quota template`,
+      );
     }
     const url = this.resolveApiCallTarget();
     const requestBody = JSON.stringify({
@@ -673,7 +789,7 @@ export class CliproxyManagementClient {
       method: template.method,
       url: template.url,
       header: template.headers,
-      data: template.data,
+      data,
     });
     const keyHeader = this.keyHeader;
     const key = this.key;

@@ -530,14 +530,18 @@ function parseRemainingPercentField(value: unknown): number | null {
 }
 
 /**
- * Display-only blind reason for a quota-blind account row. Providers whose
- * upstream exposes no quota read "upstream exposes nothing"; NIM-style
- * local estimates read "local estimate"; a gated provider that simply
- * reported no usable windows reads "no usable quota windows".
+ * Display-only blind reason for a quota-blind account row. Meta reads
+ * panel-only: the connector never calls for it (no template can
+ * authenticate — see the `api-call` template table in `src/cliproxy.ts`), so
+ * the only live read is the panel's own. Providers whose upstream exposes no
+ * quota read "upstream exposes nothing"; NIM-style local estimates read
+ * "local estimate"; a gated provider that simply reported no usable windows
+ * reads "no usable quota windows".
  */
 export function quotaBlindReason(parserKey: ProviderKey, hasWindows: boolean): string | null {
   switch (parserKey) {
     case "meta":
+      return "panel-only (needs the downloaded auth file)";
     case "antigravity":
     case "xai":
     case "kimi":
@@ -748,57 +752,109 @@ export interface ParsedApiQuota {
   warnings: string[];
 }
 
-/** Template key serving one parser family (mirrors `ApiCallTemplateKey`). */
-export type ApiCallProvider = "meta" | "antigravity" | "devin";
-
 /**
- * Parse a Meta `subs_usage` window (`{used_percent, resets_at,
- * window_duration_mins}`), mirroring the panel's `parseWindow` (`panel
- * src/features/quota/providers/metaQuota.ts`): `used_percent` clamps to
- * 0–100, `resets_at` is epoch seconds (dropped when not positive), and the
- * duration is display context only. Returns null when the window carries no
- * usable percent; the caller converts that null into an explicit unknown
- * window row, so a partial response cannot imply coverage it did not report.
+ * Shared Antigravity `groups[].buckets[]` quota-summary window reader (panel
+ * quota types `AntigravityQuotaSummaryGroupPayload.buckets[]`: `window`,
+ * `remainingFraction`, `resetTime`, `description`). Used by both the
+ * subscription-answer parser (opportunistic groups) and the quota-summary
+ * parser below, so the two answers shape windows identically. Identical
+ * upstream window names repeating across groups are disambiguated rather than
+ * emitted as duplicate ids (which would let one row overwrite or mask
+ * another downstream). Per-window tolerance: one malformed bucket never
+ * blinds the rest — it is skipped with a warning.
  */
-function parseMetaWindow(
-  id: "window" | "weekly",
-  value: unknown,
+function parseAntigravityBucketWindows(
+  groups: unknown,
   observedAt: string | null,
   allowList: string[],
-): UsageLimitRow | null {
-  const raw = asObj(value);
-  if (!raw) return null;
-  const usedRaw = getNum(raw, "used_percent", "usedPercent");
-  if (usedRaw === null) return null;
-  const usedPercent = Math.min(100, Math.max(0, usedRaw));
-  const remainingPercent = 100 - usedPercent;
-  const exhausted = remainingPercent <= 0;
-  return makeLimit({
-    id: `meta:${id}`,
-    label: `meta ${id}`,
-    usedPercent,
-    remainingPercent,
-    resetsAt: toIsoTimestamp(raw.resets_at ?? raw.resetsAt ?? null),
-    limitReached: exhausted,
-    allowed: exhausted ? false : true,
-    gating: isGatingWindow("meta", id, allowList),
-    observedAt,
-    viaProviderApi: true,
-  });
+  warnings: string[],
+): UsageLimitRow[] {
+  const limits: UsageLimitRow[] = [];
+  const list = Array.isArray(groups) ? groups : null;
+  if (!list) return limits;
+  const seenBucketWindows = new Map<string, number>();
+  for (const g of list) {
+    const group = asObj(g);
+    if (!group) {
+      warnings.push("antigravity: skipping a malformed quota group.");
+      continue;
+    }
+    const buckets = Array.isArray(group.buckets) ? group.buckets : null;
+    if (!buckets || buckets.length === 0) {
+      warnings.push("antigravity: quota group has no buckets; treating this group as unknown.");
+      continue;
+    }
+    for (const b of buckets) {
+      const bucket = asObj(b);
+      if (!bucket) {
+        warnings.push("antigravity: skipping a malformed quota bucket.");
+        continue;
+      }
+      const baseWindowName =
+        getStr(bucket, "window", "window_name", "name", "id", "displayName", "display_name") ?? "window";
+      const repeats = seenBucketWindows.get(baseWindowName) ?? 0;
+      seenBucketWindows.set(baseWindowName, repeats + 1);
+      const windowName = repeats === 0 ? baseWindowName : `${baseWindowName}#${repeats + 1}`;
+      // `remainingFraction` is a 0–1 fraction, while a trailing `%` marks an
+      // already-percent string (`"42%"` → 42, not 0.42).
+      const remainingPercent = parseAntigravityRemainingPercent(
+        bucket.remainingFraction ?? bucket.remaining_fraction ?? null,
+      );
+      if (remainingPercent === null) {
+        warnings.push(`antigravity: bucket ${JSON.stringify(windowName)} has no usable percent; skipping.`);
+        continue;
+      }
+      const usedPercent = 100 - remainingPercent;
+      const exhausted = remainingPercent <= 0;
+      limits.push(
+        makeLimit({
+          id: `antigravity:${windowName}`,
+          label: getStr(bucket, "description", "displayName", "display_name") ?? `antigravity ${windowName}`,
+          usedPercent,
+          remainingPercent,
+          resetsAt: toIsoTimestamp(bucket.resetTime ?? bucket.reset_time ?? null),
+          limitReached: exhausted,
+          allowed: exhausted ? false : true,
+          gating: isGatingWindow("antigravity", baseWindowName, allowList),
+          observedAt,
+          viaProviderApi: true,
+        }),
+      );
+    }
+  }
+  return limits;
 }
 
 /**
- * Parse the Meta Muse key endpoint answer (panel
- * `src/features/quota/providers/meta/requests.ts` `META_MUSE_QUOTA_URL` via
- * `parseMetaQuotaPayload` in `metaQuota.ts`): `subs_usage{window, weekly}`,
- * `subs_tier_name` (falling back to `subs_usage.tier`), `is_subs_active`. A
- * valid object without `subs_usage` is a successful observation with unknown
- * quota (panel: not a zero, not a request error) — plan only, zero windows.
- * An explicitly inactive subscription forces the emitted windows exhausted:
- * there is no quota to route on. Anything unparseable warns with zero windows
- * (unknown, never headroom).
+ * Does this `retrieveUserQuotaSummary` answer carry quota groups? The sync
+ * loop's stop condition: the first 2xx quota answer WITH groups wins (and is
+ * remembered); a 2xx without groups falls through to the next quota URL.
+ * Tolerant by design — the parser below owns the detailed warnings.
  */
-export function parseMetaQuota(
+export function hasAntigravityQuotaGroups(body: unknown): boolean {
+  if (typeof body === "string") {
+    try {
+      body = JSON.parse(body) as unknown;
+    } catch {
+      return false;
+    }
+  }
+  const root = asObj(body);
+  if (!root) return false;
+  return Array.isArray(root.groups) && root.groups.length > 0;
+}
+
+/**
+ * Parse an Antigravity `retrieveUserQuotaSummary` answer (panel
+ * `src/features/quota/providers/antigravity/data.ts` `fetchQuotaPayload` +
+ * `src/utils/quota/parsers.ts` `parseAntigravityPayload`): `groups[]` →
+ * `buckets[]` with `remainingFraction` / `resetTime`, built into quota groups
+ * by `buildAntigravityQuotaGroups`. Quota answers carry windows only, never
+ * plan evidence — the plan comes from the subscription answer parsed
+ * alongside. A valid answer without groups warns with zero windows (unknown,
+ * never headroom).
+ */
+export function parseAntigravityQuota(
   body: unknown,
   observedAt: string | null,
   allowList: string[],
@@ -808,49 +864,20 @@ export function parseMetaQuota(
     try {
       body = JSON.parse(body) as unknown;
     } catch {
-      warnings.push("meta: provider API answer is not JSON; treating this account as unknown.");
+      warnings.push("antigravity: provider API quota answer is not JSON; treating this account as unknown.");
       return { planType: null, limits: [], warnings };
     }
   }
   const root = asObj(body);
   if (!root) {
-    warnings.push("meta: provider API answer is not an object; treating this account as unknown.");
+    warnings.push("antigravity: provider API quota answer is not an object; treating this account as unknown.");
     return { planType: null, limits: [], warnings };
   }
-  const usage = asObj(root.subs_usage ?? root.subsUsage ?? null);
-  const explicitPlan = getStr(root, "subs_tier_name", "subsTierName");
-  const usagePlan = usage ? getStr(usage, "tier") : null;
-  const planType = (explicitPlan ?? usagePlan ?? null) || null;
-  const inactive = root.is_subs_active === false || root.isSubsActive === false;
-  if (!usage) {
-    warnings.push("meta: provider API answer carries no subs_usage; treating this account as unknown.");
-    return { planType, limits: [], warnings };
+  const limits = parseAntigravityBucketWindows(root.groups ?? null, observedAt, allowList, warnings);
+  if (!Array.isArray(root.groups) || root.groups.length === 0) {
+    warnings.push("antigravity: provider API quota answer carries no quota groups; treating this account as unknown.");
   }
-  const limits: UsageLimitRow[] = [];
-  for (const id of ["window", "weekly"] as const) {
-    const parsed = parseMetaWindow(id, usage[id], observedAt, allowList);
-    if (!parsed) {
-      warnings.push(`meta: window ${JSON.stringify(id)} has no usable percent; marking it unknown.`);
-      const unknownWindow = makeUnknownProviderWindow({
-        provider: "meta",
-        id,
-        label: `meta ${id}`,
-        observedAt,
-        allowList,
-      });
-      limits.push(
-        inactive ? { ...unknownWindow, limitReached: true, allowed: false } : unknownWindow,
-      );
-      continue;
-    }
-    limits.push(
-      inactive ? { ...parsed, limitReached: true, allowed: false } : parsed,
-    );
-  }
-  if (inactive && limits.length > 0) {
-    warnings.push("meta: subscription is inactive; treating these windows as exhausted.");
-  }
-  return { planType, limits, warnings };
+  return { planType: null, limits, warnings };
 }
 
 /**
@@ -908,11 +935,9 @@ function parseAntigravityRemainingPercent(value: unknown): number | null {
  * aliases tolerated) with the paid tier winning when it carries an id, mapped
  * through `PLAN_BY_TIER_ID`. The subscription call carries no quota windows
  * itself, so quota windows come only from an opportunistic `groups[].buckets[]`
- * quota-summary shape when the answer carries one (same bucket fields the
- * plugin parser reads: `window`, `remainingFraction`, `resetTime`,
- * `description`; percent strings like `"42%"` tolerated). Plan-only answers
- * yield zero windows — the account stays quota-blind on plan evidence alone,
- * never headroom.
+ * quota-summary shape when the answer carries one (read by the shared bucket
+ * helper above). Plan-only answers yield zero windows — the account stays
+ * quota-blind on plan evidence alone, never headroom.
  */
 export function parseAntigravitySubscription(
   body: unknown,
@@ -944,65 +969,9 @@ export function parseAntigravitySubscription(
     (effective.id && ANTIGRAVITY_PLAN_BY_TIER_ID[effective.id]) || "unknown";
   const planType = effective.name || planWord;
 
-  // Opportunistic quota-summary groups on the same answer (panel quota types
-  // `AntigravityQuotaSummaryGroupPayload.buckets[]`).
-  const limits: UsageLimitRow[] = [];
-  const groups = Array.isArray(root.groups) ? root.groups : null;
-  const seenBucketWindows = new Map<string, number>();
-  if (groups) {
-    for (const g of groups) {
-      const group = asObj(g);
-      if (!group) {
-        warnings.push("antigravity: skipping a malformed quota group.");
-        continue;
-      }
-      const buckets = Array.isArray(group.buckets) ? group.buckets : null;
-      if (!buckets || buckets.length === 0) {
-        warnings.push("antigravity: quota group has no buckets; treating this group as unknown.");
-        continue;
-      }
-      for (const b of buckets) {
-        const bucket = asObj(b);
-        if (!bucket) {
-          warnings.push("antigravity: skipping a malformed quota bucket.");
-          continue;
-        }
-        const baseWindowName =
-          getStr(bucket, "window", "window_name", "name", "id", "displayName", "display_name") ?? "window";
-        // Identical upstream window names can repeat across groups. Rows are
-        // keyed by id, so disambiguate repeats rather than emitting duplicate
-        // ids (which would let one row overwrite or mask another downstream).
-        const repeats = seenBucketWindows.get(baseWindowName) ?? 0;
-        seenBucketWindows.set(baseWindowName, repeats + 1);
-        const windowName = repeats === 0 ? baseWindowName : `${baseWindowName}#${repeats + 1}`;
-        // `remainingFraction` is a 0–1 fraction, while a trailing `%` marks an
-        // already-percent string (`"42%"` → 42, not 0.42).
-        const remainingPercent = parseAntigravityRemainingPercent(
-          bucket.remainingFraction ?? bucket.remaining_fraction ?? null,
-        );
-        if (remainingPercent === null) {
-          warnings.push(`antigravity: bucket ${JSON.stringify(windowName)} has no usable percent; skipping.`);
-          continue;
-        }
-        const usedPercent = 100 - remainingPercent;
-        const exhausted = remainingPercent <= 0;
-        limits.push(
-          makeLimit({
-            id: `antigravity:${windowName}`,
-            label: getStr(bucket, "description", "displayName", "display_name") ?? `antigravity ${windowName}`,
-            usedPercent,
-            remainingPercent,
-            resetsAt: toIsoTimestamp(bucket.resetTime ?? bucket.reset_time ?? null),
-            limitReached: exhausted,
-            allowed: exhausted ? false : true,
-            gating: isGatingWindow("antigravity", baseWindowName, allowList),
-            observedAt,
-            viaProviderApi: true,
-          }),
-        );
-      }
-    }
-  }
+  // Opportunistic quota-summary groups on the same answer, read by the shared
+  // bucket helper so subscription and quota answers shape windows identically.
+  const limits = parseAntigravityBucketWindows(root.groups ?? null, observedAt, allowList, warnings);
   return { planType, limits, warnings };
 }
 
@@ -1484,6 +1453,15 @@ export interface ParsedAccount {
    */
   authIndex: string | null;
   /**
+   * Antigravity project id for the quota-summary api-call body
+   * (`{"project": …}`), read from the auth-files entry: top-level, then
+   * `metadata`, then `attributes` (panel field order, minus the auth-file
+   * download the connector never performs). Null for non-Antigravity rows
+   * and when the entry carries none. Raw string — the sync loop validates it
+   * before any network happens.
+   */
+  quotaProjectId: string | null;
+  /**
    * This entry's advertised plugin quota route (`quota_plugin_id`), or null
    * when it advertises none, opts out (`supports_quota: false`), or the id
    * is unusable. Lets same-provider accounts on different plugins each fetch
@@ -1539,14 +1517,24 @@ export function parseAuthFiles(
      */
     pluginPayloadByAuthIndex?: Map<string, unknown>;
     /**
-     * Live provider-API answers by credential `auth_index` (pinned
-     * `POST /v0/management/api-call` templates, one call per account per
-     * sync). The parser selects the parser by the account's own family
-     * (`meta`, `antigravity`, `devin`) — never by a caller-supplied key — and
-     * only field-whitelisted quota shapes are kept. Non-2xx upstream answers
-     * warn per file and stay quota-blind (fail open).
+     * Live provider-API subscription answers by credential `auth_index`
+     * (pinned `POST /v0/management/api-call` templates: Antigravity
+     * `loadCodeAssist`, Devin `GetUserStatus`). The parser selects the parser
+     * by the account's own family — never by a caller-supplied key — and only
+     * field-whitelisted quota shapes are kept. Non-2xx upstream answers warn
+     * per file and stay quota-blind (fail open). Upstream 401/403 answers are
+     * never attached here: the sync loop owns those (per-account backoff) and
+     * warns once, so attaching them would double-warn.
      */
     apiCallPayloadByAuthIndex?: Map<string, { statusCode: number; body: unknown; observedAt?: string }>;
+    /**
+     * Live Antigravity quota-summary answers by credential `auth_index`
+     * (pinned `retrieveUserQuotaSummary` templates, winning URL only). Parsed
+     * by `parseAntigravityQuota` alongside the subscription answer above: the
+     * subscription supplies plan evidence, the quota answer supplies windows.
+     * Same non-2xx and 401/403 rules as the subscription answers.
+     */
+    apiCallQuotaPayloadByAuthIndex?: Map<string, { statusCode: number; body: unknown; observedAt?: string }>;
     /**
      * Fallback observation time for live provider-API windows that carry no
      * per-payload time: the sync's fetch time, never the passive `observed_at`.
@@ -1605,6 +1593,20 @@ export function parseAuthFiles(
     const parserKey = normalizeProvider(provider);
     const fileName = getStr(entry, "name", "Name") ?? null;
     const authIndex = getAuthIndex(entry, "auth_index", "authIndex", "AuthIndex");
+    // Project id for the Antigravity quota-summary call body. Same field
+    // order the panel uses when it resolves a project id (list fields, then
+    // metadata, then attributes) — but never the file download, which the
+    // connector does not perform. Other families ignore it.
+    const metadata = getObj(entry, "metadata", "Metadata");
+    const attributes = getObj(entry, "attributes", "Attributes");
+    const quotaProjectId =
+      rawProvider === "antigravity"
+        ? (getStr(entry, "project_id", "projectId", "virtual_project", "project") ??
+          (metadata ? getStr(metadata, "project_id", "projectId", "virtual_project", "project") : null) ??
+          (attributes
+            ? getStr(attributes, "project_id", "projectId", "virtual_project", "project", "gemini_virtual_project")
+            : null))
+        : null;
 
     // Stable identity: CLIProxy `id` first, then the auth-file `path`.
     const stableId = getStr(entry, "id", "ID", "auth_id") ?? getStr(entry, "path", "Path") ?? null;
@@ -1791,9 +1793,9 @@ export function parseAuthFiles(
     const pluginLimits: UsageLimitRow[] = pluginQuota?.limits ?? [];
     if (pluginQuota?.planType) planType = pluginQuota.planType;
 
-    // Live provider-API windows: the account's own api-call answer,
-    // parsed by its own family's parser. A non-2xx upstream answer warns per
-    // file and attaches nothing — fail open, never headroom.
+    // Live provider-API windows: the account's own api-call answers, parsed
+    // by its own family's parser. A non-2xx upstream answer warns per file
+    // and attaches nothing — fail open, never headroom.
     let apiLimits: UsageLimitRow[] = [];
     const apiPayload =
       authIndex !== null ? opts.apiCallPayloadByAuthIndex?.get(authIndex) : undefined;
@@ -1807,15 +1809,14 @@ export function parseAuthFiles(
         // Exact match on the raw provider word — never the fuzzy parser key:
         // a `gemini` answer must not parse as Antigravity quota (or vice
         // versa). The sync loop only fetches exact-word accounts, so this is
-        // defense-in-depth for direct callers.
+        // defense-in-depth for direct callers. Meta has no template and is
+        // never attached an answer (see `quotaBlindReason`).
         const parsedApi: ParsedApiQuota | null =
-          provider === "meta"
-            ? parseMetaQuota(apiPayload.body, apiObservedAt, allowList)
-            : provider === "antigravity"
-              ? parseAntigravitySubscription(apiPayload.body, apiObservedAt, allowList)
-              : provider === "devin"
-                ? parseDevinQuota(apiPayload.body, apiObservedAt, allowList)
-                : null;
+          provider === "antigravity"
+            ? parseAntigravitySubscription(apiPayload.body, apiObservedAt, allowList)
+            : provider === "devin"
+              ? parseDevinQuota(apiPayload.body, apiObservedAt, allowList)
+              : null;
         if (!parsedApi) {
           parseWarnings.push(
             `${provider}: provider API answer has no parser for this family; ignoring it.`,
@@ -1827,6 +1828,31 @@ export function parseAuthFiles(
           if (parsedApi.planType) planType = parsedApi.planType;
         }
       }
+    }
+    // Antigravity quota-summary windows: the winning `retrieveUserQuotaSummary`
+    // answer, parsed alongside the subscription answer. The subscription gives
+    // plan evidence, this gives windows; both append to the same live set.
+    const apiQuotaPayload =
+      authIndex !== null && provider === "antigravity"
+        ? opts.apiCallQuotaPayloadByAuthIndex?.get(authIndex)
+        : undefined;
+    if (apiQuotaPayload !== undefined && !disabled) {
+      const quotaObservedAt = apiQuotaPayload.observedAt ?? opts.apiCallObservedAt ?? opts.now;
+      if (apiQuotaPayload.statusCode < 200 || apiQuotaPayload.statusCode >= 300) {
+        parseWarnings.push(
+          `${provider}: provider API quota returned upstream HTTP ${apiQuotaPayload.statusCode}; treating this account as unknown for live quota.`,
+        );
+      } else {
+        const parsedQuota = parseAntigravityQuota(apiQuotaPayload.body, quotaObservedAt, allowList);
+        parseWarnings.push(...parsedQuota.warnings);
+        apiLimits = [...apiLimits, ...parsedQuota.limits];
+      }
+    } else if (!disabled && provider === "antigravity" && quotaProjectId === null) {
+      // No quota call was possible: without a project id the connector cannot
+      // shape the `{"project": …}` body, so only the subscription plan shows.
+      parseWarnings.push(
+        `${provider}: auth-files entry carries no project id; quota windows unavailable (plan evidence only).`,
+      );
     }
 
     // Usable live windows supersede same-id passive/plugin windows: the RPC
@@ -1855,9 +1881,10 @@ export function parseAuthFiles(
       ? [...limits.filter(live).map((l) => ({ ...l, gating: false })), ...pluginLimits.filter(live), ...apiRows]
       : [...limits.filter(live), ...pluginLimits.filter(live), ...apiRows];
 
-    // Meta and Antigravity publish no passive signals: without live provider-API
-    // windows they stay quota-blind. With at least one gating live window they
-    // route quota-aware like every other gated provider.
+    // Antigravity publishes no passive signals: without live provider-API
+    // windows it stays quota-blind. With at least one gating live window it
+    // routes quota-aware like every other gated provider. Meta is always
+    // quota-blind (panel-only — no template, no call).
     const hasLiveGatingWindows = apiLimits.some((l) => l.gating);
     const quotaBlind =
       parserKey === "xai" ||
@@ -1880,6 +1907,7 @@ export function parseAuthFiles(
       channel,
       fileName,
       authIndex,
+      quotaProjectId,
       quotaPluginId: advertisedPluginId,
       status,
       statusMessage,

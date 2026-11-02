@@ -160,19 +160,25 @@ or no query on older builds) — there are deliberately no config knobs for
 them, and the management key is never sent to `/v1` paths. The served-model list has its
 own pinned path (`/v1/models`, `MODELS_PATH`) fetched with the separate client API key
 (Bearer auth) under the same guarded-fetch rules (loopback, manual redirects, timeouts,
-caps, no key leaks); neither key can travel to the other's paths. Meta, Antigravity and
-Devin publish no passive quota signals, so one pinned `POST /v0/management/api-call`
-per credential per sync reads the same live quota the Management Center panel
-shows: three frozen request templates (exact upstream method, URL, headers and body
+caps, no key leaks); neither key can travel to the other's paths. Antigravity and
+Devin publish no passive quota signals, so pinned `POST /v0/management/api-call`
+calls per credential per sync read the same live quota the Management Center panel
+shows: frozen request templates (exact upstream method, URL, headers and body
 copied from the panel source, `apiCallTemplate()` in `src/cliproxy.ts`) whose only
-variable is the credential `auth_index` — callers cannot supply their own URL, headers
+variables are the credential `auth_index` — and, for the Antigravity quota templates,
+the account's project id — callers cannot supply their own URL, headers
 or body. Upstream `$TOKEN$` placeholders are substituted server-side by CLIProxy; the
-plugin never handles credential material. Meta has a backend boundary: the panel
-authorizes its Muse-key quota call with the downloaded `dca_token`, and this template
-preserves that upstream request shape, but the connector cannot verify which stored
-meta credential form the backend substitutes. If upstream rejects it, the account
-warns and stays unknown; operator resync is the verification. Transport 401/403 spends the strike budget
-like every management GET; an upstream provider-side error travels inside the returned
+plugin never handles credential material. Meta is panel-only: the panel
+authorizes its Muse-key quota call with the downloaded `dca_token`, which the
+connector never downloads (credential-bearing) and the backend never substitutes
+for `$TOKEN$`, so a pinned Meta template could only ever return HTTP 401 — there
+is none, Meta accounts are never called, and the page says panel-only. Antigravity
+reads two calls: the `loadCodeAssist` subscription (plan evidence) plus the winning
+`retrieveUserQuotaSummary` quota URL (panel try order, remembered per account) with
+the entry's project id in the `{"project": …}` body. An upstream 401/403 backs the
+account off for one hour (one warning, no per-sync retry); other upstream errors warn
+per file and stay unknown; operator resync is the verification. Transport 401/403 spends the strike budget
+like every management GET; any other provider-side error travels inside the returned
 envelope and only warns per file (fail open). Live windows are labelled "via provider
 API" on the Usage & quota page. If your CLIProxy build
 differs, change the pinned constants in `src/cliproxy.ts` — everything else follows.
@@ -195,8 +201,8 @@ tests mirrors the public CLIProxyAPI source shapes.
   it). Client-key 401/403s never spend the management strike budget.
 - Safe path only: loopback base URL, key header attached after origin validation, pinned
   GET allow-list (`api-call` excluded from it and un-admittable through it) plus the
-  three pinned `api-call` POST templates (exact upstream requests, credential
-  `auth_index` the only variable), manual redirects with revalidation
+  pinned `api-call` POST templates (exact upstream requests, credential
+  `auth_index` — and Antigravity project id — the only variables), manual redirects with revalidation
   (max 2, same-origin loopback), 15 s timeouts, 2 MB caps, schema-checked JSON. The worker
   fetches through its own guarded loopback transport (Node fetch, never the host client —
   the host SSRF guard refuses loopback); the transport re-checks loopback-only, canonical

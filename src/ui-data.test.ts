@@ -352,7 +352,7 @@ describe("usage page data", () => {
       rows: { "acct-bbb": withoutReason },
       lastSync: LAST_SYNC,
     });
-    expect(usage.providers[0]?.blindReason).toBe("upstream exposes nothing");
+    expect(usage.providers[0]?.blindReason).toBe("panel-only (needs the downloaded auth file)");
   });
 
   it("ignores spent window resets when selecting the next known reset", () => {
