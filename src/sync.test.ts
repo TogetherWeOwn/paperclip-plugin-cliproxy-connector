@@ -1683,6 +1683,37 @@ describe("stable activity keys + state-change logging", () => {
     assertNoKeyLeak(s);
   });
 
+  it("accepting a standing finding drops it silently (no drift_cleared)", async () => {
+    const s = store();
+    await runAt(s, kimiFiles, NOW); // seeds silently
+    expect(s.activity).toHaveLength(0);
+    expect(Object.keys(s.ledger ?? {})).toHaveLength(1);
+    // Ignore kimi: the finding moves to acceptedDrift, leaves the ledger
+    // silently, and writes no feed row (not drift_cleared).
+    const ignored = driftConfig([{ provider: "claude", connectionId: "conn-claude" }], {
+      ignoredProviders: ["kimi"],
+    });
+    const dIgnored = deps(s, driftFetch(kimiFiles) as unknown as typeof fetch);
+    dIgnored.config = ignored;
+    const accepted = await runSync(
+      { ...dIgnored, now: new Date(Date.parse(NOW) + HOUR).toISOString() },
+      { running: false },
+    );
+    expect(accepted.skipped).toBe(false);
+    expect(accepted.drift).toEqual([]);
+    expect((accepted.acceptedDrift ?? []).map((d) => d.provider)).toEqual(["kimi"]);
+    expect(s.activity).toEqual([]);
+    expect(s.ledger).not.toBeNull();
+    expect(Object.keys(s.ledger ?? {})).toHaveLength(0);
+    // Un-ignoring re-detects exactly once (symmetric case, desirable).
+    const redetected = await runAt(s, kimiFiles, new Date(Date.parse(NOW) + 2 * HOUR).toISOString());
+    expect(redetected.drift.map((d) => d.provider)).toEqual(["kimi"]);
+    expect(s.activity).toHaveLength(1);
+    expect(s.activity[0]?.message).toBe(ACTIVITY_DRIFT_DETECTED);
+    expect(s.activity[0]?.metadata?.provider).toBe("kimi");
+    assertNoKeyLeak(s);
+  });
+
   it("a persistent finding reminds at most once per 24 h", async () => {
     const s = store();
     await runAt(s, kimiFiles, NOW); // seeds silently (lastLoggedAt = NOW)

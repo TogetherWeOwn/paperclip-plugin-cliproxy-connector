@@ -132,8 +132,8 @@ export function CliProxyPage({ context }: PluginPageProps) {
         <div>
           <strong>Drift findings ({data.drift.length})</strong>
           <ul>
-            {data.drift.map((d, i) => (
-              <li key={i}>
+            {data.drift.map((d) => (
+              <li key={`${d.kind}:${d.provider}:${d.detail}`}>
                 [{d.kind}] {d.provider}: {d.detail}
               </li>
             ))}
@@ -145,8 +145,8 @@ export function CliProxyPage({ context }: PluginPageProps) {
           <strong>Accepted findings ({data.accepted.length})</strong> — explicitly accepted in
           config, not alerted:
           <ul>
-            {data.accepted.map((d, i) => (
-              <li key={i}>
+            {data.accepted.map((d) => (
+              <li key={`${d.kind}:${d.provider}:${d.detail}`}>
                 [{d.kind}] {d.provider}: {d.detail}
               </li>
             ))}

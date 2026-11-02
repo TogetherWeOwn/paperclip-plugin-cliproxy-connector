@@ -595,7 +595,7 @@ export async function runSync(deps: SyncDeps, inFlight: { running: boolean }): P
       // State-change logging only: new findings log once, cleared findings log
       // once, and persistent findings remind at most daily. Accepted findings
       // never reach the ledger or the feed.
-      const ledger = await reconcileDriftLedger(deps, drift);
+      const ledger = await reconcileDriftLedger(deps, drift, acceptedDrift);
       await deps.saveDriftLedger(ledger);
       const result = finish({
         skipped: false,
@@ -927,6 +927,7 @@ export function accountsToRows(
 export async function reconcileDriftLedger(
   deps: Pick<SyncDeps, "now" | "companyId" | "logActivity" | "loadDriftLedger">,
   drift: DriftFinding[],
+  acceptedDrift: DriftFinding[] = [],
 ): Promise<DriftLedger> {
   const nowMs = Date.parse(deps.now);
   const stored = await deps.loadDriftLedger();
@@ -946,6 +947,7 @@ export async function reconcileDriftLedger(
   }
   const ledger = stored;
   const current = new Set(drift.map(driftKeyFor));
+  const accepted = new Set(acceptedDrift.map(driftKeyFor));
   for (const finding of drift) {
     const key = driftKeyFor(finding);
     const entry = ledger[key];
@@ -992,6 +994,10 @@ export async function reconcileDriftLedger(
     if (current.has(key)) continue;
     const entry = ledger[key] as DriftLedgerEntry;
     delete ledger[key];
+    // A finding that moved to accepted (via a config edit) leaves the ledger
+    // silently: it did not clear, it was accepted. Only keys absent from both
+    // lists emit drift_cleared.
+    if (accepted.has(key)) continue;
     await deps.logActivity(ACTIVITY_DRIFT_CLEARED, {
       companyId: deps.companyId,
       event: ACTIVITY_DRIFT_CLEARED,
