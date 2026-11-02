@@ -582,9 +582,11 @@ export async function runSync(deps: SyncDeps, inFlight: { running: boolean }): P
           // hit the provider twice for the same credential. The single
           // envelope attaches to every row by `auth_index` at parse time, so
           // skipping here loses no row (mirrors fetchedApiCallIndexes in the
-          // template branch).
+          // template branch). The index is marked only once its file has
+          // downloaded AND yielded a token (below): a failed download or a
+          // token-less file must not block a later row naming a usable file
+          // for the same credential.
           if (fetchedMetaIndexes.has(authIndex)) continue;
-          fetchedMetaIndexes.add(authIndex);
           const lastCall = deps.apiCallLastCall?.get(metaAccountKey);
           if (
             deps.forceMetaRefresh !== true &&
@@ -642,6 +644,10 @@ export async function runSync(deps: SyncDeps, inFlight: { running: boolean }): P
               // The downloaded body is dropped the moment the token is out.
               authText = "";
             }
+            // The credential is now in hand: one key call per index from here
+            // on, so later rows sharing it reuse this run's envelope at parse
+            // time instead of hitting the provider again.
+            fetchedMetaIndexes.add(authIndex);
             let result;
             try {
               result = await client.postMetaMuseCodeKey(authIndex, dcaToken);

@@ -1446,6 +1446,7 @@ describe("live provider-API quota (pinned api-call templates)", () => {
       downloadBody?: unknown;
       upstreamStatus?: number;
       keyBody?: unknown;
+      failDownloads?: string[];
     },
   ) {
     return vi.fn(async (input: string, init?: RequestInit): Promise<Response> => {
@@ -1456,6 +1457,8 @@ describe("live provider-API quota (pinned api-call templates)", () => {
       if (url.pathname === "/v0/management/auth-files/download") {
         const name = url.searchParams.get("name") ?? "";
         downloads.push(name);
+        if (opts?.failDownloads?.includes(name))
+          return new Response("missing", { status: opts.downloadStatus ?? 500 });
         if (opts?.downloadStatus) return new Response("missing", { status: opts.downloadStatus });
         const body = opts?.downloadBody !== undefined ? opts.downloadBody : { dca_token: DCA_FIXTURE };
         return new Response(typeof body === "string" ? body : JSON.stringify(body), { status: 200 });
@@ -1704,6 +1707,45 @@ describe("live provider-API quota (pinned api-call templates)", () => {
     expect(calls).toEqual(["m1 https://api.meta.ai/muse-code/key"]);
     // The single envelope attaches to every row by auth_index: no row loses
     // its windows to the dedup.
+    const rows = Object.values(s.savedRows ?? {});
+    expect(rows).toHaveLength(2);
+    for (const row of rows) {
+      expect(row.quotaBlind).toBe(false);
+      expect(row.limits.map((l) => l.id)).toEqual(["meta:window", "meta:weekly"]);
+    }
+    assertNoKeyLeak(s);
+    assertNoDcaLeak(s);
+    assertNoApiKeyLeak(s);
+  });
+
+  it("falls back to the second file when the first download fails for a shared auth index", async () => {
+    const s = store();
+    const calls: string[] = [];
+    const downloads: string[] = [];
+    // Two rows share credential `m1`; the first names a removed file. A
+    // forced refresh must still try the second file instead of leaving both
+    // rows quota-blind — while still hitting the provider only once.
+    const files = [
+      { id: "meta-old", provider: "meta", name: "meta-old.json", auth_index: "m1" },
+      { id: "meta-current", provider: "meta", name: "meta-current.json", auth_index: "m1" },
+    ];
+    const config = configWith({ provider: "meta", connectionId: "conn-meta" });
+    const summary = await runSync(
+      {
+        ...depsWith(
+          s,
+          config,
+          metaFetch(calls, downloads, files, { failDownloads: ["meta-old.json"] }) as never,
+        ),
+        forceMetaRefresh: true,
+      },
+      { running: false },
+    );
+    expect(summary.skipped).toBe(false);
+    expect(downloads).toEqual(["meta-old.json", "meta-current.json"]);
+    expect(calls).toEqual(["m1 https://api.meta.ai/muse-code/key"]);
+    // The single envelope attaches to every row by auth_index: both rows get
+    // live windows even though the first file failed.
     const rows = Object.values(s.savedRows ?? {});
     expect(rows).toHaveLength(2);
     for (const row of rows) {
