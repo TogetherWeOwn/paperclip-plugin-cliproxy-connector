@@ -7,7 +7,7 @@
  * - GET-only allow-list; `api-call` is excluded from the GET path and can never
  *   be admitted through it (it executes upstream requests with stored upstream
  *   credentials, so "GET-only" would be a lie). The only `api-call` use is the
- *   pinned POST below: three hard-coded request templates whose only variable
+ *   pinned POST below: five hard-coded request templates whose only variable
  *   is the credential `authIndex` — no caller can supply a URL, headers or body
  * - `redirect: "manual"` with re-validation of every hop (max 2, same-origin
  *   loopback only)
@@ -106,40 +106,61 @@ function copyApiCallTemplate(template: ApiCallTemplate): ApiCallTemplate {
  * (`ApiCallTemplateKey`) and can never supply their own URL, headers or body,
  * so the guarded POST below cannot send an arbitrary upstream request.
  *
- * There is deliberately NO Meta template. The panel authorizes its Muse-key
- * quota call with the `dca_token` it reads from the downloaded auth file, but
- * the connector never downloads auth files (credential-bearing by policy), and
- * the backend's server-side `$TOKEN$` substitution (`resolveTokenForAuth` →
- * `metaTokenFromAuth`) never yields that downloaded token — so a pinned
- * `muse-code/key` template can only ever return HTTP 401 (proven 3/3 on live
+ * There is deliberately NO Meta template. The panel's Meta quota call (panel
+ * `src/features/quota/providers/meta/requests.ts`: `method: 'POST'`,
+ * `url: META_MUSE_QUOTA_URL` (`'https://api.meta.ai/muse-code/key'`), `header`
+ * with `Accept: 'application/json'`, `'Content-Type': 'application/json'`,
+ * ``Authorization: `Bearer ${dcaToken}```, `'x-api-version': '1.0.0'`,
+ * `data: '{}'`, and `authIndex` passed as a separate top-level request
+ * argument) authorizes with the `dca_token` it reads from the DOWNLOADED auth
+ * file (`downloadText(file.name)` → `JSON.parse` → `dca_token`, which must
+ * match `/^dca:[^\s]+$/`) — never with the backend's server-side `$TOKEN$`
+ * substitution (`resolveTokenForAuth` → `metaTokenFromAuth`), which never
+ * yields that downloaded token. The connector never downloads auth files
+ * (credential-bearing by policy), so a pinned `muse-code/key` template with
+ * `Bearer $TOKEN$` can only ever return HTTP 401 (proven 3/3 on live
  * accounts). Meta quota stays panel-only; the parser says so instead of
- * calling.
+ * calling. The panel itself calls this endpoint only on a user refresh, never
+ * on a poll loop.
  *
  * - Antigravity subscription: the Code Assist subscription call (panel
- *   `src/services/api/antigravitySubscription.ts` `antigravitySubscriptionApi.get`
- *   with `ANTIGRAVITY_CODE_ASSIST_URL`, `ANTIGRAVITY_REQUEST_HEADERS` and
- *   `CODE_ASSIST_REQUEST_BODY`; header constants in
- *   `src/utils/quota/constants.ts`, including the pinned
- *   `antigravity/hub/2.23.0 darwin/arm64` user agent). Plan evidence only —
- *   the subscription answer carries no quota windows, so the quota templates
+ *   `src/services/api/antigravitySubscription.ts`
+ *   `antigravitySubscriptionApi.get(authIndex)`: `method: 'POST'`,
+ *   `url: ANTIGRAVITY_CODE_ASSIST_URL`
+ *   (`'https://daily-cloudcode-pa.googleapis.com/v1internal:loadCodeAssist'`),
+ *   `header: { ...ANTIGRAVITY_REQUEST_HEADERS }`,
+ *   `data: CODE_ASSIST_REQUEST_BODY`
+ *   (`JSON.stringify({ metadata: { ideType: 'ANTIGRAVITY' } })`), with
+ *   `authIndex` as a separate top-level argument; header constants in panel
+ *   `src/utils/quota/constants.ts`: `Authorization: 'Bearer $TOKEN$'`,
+ *   `'Content-Type': 'application/json'`,
+ *   `'User-Agent': ANTIGRAVITY_USER_AGENT`
+ *   (`'antigravity/hub/2.23.0 darwin/arm64'`)). Plan evidence only — the
+ *   subscription answer carries no quota windows, so the quota templates
  *   below supply them. The backend refreshes the OAuth access token
  *   server-side for antigravity credentials.
  * - Antigravity quota (×3): the `retrieveUserQuotaSummary` endpoints the panel
  *   tries in order (panel `src/utils/quota/constants.ts`
- *   `ANTIGRAVITY_QUOTA_URLS`, tried daily → sandbox → cloudcode by
- *   `fetchQuotaPayload` in `src/features/quota/providers/antigravity/data.ts`),
- *   with the panel's quota headers (same file: JSON content type, the pinned
- *   user agent, `Bearer` token) and body shape `{"project": projectId}`. The
- *   project id comes from the auth-files list entry (same sources the panel
- *   uses, minus the auth-file download which the connector never performs);
- *   `postApiCall` injects it via `JSON.stringify`. Template key order below
- *   matches the panel's try order.
+ *   `ANTIGRAVITY_QUOTA_URLS`: daily → sandbox → cloudcode, iterated by
+ *   `fetchQuotaPayload` in `src/features/quota/providers/antigravity/data.ts`
+ *   as `for (const url of ANTIGRAVITY_QUOTA_URLS)` with
+ *   `method: 'POST'`, `header: { ...ANTIGRAVITY_REQUEST_HEADERS }` and
+ *   `data: JSON.stringify({ project: projectId })`, `authIndex` separate).
+ *   The project id resolves via `resolveAntigravityProjectId`: entry
+ *   `project_id ?? projectId`, then `metadata`, then `attributes`
+ *   (`project_id ?? projectId ?? gemini_virtual_project`), then the downloaded
+ *   file (`top-level`, `installed`, `web`) — the connector uses the same chain
+ *   minus the download, which it never performs; `postApiCall` injects the id
+ *   via `JSON.stringify`. Template key order below matches the panel's try
+ *   order.
  * - Devin: the live seat-management RPC (panel
  *   `src/features/quota/providers/devin/requests.ts`
- *   `createDevinQuotaFetcher` — method, `GetUserStatus` URL, `Content-Type` /
- *   `Connect-Protocol-Version` headers and the chisel metadata body whose
- *   `apiKey` is `$TOKEN$`). It reads the live RPC, not auth-file
- *   `quota.signals`.
+ *   `createDevinQuotaFetcher`: `method: 'POST'`,
+ *   `url: 'https://server.codeium.com/exa.seat_management_pb.SeatManagementService/GetUserStatus'`,
+ *   `header` with `'Content-Type': 'application/json'` and
+ *   `'Connect-Protocol-Version': '1'`, `data` as the chisel metadata JSON
+ *   whose `apiKey` is `$TOKEN$`, `authIndex` separate). It reads the live RPC,
+ *   not auth-file `quota.signals`.
  */
 const API_CALL_TEMPLATES = {
   antigravity: freezeApiCallTemplate({
@@ -158,7 +179,6 @@ const API_CALL_TEMPLATES = {
     method: "POST",
     url: "https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary",
     headers: {
-      Accept: "application/json",
       "Content-Type": "application/json",
       Authorization: "Bearer $TOKEN$",
       "User-Agent": "antigravity/hub/2.23.0 darwin/arm64",
@@ -171,7 +191,6 @@ const API_CALL_TEMPLATES = {
     method: "POST",
     url: "https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal:retrieveUserQuotaSummary",
     headers: {
-      Accept: "application/json",
       "Content-Type": "application/json",
       Authorization: "Bearer $TOKEN$",
       "User-Agent": "antigravity/hub/2.23.0 darwin/arm64",
@@ -184,7 +203,6 @@ const API_CALL_TEMPLATES = {
     method: "POST",
     url: "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary",
     headers: {
-      Accept: "application/json",
       "Content-Type": "application/json",
       Authorization: "Bearer $TOKEN$",
       "User-Agent": "antigravity/hub/2.23.0 darwin/arm64",

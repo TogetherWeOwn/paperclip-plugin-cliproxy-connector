@@ -1388,6 +1388,34 @@ describe("live provider-API quota (pinned api-call templates)", () => {
     assertNoKeyLeak(s);
   });
 
+  it("a disabled kill switch makes no provider call and warns once", async () => {
+    const s = store();
+    const calls: string[] = [];
+    const files = [
+      { id: "ag-a", provider: "antigravity", auth_index: "a1", project_id: "proj-a" },
+      { id: "devin-a", provider: "devin", auth_index: "d1" },
+    ];
+    const raw = baseConfigRaw();
+    raw.providers = [
+      { provider: "antigravity", connectionId: "conn-ag", completeInventory: false },
+      { provider: "devin", connectionId: "conn-devin", completeInventory: false },
+    ];
+    (raw as Record<string, unknown>).apiCallEnabled = { antigravity: false };
+    const config = parseConfig(raw).config;
+    const summary = await runSync(depsWith(s, config, apiFetch(calls, files) as never), {
+      running: false,
+    });
+    expect(summary.skipped).toBe(false);
+    // Only the devin credential called (subscription); the killed antigravity
+    // family made no call at all — not even a quota round.
+    expect(calls).toHaveLength(1);
+    expect(calls[0]).toContain("d1 https://server.codeium.com/");
+    expect(summary.errors.join(" ")).toMatch(/live quota disabled by config/);
+    const rows = Object.values(s.savedRows ?? {});
+    expect(rows.find((r) => r.provider === "devin")?.quotaBlind).toBe(false);
+    assertNoKeyLeak(s);
+  });
+
   it("skips disabled and cooling accounts (no probe while the provider says wait)", async () => {
     const s = store();
     const calls: string[] = [];

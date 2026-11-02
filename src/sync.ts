@@ -30,7 +30,7 @@ import {
   isSafeApiCallProjectId,
   type ManagementFetch,
 } from "./cliproxy.js";
-import type { ConnectorConfig, ProviderEntry } from "./config.js";
+import { isLiveQuotaEnabled, type ConnectorConfig, type ProviderEntry } from "./config.js";
 import {
   deriveProviderModels,
   observedModelKeysByProvider,
@@ -424,6 +424,7 @@ export async function runSync(deps: SyncDeps, inFlight: { running: boolean }): P
       const apiFileRef = (authIndex: string) =>
         `auth ${hashIdentity([authIndex])?.slice(0, 8) ?? "unknown"}`;
       let metaSkipped = 0;
+      let liveQuotaDisabled = 0;
       for (const a of discovered.accounts) {
         if (a.status === "disabled" || a.status === "cooling") continue;
         if (!a.authIndex || !configuredProviders.has(a.provider)) continue;
@@ -435,6 +436,13 @@ export async function runSync(deps: SyncDeps, inFlight: { running: boolean }): P
         }
         const templateKey = apiCallTemplateKeyForProvider(a.provider);
         if (!templateKey) continue;
+        // Per-provider kill switch (`apiCallEnabled` in the company config,
+        // on by default for antigravity/devin/meta): a disabled family makes
+        // no credential-bearing calls at all and stays on passive signals.
+        if (!isLiveQuotaEnabled(deps.config, a.provider)) {
+          liveQuotaDisabled += 1;
+          continue;
+        }
         if (fetchedApiCallIndexes.has(a.authIndex)) continue;
         fetchedApiCallIndexes.add(a.authIndex);
         const authIndex: string = a.authIndex;
@@ -619,6 +627,12 @@ export async function runSync(deps: SyncDeps, inFlight: { running: boolean }): P
         pluginErrors.push(
           `meta: ${metaSkipped} account(s) skipped — live Meta quota is panel-only ` +
             `(the connector never calls it); the Management Center panel remains the live read.`,
+        );
+      }
+      if (liveQuotaDisabled > 0) {
+        pluginErrors.push(
+          `live quota disabled by config (apiCallEnabled) for ${liveQuotaDisabled} account(s); ` +
+            `no provider-API call was made for them this run.`,
         );
       }
 

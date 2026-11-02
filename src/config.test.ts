@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   effectiveReservePercent,
+  isLiveQuotaEnabled,
   isLoopbackUrl,
   parseConfig,
   stripTrailingSlashes,
@@ -80,6 +81,38 @@ describe("providers[] rows", () => {
     const good = parseConfig(base({ pluginQuotaIds: { Claude: "claude-quota" } }));
     expect(good.validation.ok).toBe(true);
     expect(good.config.pluginQuotaIds).toEqual({ claude: "claude-quota" });
+  });
+});
+
+describe("apiCallEnabled kill switch", () => {
+  it("defaults live quota on for antigravity/devin/meta and off for the rest", () => {
+    const { config, validation } = parseConfig(base({ providers: [] }));
+    expect(validation.ok).toBe(true);
+    expect(config.apiCallEnabled).toEqual({});
+    for (const provider of ["antigravity", "devin", "meta", " Antigravity "]) {
+      expect(isLiveQuotaEnabled(config, provider)).toBe(true);
+    }
+    for (const provider of ["claude", "codex", "gemini", "openrouter", ""]) {
+      expect(isLiveQuotaEnabled(config, provider)).toBe(false);
+    }
+  });
+
+  it("accepts explicit per-provider booleans (lowercased) and rejects the rest", () => {
+    const good = parseConfig(
+      base({ providers: [], apiCallEnabled: { Antigravity: false, DEVIN: true } }),
+    );
+    expect(good.validation.ok).toBe(true);
+    expect(good.config.apiCallEnabled).toEqual({ antigravity: false, devin: true });
+    expect(isLiveQuotaEnabled(good.config, "antigravity")).toBe(false);
+    expect(isLiveQuotaEnabled(good.config, "devin")).toBe(true);
+    expect(isLiveQuotaEnabled(good.config, "meta")).toBe(true);
+
+    const bad = parseConfig(base({ providers: [], apiCallEnabled: { antigravity: "no" } }));
+    expect(bad.validation.ok).toBe(false);
+    expect(bad.validation.errors.some((e) => e.includes("apiCallEnabled"))).toBe(true);
+
+    const notObject = parseConfig(base({ providers: [], apiCallEnabled: true }));
+    expect(notObject.validation.ok).toBe(false);
   });
 });
 

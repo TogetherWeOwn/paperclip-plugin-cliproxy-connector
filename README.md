@@ -149,6 +149,7 @@ The plugin ships two pages over the same sync cache:
 | `providers` | `[]` | One `{ provider, connectionId, completeInventory }` row per CLIProxy provider family. The provider word is the raw auth-file string (e.g. `cloudflare-workers-ai`); any string is accepted, duplicates error, and a row that matches no accounts drift-warns as having zero enabled accounts. Empty warns. |
 | `providerWindows` | spike matrix §2 | Per-provider gating-window allow-lists (lowercased substrings). Includes Devin `daily`/`weekly` alongside `5h`. |
 | `pluginQuotaIds` | `{}` | CLIProxy plugin id per provider for quota fetch. Wins over `quota_plugin_id` discovery from the `auth-files` list. Fetched per auth file with its `auth_index` (v8.0.49+); entries without one keep one provider-level fetch. |
+| `apiCallEnabled` | `{}` (on for `antigravity`/`devin`/`meta`, off otherwise) | Per-provider kill switch for the pinned live `api-call` rounds (`{"antigravity": false}` disables all credential-bearing provider-API calls for that family). Upstream 401/403 already backs an account off for 1 hour; this switch is the manual off-ramp. |
 | `audienceConfirmed` | `false` | Page shows upstream quota state; confirm the audience, then set `true`. |
 
 ## Endpoint assumptions

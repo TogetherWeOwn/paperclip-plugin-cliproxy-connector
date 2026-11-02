@@ -474,7 +474,7 @@ describe("plugin quota auth_index (v8.0.49, per-file quota)", () => {
   });
 });
 
-describe("pinned api-call POST (three frozen templates)", () => {
+describe("pinned api-call POST (frozen templates)", () => {
   const envelope = (statusCode: number, body: unknown) =>
     json(200, { status_code: statusCode, header: {}, body: JSON.stringify(body) });
 
@@ -621,7 +621,6 @@ describe("pinned api-call POST (three frozen templates)", () => {
       method: "POST",
       url: "https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary",
       header: {
-        Accept: "application/json",
         "Content-Type": "application/json",
         Authorization: "Bearer $TOKEN$",
         "User-Agent": "antigravity/hub/2.23.0 darwin/arm64",
