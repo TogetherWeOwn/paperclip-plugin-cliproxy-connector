@@ -980,6 +980,10 @@ describe("tokenContainsEmail", () => {
     const start = Date.now();
     expect(tokenContainsEmail(`${"a".repeat(10_000)}@example.com,`)).toBe(true);
     expect(tokenContainsEmail("x".repeat(10_000))).toBe(false);
+    // Leading-punctuation flood before an address: the shape that tripped
+    // the old anchored regex trims.
+    expect(tokenContainsEmail(`${"/".repeat(10_000)}a@b.co`)).toBe(true);
+    expect(tokenContainsEmail(`${"(".repeat(10_000)}a@b.co${")".repeat(10_000)}`)).toBe(true);
     expect(Date.now() - start).toBeLessThan(1000);
   });
 });
@@ -2110,6 +2114,52 @@ describe("Group A: cooldowns[], sign-in badge, account labels", () => {
     expect(isModelGatingCooldown(dotted, NOW_MS)).toBe(true);
     expect(email.modelKey).toBeNull();
     expect(isModelGatingCooldown(email, NOW_MS)).toBe(false);
+  });
+
+  it("credential-shaped model keys never gate and never render in labels", () => {
+    const cooldowns = parseCooldowns({
+      cooldowns: [
+        { scope: "model", model_key: "sk-live-a1b2c3d4", reason: "quota", retry_at: FUTURE },
+        { scope: "model", model_key: "AKIA1234", reason: "quota", retry_at: FUTURE },
+        { scope: "model", model_key: "ab12cd34ef", reason: "quota", retry_at: FUTURE },
+        { scope: "model", model_key: "claude-sonnet-4-5-20250929", reason: "quota", retry_at: FUTURE },
+        { scope: "model", model_key: "claude-3-5-sonnet-20241022", reason: "quota", retry_at: FUTURE },
+      ],
+    } as never);
+    expect(cooldowns).toHaveLength(5);
+    const [sk, akia, short, dated, dotted] = cooldowns;
+    for (const c of [sk, akia, short]) {
+      expect(c.modelKey).toBeNull();
+      expect(isModelGatingCooldown(c, NOW_MS)).toBe(false);
+    }
+    // Dated model ids keep gating beside the rejected credentials.
+    expect(dated.modelKey).toBe("claude-sonnet-4-5-20250929");
+    expect(isModelGatingCooldown(dated, NOW_MS)).toBe(true);
+    expect(dotted.modelKey).toBe("claude-3-5-sonnet-20241022");
+    expect(isModelGatingCooldown(dotted, NOW_MS)).toBe(true);
+    // End to end: no rendered limit id or label carries the secret material.
+    const { accounts } = parseAuthFiles(
+      [
+        {
+          id: "cred-1",
+          provider: "claude",
+          cooldowns: [
+            { scope: "model", model_key: "sk-live-a1b2c3d4", reason: "quota", retry_at: FUTURE },
+            {
+              scope: "model",
+              model_key: "claude-sonnet-4-5-20250929",
+              reason: "quota",
+              retry_at: FUTURE,
+            },
+          ],
+        },
+      ],
+      { now: NOW, allowLists: { claude: ["5h"] } },
+    );
+    expect(accounts).toHaveLength(1);
+    const text = JSON.stringify(accounts[0]?.limits ?? []);
+    expect(text).not.toContain("sk-live-a1b2c3d4");
+    expect(text).toContain("claude-sonnet-4-5-20250929");
   });
 
   it("scrubs the full label note and hint before capping: no partial-email leak", () => {

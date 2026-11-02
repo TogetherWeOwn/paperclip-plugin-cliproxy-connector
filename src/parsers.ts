@@ -141,20 +141,44 @@ export function isEmailLike(s: string): boolean {
 }
 
 /**
+ * True for an ASCII letter or digit — the only chars kept at a token edge.
+ */
+function isEdgeAlnum(code: number): boolean {
+  return (
+    (code >= 48 && code <= 57) || (code >= 65 && code <= 90) || (code >= 97 && code <= 122)
+  );
+}
+
+/**
+ * Strip leading/trailing chars that cannot appear in an address (quotes,
+ * parens, trailing punctuation). Manual index walk — linear time, no
+ * backtracking pattern (CodeQL js/polynomial-redos flags the equivalent
+ * anchored regex trims).
+ */
+function trimEdgePunct(tok: string): string {
+  let start = 0;
+  let end = tok.length;
+  while (start < end && !isEdgeAlnum(tok.charCodeAt(start))) start++;
+  while (end > start && !isEdgeAlnum(tok.charCodeAt(end - 1))) end--;
+  return tok.slice(start, end);
+}
+
+/**
  * True when a whitespace-delimited token holds an email-shaped piece glued to
  * other text (`user@example.com's`, `a@x.com,b@y.com`, `email=a@b.com&retry`,
  * `a@x.test/path`, `user@example.com:443`). The token is split on characters
  * that cannot appear in an address and each piece is judged with the linear
- * `isEmailLike` scan — no backtracking pattern (CodeQL js/polynomial-redos).
+ * `isEmailLike` scan — edges trimmed with a linear index walk, no
+ * backtracking pattern (CodeQL js/polynomial-redos).
  * Tokens without `@` return false without splitting.
  */
 export function tokenContainsEmail(tok: string): boolean {
   if (!tok.includes("@")) return false;
-  const core = tok.replace(/^[^A-Za-z0-9]+/, "").replace(/[^A-Za-z0-9]+$/, "");
+  const core = trimEdgePunct(tok);
   if (isEmailLike(core)) return true;
   const pieces = core.split(/[^A-Za-z0-9._%+@-]+/);
   for (const piece of pieces) {
-    const p = piece.replace(/^[^A-Za-z0-9]+/, "").replace(/[^A-Za-z0-9]+$/, "");
+    const p = trimEdgePunct(piece);
     if (p.length > 0 && p !== core && isEmailLike(p)) return true;
   }
   return false;
@@ -183,7 +207,9 @@ export function sanitizeStatusMessage(raw: string | null): string | null {
       // operational-shape exemption. Email-shaped pieces glued inside the
       // token (`a@x.com,b@y.com`, `email=a@b.com&retry`) redact as a whole
       // token, so a suffix cannot smuggle an address past the check.
-      const core = tok.replace(/^[^A-Za-z0-9]+/, "").replace(/[^A-Za-z0-9]+$/, "");
+      // Linear edge trim (see `trimEdgePunct`) — the regex form trips
+      // CodeQL js/polynomial-redos.
+      const core = trimEdgePunct(tok);
       if (tokenContainsEmail(tok)) return "[redacted-email]";
       if (/[A-Za-z0-9_\-]{20,}/.test(tok)) return "[redacted]";
       if (isCredentialCore(core)) return "[redacted]";
@@ -640,8 +666,18 @@ const SIGN_IN_COOLDOWN_REASONS = new Set(["invalid_grant", "unauthorized"]);
  * allow-list pattern, email-shaped values rejected. The status-message
  * scrubber redacted dated model ids (`claude-sonnet-4-5-20250929` trips the
  * 20+ word-char rule) and silently disabled model-scoped gating, so model
- * keys never go through it. A rejected model key yields no model gating;
- * callers keep the raw trimmed word for display-only reasons.
+ * keys never go through it. Credential-shaped values are rejected too: a
+ * secret that lands in `model_key` must never gate routing nor render in the
+ * limit label. The whole-token credential check cannot apply here — dated
+ * model ids are letter+digit and 8+ chars, so it would reject them as well.
+ * Instead each dot/hyphen segment is judged with `isCredentialCore`: dated
+ * ids keep gating (their segments are words, small numbers, or digit-only
+ * runs like `20250929`), while key material (`sk-live-a1b2c3d4`,
+ * `AKIA1234`, `ab12cd34ef`) rejects. A leading secret marker (`sk-…`,
+ * `token.…`) rejects even when every segment is short, and opaque 20+
+ * separator-free runs reject like the status-message scrubber's rule.
+ * A rejected model key yields no model gating; callers keep the raw trimmed
+ * word for display-only reasons.
  */
 const COOLDOWN_TOKEN_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$/;
 
@@ -650,6 +686,10 @@ function scrubCooldownToken(raw: unknown): string | null {
   const s = raw.trim();
   if (!s) return null;
   if (isEmailLike(s) || !COOLDOWN_TOKEN_PATTERN.test(s)) return null;
+  const segments = s.split(/[-.]/);
+  if (SECRET_DOT_PREFIX.test(segments[0] ?? "")) return null;
+  if (segments.some((seg) => isCredentialCore(seg))) return null;
+  if (/[A-Za-z0-9]{20,}/.test(s)) return null;
   return s;
 }
 
