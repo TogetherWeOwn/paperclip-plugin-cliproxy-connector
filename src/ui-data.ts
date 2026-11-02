@@ -532,9 +532,16 @@ function earliestKnownReset(providers: ProviderCard[]): string | null {
  * per-window `observedAt` existed. Rows without limits (quota-blind providers,
  * best-effort quota failures) never contribute, and windows with no parseable
  * time never contribute: the section timestamp must reflect the age of the
- * displayed figures, not a cache refresh that left them untouched.
+ * displayed figures, not a cache refresh that left them untouched. Candidates
+ * later than `nowMs + futureSkewMs` are untrusted (same budget as the router's
+ * `windowObservationAgeMs`): `observedAt` runs on the upstream clock, so one
+ * skewed host must not stamp the section with a future time.
  */
-function latestQuotaCheckedAt(rows: Record<string, AccountUsageRow>): string | null {
+function latestQuotaCheckedAt(
+  rows: Record<string, AccountUsageRow>,
+  nowMs: number,
+  futureSkewMs: number,
+): string | null {
   let latest: string | null = null;
   let latestMs = NaN;
   for (const row of Object.values(rows)) {
@@ -544,6 +551,7 @@ function latestQuotaCheckedAt(rows: Record<string, AccountUsageRow>): string | n
       const candidate = window.observedAt ?? row.checkedAt;
       const ms = window.observedAt != null ? Date.parse(window.observedAt) : rowMs;
       if (candidate == null || Number.isNaN(ms)) continue;
+      if (ms > nowMs + futureSkewMs) continue;
       if (latest === null || ms > latestMs) {
         latest = candidate;
         latestMs = ms;
@@ -612,7 +620,7 @@ export function buildUsageData(args: {
     // window contributes its own observation time (`observedAt`, else the row
     // fetch), so a passive window observed hours ago is never stamped with a
     // minutes-old cache refresh.
-    quotaFetchedAt: latestQuotaCheckedAt(rows),
+    quotaFetchedAt: latestQuotaCheckedAt(rows, nowMs, config.futureSkewSeconds * 1000),
     spend: {
       configured: config.openRouterSecretRef !== undefined && config.openRouterSecretRef !== null,
       totalCredits,

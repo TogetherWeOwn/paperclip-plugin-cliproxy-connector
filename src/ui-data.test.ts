@@ -731,6 +731,21 @@ describe("skipped sync honesty", () => {
     expect(usage.quotaFetchedAt).toBe("2026-11-01T10:30:00.000Z");
   });
 
+  it("ignores future-dated observations beyond the clock-skew budget", () => {
+    const usage = buildUsageData({
+      now: NOW,
+      config: testConfig(),
+      rows: {
+        skewed: quotaRow("acct-skewed", NOW, "2026-11-01T14:00:00.000Z"),
+        real: quotaRow("acct-real", NOW, "2026-11-01T09:00:00.000Z"),
+      },
+      lastSync: LAST_SYNC,
+    });
+    // observedAt runs on the upstream clock; the skewed host's future
+    // observation is untrusted (same budget as the router), so the real one wins.
+    expect(usage.quotaFetchedAt).toBe("2026-11-01T09:00:00.000Z");
+  });
+
   it("ignores quota-blind rows and unparseable row timestamps", () => {
     const usage = buildUsageData({
       now: NOW,
