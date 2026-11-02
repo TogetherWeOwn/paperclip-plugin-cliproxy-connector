@@ -94,13 +94,24 @@ export interface ConnectorConfig {
   /**
    * Per-provider kill switch for the pinned live `api-call` rounds. An entry
    * of `false` disables all credential-bearing provider-API calls for that
-   * provider family (no subscription round, no quota round); anything else —
-   * including a missing entry — falls back to `DEFAULT_LIVE_QUOTA_PROVIDERS`
-   * below (on for antigravity/devin/meta, off for everything else, which has
-   * no template anyway). In-memory Maps (`apiCallLastCall`, backoff) are
-   * untouched by a kill switch flip, so re-enabling re-proves on the next run.
+   * provider family (no subscription round, no quota round, and for Meta no
+   * auth-file download or key call); anything else — including a missing
+   * entry — falls back to `DEFAULT_LIVE_QUOTA_PROVIDERS` below (on for
+   * antigravity/devin/meta, off for everything else, which has no template
+   * anyway). In-memory Maps (`apiCallLastCall`, backoff) are untouched by a
+   * kill switch flip, so re-enabling re-proves on the next run.
    */
   apiCallEnabled: Record<string, boolean>;
+  /**
+   * Meta live-quota switch. The Meta read downloads each Meta account's auth
+   * file, extracts its `dca_token`, and calls the provider `muse-code/key`
+   * endpoint with it as a literal bearer — the same live quota the Management
+   * Center panel shows. `enabled: false` disables the download and the call
+   * for the whole Meta family (accounts stay on passive signals, i.e.
+   * quota-blind with the Meta reason). On by default; see the README for the
+   * poll cadence, cache and backoff rules.
+   */
+  metaQuota: { enabled: boolean };
   /** Operator confirms the page audience exposure is intended (proposal §4.4). */
   audienceConfirmed: boolean;
 }
@@ -127,9 +138,9 @@ export const DEFAULT_PROVIDER_WINDOWS: Record<string, string[]> = {
   // both must gate, or stock quotas never constrain routing.
   codex: ["codex", "5h", "weekly", "primary", "secondary"],
   // Live provider-API windows: the Devin Connect-RPC serves `daily` +
-  // `weekly` (`parseDevinQuota`), and Antigravity quota-summary buckets gate
-  // on their time window (`parseAntigravityQuota`). Meta stays panel-only
-  // (no connector template), so its row below is window-name parity only.
+  // `weekly` (`parseDevinQuota`), Antigravity quota-summary buckets gate on
+  // their time window (`parseAntigravityQuota`), and the Meta key answer
+  // serves `window` + `weekly` (`parseMetaQuota`).
   meta: ["meta", "window", "weekly"],
   antigravity: ["antigravity", "5h", "weekly", "daily", "monthly"],
   devin: ["devin", "5h", "weekly", "daily"],
@@ -363,6 +374,22 @@ export function parseConfig(raw: unknown): { config: ConnectorConfig; validation
     errors.push("apiCallEnabled must be an object mapping provider words to booleans.");
   }
 
+  // Meta live-quota switch (`metaQuota.enabled`, on by default). A present
+  // non-object or a non-boolean `enabled` fails validation loudly: a typo
+  // must never silently disable a credential-bearing read.
+  let metaQuotaEnabled = true;
+  if (r.metaQuota !== undefined && r.metaQuota !== null) {
+    if (!isPlainObject(r.metaQuota)) {
+      errors.push("metaQuota must be an object like { enabled: false }; it defaults to { enabled: true }.");
+    } else if (r.metaQuota.enabled !== undefined && r.metaQuota.enabled !== null) {
+      if (typeof r.metaQuota.enabled !== "boolean") {
+        errors.push(`metaQuota.enabled must be a boolean; got ${JSON.stringify(r.metaQuota.enabled)}.`);
+      } else {
+        metaQuotaEnabled = r.metaQuota.enabled;
+      }
+    }
+  }
+
   const perPoolReservePercent: Record<string, number> = {};
   const perPoolIn = (r.perPoolReservePercent ?? {}) as Record<string, unknown>;
   if (isPlainObject(perPoolIn)) {
@@ -417,6 +444,7 @@ export function parseConfig(raw: unknown): { config: ConnectorConfig; validation
     providerWindows,
     pluginQuotaIds,
     apiCallEnabled,
+    metaQuota: { enabled: metaQuotaEnabled },
     audienceConfirmed: r.audienceConfirmed === true,
     ignoredProviders,
     ignoredAuthFileRefs,
@@ -426,10 +454,11 @@ export function parseConfig(raw: unknown): { config: ConnectorConfig; validation
 
 /**
  * Default per-provider live `api-call` state. On for the families with pinned
- * templates (antigravity/devin) and for meta (no template exists, so the entry
- * documents intent and covers a future Meta template without a config
- * migration); off for everything else, which has no template anyway. An
- * explicit `apiCallEnabled` entry always wins over this default.
+ * templates (antigravity/devin) and for meta (no frozen template — the
+ * dedicated download + literal-header key call — so the entry covers the
+ * Meta family without a config migration); off for everything else, which has
+ * no template anyway. An explicit `apiCallEnabled` entry always wins over
+ * this default.
  */
 export const DEFAULT_LIVE_QUOTA_PROVIDERS: Record<string, boolean> = {
   antigravity: true,
@@ -443,6 +472,16 @@ export function isLiveQuotaEnabled(config: ConnectorConfig, provider: string): b
   const explicit = config.apiCallEnabled[word];
   if (typeof explicit === "boolean") return explicit;
   return DEFAULT_LIVE_QUOTA_PROVIDERS[word] ?? false;
+}
+
+/**
+ * Whether the Meta live-quota read may run. Both switches must agree: the
+ * Meta toggle (`metaQuota.enabled`, on by default) and the family kill
+ * switch (`apiCallEnabled.meta`, on by default). Either off disables the
+ * auth-file download and the key call for the whole Meta family.
+ */
+export function isMetaQuotaEnabled(config: ConnectorConfig): boolean {
+  return config.metaQuota.enabled === true && isLiveQuotaEnabled(config, "meta");
 }
 
 /**

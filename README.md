@@ -195,6 +195,7 @@ The plugin ships two pages over the same sync cache:
 | `providerWindows` | spike matrix §2 | Per-provider gating-window allow-lists (lowercased substrings). Includes Devin `daily`/`weekly` alongside `5h`. |
 | `pluginQuotaIds` | `{}` | CLIProxy plugin id per provider for quota fetch. Wins over `quota_plugin_id` discovery from the `auth-files` list. Fetched per auth file with its `auth_index` (v8.0.49+); entries without one keep one provider-level fetch. |
 | `apiCallEnabled` | `{}` (on for `antigravity`/`devin`/`meta`, off otherwise) | Per-provider kill switch for the pinned live `api-call` rounds (`{"antigravity": false}` disables all credential-bearing provider-API calls for that family). Upstream 401/403 already backs an account off for 1 hour; this switch is the manual off-ramp. |
+| `metaQuota` | `{ enabled: true }` | Meta live-quota toggle for the download + literal-header key call. Either this or `apiCallEnabled.meta: false` disables all Meta downloads and key calls for the run; Meta accounts then stay on passive signals. |
 | `audienceConfirmed` | `false` | Page shows upstream quota state; confirm the audience, then set `true`. |
 | `ignoredProviders` | `[]` | Provider words (lowercased, e.g. `openrouter`) whose `unconfigured-provider` drift is explicitly accepted: no finding, no activity row; shown on the page as accepted. |
 | `ignoredAuthFileRefs` | `[]` | Accepted `auth file <hash8>` refs (bare hash or full page ref, e.g. `auth file c246e171`) whose `untrusted-auth-file` drift is explicitly accepted. Same accepted-not-alerted rule; typos fail validation loudly. |
@@ -216,11 +217,27 @@ copied from the panel source, `apiCallTemplate()` in `src/cliproxy.ts`) whose on
 variables are the credential `auth_index` — and, for the Antigravity quota templates,
 the account's project id — callers cannot supply their own URL, headers
 or body. Upstream `$TOKEN$` placeholders are substituted server-side by CLIProxy; the
-plugin never handles credential material. Meta is panel-only: the panel
-authorizes its Muse-key quota call with the downloaded `dca_token`, which the
-connector never downloads (credential-bearing) and the backend never substitutes
-for `$TOKEN$`, so a pinned Meta template could only ever return HTTP 401 — there
-is none, Meta accounts are never called, and the page says panel-only. Antigravity
+plugin never handles credential material — except for Meta, below, where the
+panel's own read is the only thing that authenticates. The panel authorizes its
+Muse-key quota call with the downloaded `dca_token` (the backend never substitutes
+`$TOKEN$` for `dca:` tokens), so Meta rides a dedicated download + literal-header
+key call instead of a frozen template: per Meta account the sync `GET`s the
+account's auth file (`/v0/management/auth-files/download?name=<file>`), extracts
+only its `dca_token` (must match `dca:`, no whitespace), and `POST`s
+`https://api.meta.ai/muse-code/key` through `/v0/management/api-call` with the
+frozen panel shape (`Accept` / `Content-Type` / `x-api-version: 1.0.0` headers,
+`'{}'` body) plus a literal `Authorization: Bearer <dca_token>` header. The token
+lives in memory for that one call only: the downloaded body is dropped the moment
+the token is out, the token is cleared the moment the call resolves, and neither
+is ever logged, persisted, attached to activity/metrics/errors/plugin state, or
+shown in UI payloads. The key answer's `subs_usage.window` / `subs_usage.weekly`
+(`used_percent`, `resets_at`) become the `meta:window` / `meta:weekly` rows with
+the plan name from `subs_tier_name` (falling back to `subs_usage.tier`); a 2xx
+without `subs_usage` is unknown, never zero. Meta polls at most every 45 minutes
+per account (the panel only reads this endpoint on user refresh) with the last 2xx
+answer cached between polls; the Usage & quota page's resync action forces a
+manual refresh (bypasses the throttle, never the auth backoff). An upstream
+401/403 parks the account for an hour like every other family. Antigravity
 reads two calls: the `loadCodeAssist` subscription (plan evidence) plus the winning
 `retrieveUserQuotaSummary` quota URL (panel try order, remembered per account) with
 the entry's project id in the `{"project": …}` body. An upstream 401/403 backs the

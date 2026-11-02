@@ -675,7 +675,7 @@ describe("parseAuthFiles (redacted fixture)", () => {
     expect(accounts).toHaveLength(1);
     expect(accounts[0]?.limits).toHaveLength(0);
     expect(accounts[0]?.quotaBlind).toBe(true);
-    expect(accounts[0]?.quotaBlindReason).toBe("panel-only (needs the downloaded auth file)");
+    expect(accounts[0]?.quotaBlindReason).toBe("Meta live read unavailable (see sync warnings)");
     expect(accounts[0]?.parseWarnings.some((w) => w.includes("no quota signals"))).toBe(false);
   });
 
@@ -702,7 +702,7 @@ describe("parseAuthFiles (redacted fixture)", () => {
     });
     expect(accounts.find((a) => a.provider === "meta")).toMatchObject({
       quotaBlind: true,
-      quotaBlindReason: "panel-only (needs the downloaded auth file)",
+      quotaBlindReason: "Meta live read unavailable (see sync warnings)",
     });
   });
 
@@ -1415,14 +1415,14 @@ describe("parseAuthFiles with live provider-API payloads", () => {
     expect(accounts[0]?.parseWarnings.join(" ")).toMatch(/429/);
   });
 
-  it("meta without a live answer stays quota-blind with the panel-only reason", async () => {
+  it("meta without a live answer stays quota-blind with the Meta live-read reason", async () => {
     const { parseAuthFiles } = await import("./parsers.js");
     const { accounts } = parseAuthFiles(filesFor("meta", "m2"), {
       now: NOW,
       allowLists: allowLists(),
     });
     expect(accounts[0]?.quotaBlind).toBe(true);
-    expect(accounts[0]?.quotaBlindReason).toBe("panel-only (needs the downloaded auth file)");
+    expect(accounts[0]?.quotaBlindReason).toBe("Meta live read unavailable (see sync warnings)");
   });
 });
 
@@ -1824,5 +1824,145 @@ describe("live windows supersede same-id passive windows", () => {
     expect(accounts[0]?.limits.every((l) => l.remainingPercent === null)).toBe(true);
     expect(accounts[0]?.limits.every((l) => l.viaProviderApi === true)).toBe(true);
     expect(accounts[0]?.quotaBlind).toBe(false);
+  });
+});
+
+describe("parseMetaQuota (panel parseMetaQuotaPayload shape)", () => {
+  const RESET = Math.floor(Date.parse(NOW) / 1000) + 3600;
+  const metaWindows = () => DEFAULT_PROVIDER_WINDOWS.meta as string[];
+  const keyBody = () => ({
+    subs_tier_name: "Pro",
+    subs_usage: {
+      tier: "Pro",
+      window: { used_percent: 30, resets_at: RESET },
+      weekly: { used_percent: 50, resets_at: RESET + 86400 },
+    },
+  });
+
+  it("parses window/weekly percents with resets and the explicit plan name", async () => {
+    const { parseMetaQuota } = await import("./parsers.js");
+    const parsed = parseMetaQuota(keyBody(), NOW, metaWindows());
+    expect(parsed.planType).toBe("Pro");
+    expect(parsed.warnings).toEqual([]);
+    expect(parsed.limits.map((l) => l.id)).toEqual(["meta:window", "meta:weekly"]);
+    const [window, weekly] = parsed.limits;
+    expect(window).toMatchObject({
+      usedPercent: 30,
+      remainingPercent: 70,
+      allowed: true,
+      limitReached: false,
+      gating: true,
+      viaProviderApi: true,
+    });
+    expect(window?.resetsAt).toBe(iso(RESET * 1000));
+    expect(weekly).toMatchObject({ usedPercent: 50, remainingPercent: 50, allowed: true });
+    expect(weekly?.resetsAt).toBe(iso((RESET + 86400) * 1000));
+  });
+
+  it("falls back to subs_usage.tier when subs_tier_name is absent", async () => {
+    const { parseMetaQuota } = await import("./parsers.js");
+    const body = keyBody() as Record<string, unknown>;
+    delete body.subs_tier_name;
+    const parsed = parseMetaQuota(body, NOW, metaWindows());
+    expect(parsed.planType).toBe("Pro");
+    expect(parsed.limits).toHaveLength(2);
+  });
+
+  it("reads a 2xx without subs_usage as unknown, never zero or exhaustion", async () => {
+    const { parseMetaQuota } = await import("./parsers.js");
+    const parsed = parseMetaQuota({ subs_tier_name: "Pro", api_key: "sk-planted" }, NOW, metaWindows());
+    expect(parsed.planType).toBe("Pro");
+    expect(parsed.limits.map((l) => l.id)).toEqual(["meta:window", "meta:weekly"]);
+    for (const limit of parsed.limits) {
+      expect(limit.usedPercent).toBeNull();
+      expect(limit.remainingPercent).toBeNull();
+      expect(limit.limitReached).toBe(false);
+      // The key endpoint answered, so admission stands — but the null
+      // percent keeps the verdict unknown (vetoes headroom, never exhaustion).
+      expect(limit.allowed).toBe(true);
+      expect(limit.viaProviderApi).toBe(true);
+    }
+    expect(parsed.warnings.join(" ")).toMatch(/no subs_usage/);
+  });
+
+  it("marks only the unusable window unknown and keeps parsing the other", async () => {
+    const { parseMetaQuota } = await import("./parsers.js");
+    const parsed = parseMetaQuota(
+      {
+        subs_usage: {
+          window: { used_percent: "garbage", resets_at: RESET },
+          weekly: { used_percent: 10, resets_at: RESET },
+        },
+      },
+      NOW,
+      metaWindows(),
+    );
+    const [window, weekly] = parsed.limits;
+    expect(window?.usedPercent).toBeNull();
+    expect(weekly?.usedPercent).toBe(10);
+    expect(parsed.warnings.join(" ")).toMatch(/window quota percent is unusable/);
+  });
+
+  it("reads full use as exhaustion (not allowed, limit reached)", async () => {
+    const { parseMetaQuota } = await import("./parsers.js");
+    const parsed = parseMetaQuota(
+      { subs_usage: { window: { used_percent: 100 }, weekly: { used_percent: 0 } } },
+      NOW,
+      metaWindows(),
+    );
+    const [window, weekly] = parsed.limits;
+    expect(window).toMatchObject({ usedPercent: 100, remainingPercent: 0, allowed: false, limitReached: true });
+    expect(weekly).toMatchObject({ usedPercent: 0, allowed: true, limitReached: false });
+  });
+
+  it("clamps out-of-range percents and nulls unusable resets", async () => {
+    const { parseMetaQuota } = await import("./parsers.js");
+    const parsed = parseMetaQuota(
+      {
+        subs_usage: {
+          window: { used_percent: 150, resets_at: -5 },
+          weekly: { used_percent: "25", resets_at: String(RESET) },
+        },
+      },
+      NOW,
+      metaWindows(),
+    );
+    const [window, weekly] = parsed.limits;
+    expect(window?.usedPercent).toBe(100);
+    expect(window?.resetsAt).toBeNull();
+    expect(weekly?.usedPercent).toBe(25);
+    expect(weekly?.resetsAt).toBe(iso(RESET * 1000));
+  });
+
+  it("parses a JSON string body and warns without windows on garbage", async () => {
+    const { parseMetaQuota } = await import("./parsers.js");
+    const fromString = parseMetaQuota(JSON.stringify(keyBody()), NOW, metaWindows());
+    expect(fromString.limits.map((l) => l.id)).toEqual(["meta:window", "meta:weekly"]);
+    for (const bad of ["not-json{{{", JSON.stringify([1, 2]), "null"]) {
+      const parsed = parseMetaQuota(bad, NOW, metaWindows());
+      expect(parsed.limits).toEqual([]);
+      expect(parsed.warnings.length).toBeGreaterThan(0);
+    }
+  });
+
+  it("never retains api_key or PII from the key answer", async () => {
+    const { parseMetaQuota } = await import("./parsers.js");
+    const parsed = parseMetaQuota(
+      {
+        ...keyBody(),
+        api_key: "sk-planted-secret-key",
+        email: "someone@example.com",
+        subs_usage: {
+          ...(keyBody().subs_usage as Record<string, unknown>),
+          owner_email: "someone@example.com",
+        },
+      },
+      NOW,
+      metaWindows(),
+    );
+    expect(parsed.limits).toHaveLength(2);
+    const blob = JSON.stringify(parsed);
+    expect(blob).not.toContain("sk-planted-secret-key");
+    expect(blob).not.toContain("someone@example.com");
   });
 });

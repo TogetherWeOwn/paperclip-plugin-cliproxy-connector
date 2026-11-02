@@ -304,7 +304,9 @@ const plugin = definePlugin({
     ctx.actions.register(RESYNC_ACTION_KEY, async (params) => {
       const companyId = String((params as Record<string, unknown>).companyId ?? "");
       if (!companyId) throw new Error("companyId is required");
-      return runCompanySync(ctx, companyId, new Date().toISOString());
+      // A manual refresh re-reads Meta accounts even inside the 45-minute
+      // poll throttle (the upstream-auth backoff still holds).
+      return runCompanySync(ctx, companyId, new Date().toISOString(), { forceMetaRefresh: true });
     });
     ctx.actions.register(REENABLE_ACTION_KEY, async (params, context?: PluginPerformActionContext) => {
       // Board users only: the host passes the authenticated actor — an agent
@@ -399,6 +401,7 @@ async function runCompanySync(
   ctx: PluginContext,
   companyId: string,
   now: string,
+  opts?: { forceMetaRefresh?: boolean },
 ): Promise<SyncSummary> {
   const { config, ok } = await resolveCompany(ctx, companyId);
   if (!ok) {
@@ -479,6 +482,7 @@ async function runCompanySync(
       apiCallCache,
       apiCallAuthBackoffUntil,
       apiCallQuotaChoice,
+      forceMetaRefresh: opts?.forceMetaRefresh,
     },
     inFlight,
   );

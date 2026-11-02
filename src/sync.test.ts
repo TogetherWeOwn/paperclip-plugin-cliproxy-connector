@@ -1418,28 +1418,298 @@ describe("live provider-API quota (pinned api-call templates)", () => {
     assertNoKeyLeak(s);
   });
 
-  it("never calls for meta accounts (panel-only) and says so once", async () => {
+  // Meta live quota: download + literal-header key call, same read the
+  // Management Center panel makes. The fixture bearer below stands in for a
+  // real `dca:` token and must never reach activity, summaries, rows,
+  // strike state or failures — every Meta test below asserts that.
+  const DCA_FIXTURE = "dca:fixture-meta-token-abc123";
+  const metaKeyBody = () => ({
+    subs_tier_name: "Pro",
+    subs_usage: {
+      tier: "Pro",
+      window: { used_percent: 30, resets_at: RESET },
+      weekly: { used_percent: 50, resets_at: RESET + 86400 },
+    },
+  });
+
+  function metaFetch(
+    calls: string[],
+    downloads: string[],
+    files: unknown[],
+    opts?: {
+      downloadStatus?: number;
+      downloadBody?: unknown;
+      upstreamStatus?: number;
+      keyBody?: unknown;
+    },
+  ) {
+    return vi.fn(async (input: string, init?: RequestInit): Promise<Response> => {
+      const url = new URL(String(input));
+      if (url.pathname === "/v0/management/auth-files") return jsonResponse(200, files);
+      if (url.pathname === "/v1/models") return jsonResponse(200, { data: [] });
+      if (url.pathname.includes("/plugins/")) return jsonResponse(200, { groups: [] });
+      if (url.pathname === "/v0/management/auth-files/download") {
+        const name = url.searchParams.get("name") ?? "";
+        downloads.push(name);
+        if (opts?.downloadStatus) return new Response("missing", { status: opts.downloadStatus });
+        const body = opts?.downloadBody !== undefined ? opts.downloadBody : { dca_token: DCA_FIXTURE };
+        return new Response(typeof body === "string" ? body : JSON.stringify(body), { status: 200 });
+      }
+      if (url.pathname === "/v0/management/api-call") {
+        const sent = JSON.parse(String(init?.body)) as {
+          auth_index: string;
+          url: string;
+          header: Record<string, string>;
+          data: string;
+        };
+        calls.push(`${sent.auth_index} ${sent.url}`);
+        expect(sent.auth_index).not.toMatch(/api-call/);
+        // The literal bearer carries the downloaded token, exactly as the
+        // panel sends it — never a server-side placeholder.
+        expect(sent.header.Authorization).toBe(`Bearer ${DCA_FIXTURE}`);
+        expect(sent.url).toBe("https://api.meta.ai/muse-code/key");
+        expect(sent.data).toBe("{}");
+        const status = opts?.upstreamStatus ?? 200;
+        const upstream = opts?.keyBody !== undefined ? opts.keyBody : metaKeyBody();
+        return jsonResponse(200, { status_code: status, header: {}, body: JSON.stringify(upstream) });
+      }
+      return new Response("not found", { status: 404 });
+    });
+  }
+
+  function assertNoDcaLeak(s: Store) {
+    const blob = JSON.stringify([
+      s.activity,
+      s.savedSummary,
+      s.savedRows,
+      s.strike,
+      s.failure,
+      s.savedSpend,
+      s.savedCounts,
+    ]);
+    expect(blob).not.toContain(DCA_FIXTURE);
+    expect(blob).not.toContain(encodeURIComponent(DCA_FIXTURE));
+  }
+
+  function metaFiles() {
+    return [
+      { id: "meta-a", provider: "meta", name: "meta-a.json", auth_index: "m1" },
+      { id: "meta-b", provider: "meta", name: "meta-b.json", auth_index: "m2" },
+    ];
+  }
+
+  it("downloads each auth file and attaches window/weekly rows via the key call", async () => {
     const s = store();
     const calls: string[] = [];
-    const files = [
-      { id: "meta-a", provider: "meta", auth_index: "m1" },
-      { id: "meta-b", provider: "meta", auth_index: "m2" },
-    ];
+    const downloads: string[] = [];
     const config = configWith({ provider: "meta", connectionId: "conn-meta" });
-    const summary = await runSync(depsWith(s, config, apiFetch(calls, files) as never), {
+    const summary = await runSync(depsWith(s, config, metaFetch(calls, downloads, metaFiles()) as never), {
       running: false,
     });
     expect(summary.skipped).toBe(false);
+    // One download + one key call per distinct credential.
+    expect(downloads.sort()).toEqual(["meta-a.json", "meta-b.json"]);
+    expect(calls).toHaveLength(2);
+    expect(calls).toEqual(
+      expect.arrayContaining([
+        "m1 https://api.meta.ai/muse-code/key",
+        "m2 https://api.meta.ai/muse-code/key",
+      ]),
+    );
+    const rows = Object.values(s.savedRows ?? {});
+    expect(rows).toHaveLength(2);
+    for (const row of rows) {
+      expect(row.quotaBlind).toBe(false);
+      expect(row.planType).toBe("Pro");
+      expect(row.limits.map((l) => l.id)).toEqual(["meta:window", "meta:weekly"]);
+      expect(row.limits.every((l) => l.viaProviderApi === true)).toBe(true);
+      const [window, weekly] = row.limits;
+      expect(window?.usedPercent).toBe(30);
+      expect(window?.remainingPercent).toBe(70);
+      expect(weekly?.usedPercent).toBe(50);
+      expect(weekly?.remainingPercent).toBe(50);
+      expect(row.lastError).toBeNull();
+    }
+    assertNoKeyLeak(s);
+    assertNoDcaLeak(s);
+  });
+
+  it("skips per file when the auth file carries no usable dca token (no key call, stays blind)", async () => {
+    const s = store();
+    const calls: string[] = [];
+    const downloads: string[] = [];
+    const config = configWith({ provider: "meta", connectionId: "conn-meta" });
+    const summary = await runSync(
+      depsWith(
+        s,
+        config,
+        metaFetch(calls, downloads, metaFiles(), { downloadBody: { something_else: 1 } }) as never,
+      ),
+      { running: false },
+    );
+    expect(summary.skipped).toBe(false);
+    expect(downloads).toHaveLength(2);
     expect(calls).toHaveLength(0);
     const rows = Object.values(s.savedRows ?? {});
     expect(rows).toHaveLength(2);
     for (const row of rows) {
       expect(row.quotaBlind).toBe(true);
-      expect(row.planType).toBeNull();
       expect(row.limits).toEqual([]);
     }
-    expect(summary.errors.join(" ")).toMatch(/meta: 2 account\(s\) skipped.*panel-only/);
+    expect(summary.errors.join(" ")).toMatch(/no usable dca_token/);
     assertNoKeyLeak(s);
+    assertNoDcaLeak(s);
+  });
+
+  it("warns per file when the auth-file download fails (no key call, stays blind)", async () => {
+    const s = store();
+    const calls: string[] = [];
+    const downloads: string[] = [];
+    const config = configWith({ provider: "meta", connectionId: "conn-meta" });
+    const summary = await runSync(
+      depsWith(s, config, metaFetch(calls, downloads, metaFiles(), { downloadStatus: 404 }) as never),
+      { running: false },
+    );
+    expect(summary.skipped).toBe(false);
+    expect(downloads).toHaveLength(2);
+    expect(calls).toHaveLength(0);
+    expect(Object.values(s.savedRows ?? {}).every((r) => r.quotaBlind)).toBe(true);
+    expect(summary.errors.join(" ")).toMatch(/auth-file download failed/);
+    assertNoKeyLeak(s);
+    assertNoDcaLeak(s);
+  });
+
+  it("an upstream 401 on the key call backs the account off for an hour", async () => {
+    const s = store();
+    const calls: string[] = [];
+    const downloads: string[] = [];
+    const files = [{ id: "meta-a", provider: "meta", name: "meta-a.json", auth_index: "m1" }];
+    const config = configWith({ provider: "meta", connectionId: "conn-meta" });
+    const apiCallLastCall = new Map<string, number>();
+    const apiCallCache = new Map<string, { statusCode: number; body: unknown; observedAt: string }>();
+    const apiCallAuthBackoffUntil = new Map<string, number>();
+    const base = { apiCallLastCall, apiCallCache, apiCallAuthBackoffUntil };
+    const first = await runSync(
+      { ...depsWith(s, config, metaFetch(calls, downloads, files, { upstreamStatus: 401 }) as never), ...base },
+      { running: false },
+    );
+    expect(first.skipped).toBe(false);
+    expect(calls).toHaveLength(1);
+    expect(first.errors.join(" ")).toMatch(/backing off for 1 hour/);
+    const rows = Object.values(s.savedRows ?? {});
+    expect(rows[0]?.quotaBlind).toBe(true);
+    expect(rows[0]?.lastError).toBeNull();
+    // A minute later the account is parked: no retry, no new call.
+    const later = new Date(Date.parse(NOW) + 60_000).toISOString();
+    const second = await runSync(
+      {
+        ...depsWith(s, config, metaFetch(calls, downloads, files, { upstreamStatus: 401 }) as never),
+        now: later,
+        ...base,
+      },
+      { running: false },
+    );
+    expect(second.skipped).toBe(false);
+    expect(calls).toHaveLength(1);
+    expect(downloads).toHaveLength(1);
+    assertNoKeyLeak(s);
+    assertNoDcaLeak(s);
+  });
+
+  it("reuses the cached key answer within 45 minutes and refetches after (or on manual refresh)", async () => {
+    const s = store();
+    const calls: string[] = [];
+    const downloads: string[] = [];
+    const files = [{ id: "meta-a", provider: "meta", name: "meta-a.json", auth_index: "m1" }];
+    const config = configWith({ provider: "meta", connectionId: "conn-meta" });
+    const apiCallLastCall = new Map<string, number>();
+    const apiCallCache = new Map<string, { statusCode: number; body: unknown; observedAt: string }>();
+    const apiCallAuthBackoffUntil = new Map<string, number>();
+    const base = { apiCallLastCall, apiCallCache, apiCallAuthBackoffUntil };
+    const fetchImpl = () => metaFetch(calls, downloads, files) as never;
+    await runSync({ ...depsWith(s, config, fetchImpl()), ...base }, { running: false });
+    expect(calls).toHaveLength(1);
+    expect(Object.values(s.savedRows ?? {})[0]?.quotaBlind).toBe(false);
+    // Ten minutes later: throttled, but the cached answer still attaches rows.
+    const later = new Date(Date.parse(NOW) + 10 * 60_000).toISOString();
+    await runSync({ ...depsWith(s, config, fetchImpl()), now: later, ...base }, { running: false });
+    expect(calls).toHaveLength(1);
+    expect(downloads).toHaveLength(1);
+    expect(Object.values(s.savedRows ?? {})[0]?.quotaBlind).toBe(false);
+    expect(Object.values(s.savedRows ?? {})[0]?.limits.map((l) => l.id)).toEqual([
+      "meta:window",
+      "meta:weekly",
+    ]);
+    // Manual refresh bypasses the throttle but never the auth backoff.
+    await runSync(
+      { ...depsWith(s, config, fetchImpl()), now: later, forceMetaRefresh: true, ...base },
+      { running: false },
+    );
+    expect(calls).toHaveLength(2);
+    expect(downloads).toHaveLength(2);
+    // Past the 45-minute interval (measured from the manual refresh) the
+    // poll refetches on its own.
+    const after = new Date(Date.parse(NOW) + 60 * 60_000).toISOString();
+    await runSync({ ...depsWith(s, config, fetchImpl()), now: after, ...base }, { running: false });
+    expect(calls).toHaveLength(3);
+    assertNoKeyLeak(s);
+    assertNoDcaLeak(s);
+  });
+
+  it("makes no download or key call when metaQuota is disabled and says so once", async () => {
+    const s = store();
+    const calls: string[] = [];
+    const downloads: string[] = [];
+    const raw = baseConfigRaw();
+    raw.providers = [{ provider: "meta", connectionId: "conn-meta", completeInventory: false }];
+    (raw as Record<string, unknown>).metaQuota = { enabled: false };
+    const config = parseConfig(raw).config;
+    const summary = await runSync(
+      depsWith(s, config, metaFetch(calls, downloads, metaFiles()) as never),
+      { running: false },
+    );
+    expect(summary.skipped).toBe(false);
+    expect(downloads).toHaveLength(0);
+    expect(calls).toHaveLength(0);
+    expect(Object.values(s.savedRows ?? {}).every((r) => r.quotaBlind)).toBe(true);
+    expect(summary.errors.join(" ")).toMatch(/meta quota disabled by config/);
+    assertNoKeyLeak(s);
+    assertNoDcaLeak(s);
+  });
+
+  it("keeps the fixture token out of errors on 4xx/5xx and on parse failures", async () => {
+    const s = store();
+    // Upstream 500 on the key call: the envelope status warns per file.
+    const calls500: string[] = [];
+    const downloads500: string[] = [];
+    const files = [{ id: "meta-a", provider: "meta", name: "meta-a.json", auth_index: "m1" }];
+    const config = configWith({ provider: "meta", connectionId: "conn-meta" });
+    const failed = await runSync(
+      depsWith(s, config, metaFetch(calls500, downloads500, files, { upstreamStatus: 500 }) as never),
+      { running: false },
+    );
+    expect(failed.skipped).toBe(false);
+    expect(Object.values(s.savedRows ?? {})[0]?.quotaBlind).toBe(true);
+    // The non-2xx warning attaches to the row, like the template families.
+    const failedRows = Object.values(s.savedRows ?? {});
+    expect(failed.errors.join(" ") + (failedRows[0]?.lastError ?? "")).toMatch(/upstream HTTP 500/);
+    assertNoDcaLeak(s);
+    // Unparseable key body on a 2xx: the parser warns, the row stays blind.
+    const callsBad: string[] = [];
+    const downloadsBad: string[] = [];
+    const bad = await runSync(
+      depsWith(
+        s,
+        config,
+        metaFetch(callsBad, downloadsBad, files, { keyBody: "not-json{{{" }) as never,
+      ),
+      { running: false },
+    );
+    expect(bad.skipped).toBe(false);
+    // The envelope body is a string holding invalid JSON.
+    expect(Object.values(s.savedRows ?? {})[0]?.quotaBlind).toBe(true);
+    assertNoKeyLeak(s);
+    assertNoDcaLeak(s);
   });
 
   it("a disabled kill switch makes no provider call and warns once", async () => {

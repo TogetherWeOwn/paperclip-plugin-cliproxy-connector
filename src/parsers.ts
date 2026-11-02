@@ -530,18 +530,19 @@ function parseRemainingPercentField(value: unknown): number | null {
 }
 
 /**
- * Display-only blind reason for a quota-blind account row. Meta reads
- * panel-only: the connector never calls for it (no template can
- * authenticate — see the `api-call` template table in `src/cliproxy.ts`), so
- * the only live read is the panel's own. Providers whose upstream exposes no
- * quota read "upstream exposes nothing"; NIM-style local estimates read
- * "local estimate"; a gated provider that simply reported no usable windows
- * reads "no usable quota windows".
+ * Display-only blind reason for a quota-blind account row. Meta reads live
+ * through the downloaded auth file plus the `muse-code/key` call (see the
+ * `api-call` template table in `src/cliproxy.ts`), so a blind Meta row means
+ * the live read was disabled, throttled without a cache, or failed this run
+ * — the sync warnings carry the concrete cause. Providers whose upstream
+ * exposes no quota read "upstream exposes nothing"; NIM-style local estimates
+ * read "local estimate"; a gated provider that simply reported no usable
+ * windows reads "no usable quota windows".
  */
 export function quotaBlindReason(parserKey: ProviderKey, hasWindows: boolean): string | null {
   switch (parserKey) {
     case "meta":
-      return "panel-only (needs the downloaded auth file)";
+      return "Meta live read unavailable (see sync warnings)";
     case "antigravity":
     case "xai":
     case "kimi":
@@ -1081,6 +1082,127 @@ export function parseDevinQuota(
   }
   if (limits.length === 0) {
     warnings.push("devin: provider API answer carries no usable quota windows; treating this account as unknown.");
+  }
+  return { planType, limits, warnings };
+}
+
+/**
+ * Strict panel-style Meta percent (panel `metaQuota.ts` `parseUsedPercent`):
+ * a finite 0–100 number, or a digits-only string — clamped, never guessed.
+ * Anything else is null (unknown, never headroom).
+ */
+function parseMetaUsedPercent(value: unknown): number | null {
+  if (typeof value === "number") {
+    if (!Number.isFinite(value)) return null;
+    return Math.min(100, Math.max(0, value));
+  }
+  if (typeof value === "string" && value.trim() !== "" && Number.isFinite(Number(value))) {
+    return Math.min(100, Math.max(0, Number(value)));
+  }
+  return null;
+}
+
+/**
+ * Strict panel-style unix-seconds instant (panel `metaQuota.ts`
+ * `parsePositiveNumber` on `resets_at`): a positive finite seconds count
+ * (digits-only strings accepted) to ISO. Anything else is null (no reset
+ * known). Rejects non-positive values before `toIsoTimestamp`, which would
+ * otherwise map small numbers to null anyway with a different story.
+ */
+function parseMetaResetAt(value: unknown): string | null {
+  if (typeof value === "number") {
+    if (!Number.isFinite(value) || value <= 0) return null;
+    return toIsoTimestamp(value);
+  }
+  if (typeof value === "string") {
+    const text = value.trim();
+    if (!/^\d+$/.test(text)) return null;
+    const seconds = Number(text);
+    if (!Number.isSafeInteger(seconds) || seconds <= 0) return null;
+    return toIsoTimestamp(seconds);
+  }
+  return null;
+}
+
+/**
+ * Parse the Meta `muse-code/key` answer (panel `src/services/api/metaQuota.ts`
+ * `parseMetaQuotaPayload`): `subs_usage.window` / `subs_usage.weekly` with
+ * `used_percent` and `resets_at`, plus the plan name from `subs_tier_name`
+ * (falling back to `subs_usage.tier`) and the subscription flag. Only these
+ * fields are read — the upstream answer may also carry `api_key` and PII, so
+ * retaining the source object (or spreading it) is forbidden, exactly as in
+ * the panel. A 2xx answer without `subs_usage` is a successful observation
+ * with unknown quota (e.g. before the account's first request), not a zero
+ * or a request error: both windows emit as explicit unknown rows that veto
+ * headroom but never read as exhaustion. The `window_duration_mins` the
+ * panel shows is display-only and carries no quota signal the rows need.
+ */
+export function parseMetaQuota(
+  body: unknown,
+  observedAt: string | null,
+  allowList: string[],
+): ParsedApiQuota {
+  const warnings: string[] = [];
+  if (typeof body === "string") {
+    try {
+      body = JSON.parse(body) as unknown;
+    } catch {
+      warnings.push("meta: provider API answer is not JSON; treating this account as unknown.");
+      return { planType: null, limits: [], warnings };
+    }
+  }
+  const root = asObj(body);
+  if (!root) {
+    warnings.push("meta: provider API answer is not an object; treating this account as unknown.");
+    return { planType: null, limits: [], warnings };
+  }
+  const usage = asObj(root.subs_usage ?? null);
+  const explicitPlan = typeof root.subs_tier_name === "string" ? root.subs_tier_name.trim() : "";
+  const usagePlan = usage && typeof usage.tier === "string" ? usage.tier.trim() : "";
+  const planType = (explicitPlan || usagePlan || null) as string | null;
+  if (!usage) {
+    warnings.push("meta: provider API answer carries no subs_usage; treating this account as unknown.");
+  }
+  const limits: UsageLimitRow[] = [];
+  for (const window of ["window", "weekly"] as const) {
+    const raw = usage ? asObj(usage[window] ?? null) : null;
+    const usedPercent = raw ? parseMetaUsedPercent(raw.used_percent ?? null) : null;
+    if (usedPercent === null) {
+      if (usage && raw) {
+        warnings.push(`meta: ${window} quota percent is unusable; marking it unknown.`);
+      }
+      limits.push(
+        makeUnknownProviderWindow({
+          provider: "meta",
+          id: window,
+          label: `meta ${window}`,
+          observedAt,
+          allowList,
+          // The key endpoint answered — the subscription exists, only the
+          // percent telemetry is missing. `allowed: true` with a null
+          // percent keeps the aggregation verdict unknown (still vetoing
+          // headroom) instead of tripping into phantom exhaustion.
+          allowed: true,
+        }),
+      );
+      continue;
+    }
+    const remainingPercent = 100 - usedPercent;
+    const exhausted = remainingPercent <= 0;
+    limits.push(
+      makeLimit({
+        id: `meta:${window}`,
+        label: `meta ${window}`,
+        usedPercent,
+        remainingPercent,
+        resetsAt: parseMetaResetAt(raw?.resets_at ?? null),
+        limitReached: exhausted,
+        allowed: exhausted ? false : true,
+        gating: isGatingWindow("meta", window, allowList),
+        observedAt,
+        viaProviderApi: true,
+      }),
+    );
   }
   return { planType, limits, warnings };
 }
@@ -1809,14 +1931,17 @@ export function parseAuthFiles(
         // Exact match on the raw provider word — never the fuzzy parser key:
         // a `gemini` answer must not parse as Antigravity quota (or vice
         // versa). The sync loop only fetches exact-word accounts, so this is
-        // defense-in-depth for direct callers. Meta has no template and is
-        // never attached an answer (see `quotaBlindReason`).
+        // defense-in-depth for direct callers. Meta answers ride the
+        // dedicated download + literal-header key call (no frozen template),
+        // parsed by `parseMetaQuota`.
         const parsedApi: ParsedApiQuota | null =
           provider === "antigravity"
             ? parseAntigravitySubscription(apiPayload.body, apiObservedAt, allowList)
             : provider === "devin"
               ? parseDevinQuota(apiPayload.body, apiObservedAt, allowList)
-              : null;
+              : provider === "meta"
+                ? parseMetaQuota(apiPayload.body, apiObservedAt, allowList)
+                : null;
         if (!parsedApi) {
           parseWarnings.push(
             `${provider}: provider API answer has no parser for this family; ignoring it.`,
@@ -1883,8 +2008,9 @@ export function parseAuthFiles(
 
     // Antigravity publishes no passive signals: without live provider-API
     // windows it stays quota-blind. With at least one gating live window it
-    // routes quota-aware like every other gated provider. Meta is always
-    // quota-blind (panel-only — no template, no call).
+    // routes quota-aware like every other gated provider. Meta publishes no
+    // passive signals either: without a live key answer it stays quota-blind
+    // with the Meta reason above.
     const hasLiveGatingWindows = apiLimits.some((l) => l.gating);
     const quotaBlind =
       parserKey === "xai" ||

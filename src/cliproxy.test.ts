@@ -2,7 +2,9 @@ import { describe, expect, it, vi } from "vitest";
 import {
   type ManagementFetch,
   AUTH_FILES_PATH,
+  AUTH_FILE_DOWNLOAD_PATH,
   AUTH_FILE_MODELS_PATH,
+  authFileDownloadPath,
   authFileModelsPath,
   CliproxyAuthError,
   CliproxyBodyError,
@@ -13,7 +15,9 @@ import {
   CliproxyNotFoundError,
   CliproxyRedirectError,
   isSafeAuthFileName,
+  META_MUSE_CODE_KEY_URL,
   MODELS_PATH,
+  readDcaTokenFromAuthFile,
   apiCallTemplate,
   apiCallTemplateKeyForProvider,
   pluginQuotaPath,
@@ -529,9 +533,10 @@ describe("pinned api-call POST (frozen templates)", () => {
   it("resolves template keys by exact provider word only (no fuzzy matching)", async () => {
     expect(apiCallTemplateKeyForProvider("antigravity")).toBe("antigravity");
     expect(apiCallTemplateKeyForProvider("devin")).toBe("devin");
-    // Meta is panel-only (no template exists), and fuzzy/substring lookalikes
-    // must never resolve: a Gemini credential must not travel through the
-    // Antigravity request, nor a made-up word through any request.
+    // Meta has no frozen template (dedicated download + literal-header key
+    // call instead), and fuzzy/substring lookalikes must never resolve: a
+    // Gemini credential must not travel through the Antigravity request, nor
+    // a made-up word through any request.
     for (const word of ["meta", " Meta ", "gemini", "gemini-cli", "metafoo", "metas", "mydevin", "claude", "", "constructor"]) {
       expect(apiCallTemplateKeyForProvider(word)).toBeNull();
     }
@@ -773,5 +778,181 @@ describe("pinned api-call POST (frozen templates)", () => {
       CliproxyConfigError,
     );
     expect(fetch).not.toHaveBeenCalled();
+  });
+});
+
+describe("Meta live quota (download + literal-header key call)", () => {
+  // Stand-in for a real `dca:` bearer: no test may let it reach an error,
+  // a log line, or a persisted artifact.
+  const DCA_FIXTURE = "dca:fixture-meta-token-for-tests-only";
+  const envelope = (statusCode: number, body: unknown) =>
+    json(200, { status_code: statusCode, header: {}, body: JSON.stringify(body) });
+
+  it("pins the download path and requires the stock .json suffix", () => {
+    expect(AUTH_FILE_DOWNLOAD_PATH).toBe("/v0/management/auth-files/download");
+    expect(authFileDownloadPath("meta-a.json")).toBe(
+      "/v0/management/auth-files/download?name=meta-a.json",
+    );
+    expect(authFileDownloadPath("antigravity-user@example.com.json")).toBe(
+      "/v0/management/auth-files/download?name=antigravity-user%40example.com.json",
+    );
+    for (const bad of ["../config", "a/b", "api-call", "suffixless", "meta-a.JSON.bak"]) {
+      expect(() => authFileDownloadPath(bad)).toThrow(CliproxyConfigError);
+    }
+  });
+
+  it("GETs the raw auth-file bytes with the management key header", async () => {
+    let seen: { url?: string; headers?: Headers } = {};
+    const fileBody = JSON.stringify({ dca_token: DCA_FIXTURE });
+    const fetch = vi.fn(async (url: string, init?: RequestInit) => {
+      seen = { url, headers: new Headers(init?.headers) };
+      return new Response(fileBody, { status: 200 });
+    });
+    const text = await client(fetch).getAuthFileText("meta-a.json");
+    expect(text).toBe(fileBody);
+    expect(seen.url).toBe(
+      "http://127.0.0.1:8317/v0/management/auth-files/download?name=meta-a.json",
+    );
+    expect(seen.headers?.get("X-Test-Key")).toBe(KEY);
+  });
+
+  it("rejects hostile download names before any network happens", async () => {
+    for (const bad of ["../config", "a/b", "api-call", "suffixless"]) {
+      const fetch = vi.fn(async () => new Response("{}", { status: 200 }));
+      await expect(client(fetch).getAuthFileText(bad)).rejects.toThrow(CliproxyConfigError);
+      expect(fetch).not.toHaveBeenCalled();
+    }
+  });
+
+  it("maps download 404 to CliproxyNotFoundError and 401 to CliproxyAuthError", async () => {
+    {
+      const fetch = vi.fn(async () => new Response("nope", { status: 404 }));
+      const err = await client(fetch)
+        .getAuthFileText("meta-a.json")
+        .catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(CliproxyNotFoundError);
+    }
+    {
+      const fetch = vi.fn(async () => new Response("denied", { status: 401 }));
+      const err = await client(fetch)
+        .getAuthFileText("meta-a.json")
+        .catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(CliproxyAuthError);
+    }
+  });
+
+  it("never quotes the downloaded file in an error message", async () => {
+    // A hostile file stuffed with secret-looking material must not smuggle it
+    // into logs via an error: transport messages are pathname-only.
+    const hostile = JSON.stringify({ dca_token: DCA_FIXTURE, injected: "市からの秘密情報" });
+    const fetch = vi.fn(async () => new Response(hostile, { status: 500 }));
+    const err = (await client(fetch)
+      .getAuthFileText("meta-a.json")
+      .catch((e: unknown) => e)) as Error;
+    expect(err.message).not.toContain(DCA_FIXTURE);
+    expect(err.message).not.toContain("秘密情報");
+  });
+
+  it("extracts only the dca_token and rejects everything else without quoting the file", () => {
+    expect(readDcaTokenFromAuthFile(JSON.stringify({ dca_token: DCA_FIXTURE }))).toBe(DCA_FIXTURE);
+    // Surrounding fields (api keys, PII) are ignored, never returned.
+    expect(
+      readDcaTokenFromAuthFile(
+        JSON.stringify({ dca_token: `  ${DCA_FIXTURE}  `, api_key: "sk-secret", email: "a@b.c" }),
+      ),
+    ).toBe(DCA_FIXTURE);
+    const hostileSecret = "dca:hostile-secret-material-abcdef";
+    // A well-formed hostile token extracts (shape is all the reader checks);
+    // the caller drops its copy after the one key call either way.
+    expect(readDcaTokenFromAuthFile(JSON.stringify({ dca_token: hostileSecret }))).toBe(
+      hostileSecret,
+    );
+    const badBodies = [
+      "not json at all",
+      "[1,2,3]",
+      "null",
+      JSON.stringify({}),
+      JSON.stringify({ dca_token: 42 }),
+      JSON.stringify({ dca_token: "not-a-dca-token" }),
+      JSON.stringify({ dca_token: "dca:has whitespace" }),
+      JSON.stringify({ dca_token: "" }),
+      JSON.stringify({ dca_token: `dca:${"x".repeat(4096)}` }),
+    ];
+    for (const body of badBodies) {
+      const err = (() => {
+        try {
+          readDcaTokenFromAuthFile(body);
+        } catch (e: unknown) {
+          return e;
+        }
+        return null;
+      })();
+      expect(err).toBeInstanceOf(CliproxyBodyError);
+      expect((err as Error).message).not.toContain(DCA_FIXTURE);
+      expect((err as Error).message).not.toContain(hostileSecret);
+    }
+  });
+
+  it("POSTs the exact frozen key-call shape with the literal bearer", async () => {
+    let seen: { url?: string; method?: string; headers?: Headers; body?: string } = {};
+    const fetch = vi.fn(async (url: string, init?: RequestInit) => {
+      seen = {
+        url,
+        method: init?.method,
+        headers: new Headers(init?.headers),
+        body: init?.body as string,
+      };
+      return envelope(200, { subs_usage: {} });
+    });
+    const result = await client(fetch).postMetaMuseCodeKey("m1", DCA_FIXTURE);
+    expect(seen.url).toBe("http://127.0.0.1:8317/v0/management/api-call");
+    expect(seen.method).toBe("POST");
+    expect(seen.headers?.get("X-Test-Key")).toBe(KEY);
+    expect(META_MUSE_CODE_KEY_URL).toBe("https://api.meta.ai/muse-code/key");
+    const sent = JSON.parse(seen.body as string) as Record<string, unknown>;
+    expect(sent).toEqual({
+      auth_index: "m1",
+      method: "POST",
+      url: "https://api.meta.ai/muse-code/key",
+      header: {
+        Accept: "application/json",
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${DCA_FIXTURE}`,
+        "x-api-version": "1.0.0",
+      },
+      data: "{}",
+    });
+    expect(result.statusCode).toBe(200);
+  });
+
+  it("refuses an unusable token or index before any network happens", async () => {
+    for (const badToken of ["", "not-a-dca-token", "dca:has whitespace", `dca:${"x".repeat(4096)}`]) {
+      const fetch = vi.fn(async () => envelope(200, {}));
+      await expect(client(fetch).postMetaMuseCodeKey("m1", badToken)).rejects.toThrow(
+        CliproxyConfigError,
+      );
+      expect(fetch).not.toHaveBeenCalled();
+    }
+    for (const badIndex of ["", "../config", "a/b", "api-call"]) {
+      const fetch = vi.fn(async () => envelope(200, {}));
+      await expect(client(fetch).postMetaMuseCodeKey(badIndex, DCA_FIXTURE)).rejects.toThrow(
+        CliproxyConfigError,
+      );
+      expect(fetch).not.toHaveBeenCalled();
+    }
+  });
+
+  it("never surfaces the bearer even when the transport error quotes it", async () => {
+    // The transport wraps rejections with the error NAME only (pathname +
+    // root-cause label), so a token quoted below never reaches the caller.
+    // The `[redacted-dca-token]` scrub in the client is defense-in-depth for
+    // a future transport that quotes request bodies instead of dropping them.
+    const fetch = vi.fn(async () => {
+      throw new Error(`transport blew up on ${DCA_FIXTURE} mid-flight`);
+    });
+    const err = (await client(fetch)
+      .postMetaMuseCodeKey("m1", DCA_FIXTURE)
+      .catch((e: unknown) => e)) as Error;
+    expect(err.message).not.toContain(DCA_FIXTURE);
   });
 });
