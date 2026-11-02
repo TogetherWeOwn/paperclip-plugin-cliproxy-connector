@@ -116,6 +116,57 @@ describe("apiCallEnabled kill switch", () => {
   });
 });
 
+describe("ignored drift acceptance (ignoredProviders / ignoredAuthFileRefs)", () => {
+  it("defaults both lists to empty", () => {
+    const { config, validation } = parseConfig(base({ providers: [] }));
+    expect(validation.ok).toBe(true);
+    expect(config.ignoredProviders).toEqual([]);
+    expect(config.ignoredAuthFileRefs).toEqual([]);
+  });
+
+  it("normalises providers to lowercase and dedupes with a warning", () => {
+    const { config, validation } = parseConfig(
+      base({ providers: [], ignoredProviders: [" OpenRouter ", "openrouter", "XAI"] }),
+    );
+    expect(validation.ok).toBe(true);
+    expect(config.ignoredProviders).toEqual(["openrouter", "xai"]);
+    expect(validation.warnings.some((w) => w.includes("ignoredProviders"))).toBe(true);
+  });
+
+  it("accepts the full page ref and the bare hash, normalised to 8-hex", () => {
+    const { config, validation } = parseConfig(
+      base({ providers: [], ignoredAuthFileRefs: ["auth file C246E171", "6d6f6b47"] }),
+    );
+    expect(validation.ok).toBe(true);
+    expect(config.ignoredAuthFileRefs).toEqual(["c246e171", "6d6f6b47"]);
+  });
+
+  it("dedupes refs across both spellings with a warning", () => {
+    const { config, validation } = parseConfig(
+      base({ providers: [], ignoredAuthFileRefs: ["auth file c246e171", "c246e171"] }),
+    );
+    expect(validation.ok).toBe(true);
+    expect(config.ignoredAuthFileRefs).toEqual(["c246e171"]);
+    expect(validation.warnings.some((w) => w.includes("ignoredAuthFileRefs"))).toBe(true);
+  });
+
+  it("rejects non-lists, empty entries and non-hash refs loudly", () => {
+    for (const bad of [
+      { ignoredProviders: "openrouter" },
+      { ignoredProviders: [""] },
+      { ignoredProviders: [42] },
+      { ignoredAuthFileRefs: "auth file c246e171" },
+      { ignoredAuthFileRefs: [""] },
+      { ignoredAuthFileRefs: ["auth file c246e17"] },
+      { ignoredAuthFileRefs: ["c246e17g"] },
+      { ignoredAuthFileRefs: ["auth file not-a-hash-at-all"] },
+    ]) {
+      const { validation } = parseConfig(base({ providers: [], ...bad }));
+      expect(validation.ok).toBe(false);
+    }
+  });
+});
+
 describe("providerWindows overrides", () => {
   it("warns when a codex override drops the stock primary/secondary windows", () => {
     // Operator overrides replace the defaults: ["5h", "weekly"] alone stops

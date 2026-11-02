@@ -151,6 +151,12 @@ export interface PageData {
     waitUntil: string | null;
   };
   drift: DriftFinding[];
+  /**
+   * Findings the operator explicitly accepted via `ignoredProviders` /
+   * `ignoredAuthFileRefs`: shown as accepted, never counted as drift and never
+   * alerted. Absent on summaries written before the ignore config existed.
+   */
+  accepted: DriftFinding[];
   providers: ProviderCard[];
   earliestReset: string | null;
   /** Proven served-model ids per provider from the latest sync (stock ids). */
@@ -255,6 +261,7 @@ export function buildPageData(args: {
       waitUntil: strikeWaitUntil(strike.failures, nowMs),
     },
     drift: lastSync?.drift ?? [],
+    accepted: lastSync?.acceptedDrift ?? [],
     providers,
     earliestReset,
     providerModels,

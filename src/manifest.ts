@@ -1,7 +1,7 @@
 import type { PaperclipPluginManifestV1 } from "@paperclipai/plugin-sdk";
 
 export const PLUGIN_ID = "togetherweown.cliproxy-connector";
-export const PLUGIN_VERSION = "0.2.5";
+export const PLUGIN_VERSION = "0.2.6";
 export const SYNC_JOB_KEY = "cliproxy-sync";
 export const PAGE_DATA_KEY = "cliproxy-page";
 export const USAGE_DATA_KEY = "cliproxy-usage";
@@ -14,6 +14,13 @@ export const LAST_SYNC_STATE_KEY = "last-sync";
 export const STRIKE_STATE_KEY = "strike-budget";
 /** Latest sync failure (non-auth errors, unresolvable secrets). Never touches `last-sync`. */
 export const LAST_ERROR_STATE_KEY = "last-error";
+/**
+ * Drift ledger for state-change activity logging: per drift key the first/last
+ * seen times plus the last time it produced an activity row. New findings log
+ * once, cleared findings log once, and persistent findings remind at most
+ * daily.
+ */
+export const DRIFT_LEDGER_STATE_KEY = "drift-ledger";
 
 const manifest: PaperclipPluginManifestV1 = {
   id: PLUGIN_ID,

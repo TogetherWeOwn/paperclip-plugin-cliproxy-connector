@@ -163,6 +163,28 @@ export interface DriftFinding {
 }
 
 /**
+ * One tracked drift finding in the ledger: per drift key (`kind + provider +
+ * detail` — details are count-free and stable) with first/last seen times and
+ * the last time it was written to the activity feed. Drives state-change
+ * logging: one row when a finding appears, one when it clears, and at most one
+ * daily reminder while it persists.
+ */
+export interface DriftLedgerEntry {
+  kind: string;
+  provider: string;
+  detail: string;
+  /** ISO time the finding was first seen. */
+  firstSeenAt: string;
+  /** ISO time the finding was last present in a successful sync. */
+  lastSeenAt: string;
+  /** ISO time the finding last produced an activity row. */
+  lastLoggedAt: string;
+}
+
+/** Drift ledger persisted in plugin state, keyed by drift key. */
+export type DriftLedger = Record<string, DriftLedgerEntry>;
+
+/**
  * A sync failure that never became a `SyncSummary`: non-auth fetch/parse
  * errors and unresolvable secrets. Persisted under its own state key WITHOUT
  * touching `last-sync.finishedAt` (which drives the min-interval check), so
@@ -173,6 +195,14 @@ export interface SyncFailure {
   attemptedAt: string;
   /** Human reason; never holds key material. */
   message: string;
+  /**
+   * Stable dedupe signature for activity logging (e.g. `secret-empty`,
+   * `auth-rejected`, `sync-error`). Repeated identical failures log once,
+   * with at most one reminder per 24 h while the same failure persists.
+   */
+  failureKind?: string;
+  /** ISO time this failure last produced an activity row. */
+  lastLoggedAt?: string;
 }
 
 /** Result of one sync run (persisted summary + returned to the on-demand route). */
@@ -182,6 +212,13 @@ export interface SyncSummary {
   accountsSeen: number;
   rowsWritten: number;
   drift: DriftFinding[];
+  /**
+   * Findings suppressed by the operator's ignore config (`ignoredProviders`,
+   * `ignoredAuthFileRefs`): explicitly accepted, never alerted. Shown on the
+   * plugin page as accepted, not as drift. Absent on summaries written before
+   * the ignore config existed.
+   */
+  acceptedDrift?: DriftFinding[];
   errors: string[];
   skipped: boolean;
   skipReason: string | null;

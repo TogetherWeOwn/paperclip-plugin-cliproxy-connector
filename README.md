@@ -118,7 +118,16 @@ The plugin ships two pages over the same sync cache:
 
 - The **provider** page: one card per `providers[]` row with the aggregate verdict,
   connection, inventory confirmation, proven models, drift and the informational
-  per-account detail.
+  per-account detail. Findings suppressed by `ignoredProviders` /
+  `ignoredAuthFileRefs` render in a separate accepted section, never as drift.
+- The **activity feed** stays quiet by design: every plugin row uses a stable key
+  (`cliproxy_connector.drift_detected` / `.drift_cleared` /
+  `.drift_still_present` / `sync_failed` / `sync_recovered` / `.setup_error` /
+  `.strike_budget_reenabled`) with the human sentence
+  in `metadata.summary` plus structured fields. Drift logs only on state changes
+  (new key, cleared key, at most one reminder per 24 h per finding); repeated
+  identical sync failures log once with the same daily reminder bound. Expect
+  near-zero rows per day in steady state.
 - The **Usage & Quota** page (`cliproxy-usage`): per-provider verdict, headroom
   (`<n> of <m> enabled accounts with headroom`), earliest known reset with countdown
   (informational — shown for allowed providers too, unlike the exhaustion-only
@@ -151,6 +160,8 @@ The plugin ships two pages over the same sync cache:
 | `pluginQuotaIds` | `{}` | CLIProxy plugin id per provider for quota fetch. Wins over `quota_plugin_id` discovery from the `auth-files` list. Fetched per auth file with its `auth_index` (v8.0.49+); entries without one keep one provider-level fetch. |
 | `apiCallEnabled` | `{}` (on for `antigravity`/`devin`/`meta`, off otherwise) | Per-provider kill switch for the pinned live `api-call` rounds (`{"antigravity": false}` disables all credential-bearing provider-API calls for that family). Upstream 401/403 already backs an account off for 1 hour; this switch is the manual off-ramp. |
 | `audienceConfirmed` | `false` | Page shows upstream quota state; confirm the audience, then set `true`. |
+| `ignoredProviders` | `[]` | Provider words (lowercased, e.g. `openrouter`) whose `unconfigured-provider` drift is explicitly accepted: no finding, no activity row; shown on the page as accepted. |
+| `ignoredAuthFileRefs` | `[]` | Accepted `auth file <hash8>` refs (bare hash or full page ref, e.g. `auth file c246e171`) whose `untrusted-auth-file` drift is explicitly accepted. Same accepted-not-alerted rule; typos fail validation loudly. |
 
 ## Endpoint assumptions
 
@@ -242,7 +253,9 @@ namespace-first attribution, Devin `owned_by: anthropic` case, colliding bare-id
 `cliproxy.test.ts` (management + client allow-lists, redirects, caps, redaction),
 `loopback-fetch.test.ts` (worker-local loopback transport: off-loopback/off-origin/other-method
 refused, no auto-redirects, composition with the client),
-`config.test.ts` (incl. the optional client-key `secret_ref`), `ui-data.test.ts`
+`config.test.ts` (incl. the optional client-key `secret_ref` and the ignore lists),
+`ui-data.test.ts`
 (incl. the usage-page data: verdicts, headroom, resets, freshness, blind badges with
-reasons, masked labels, metrics passthrough, legacy rows without `quotaBlindReason`),
-`plugin.test.ts` (harness: job, data, actions, API routes).
+reasons, masked labels, metrics passthrough, legacy rows without `quotaBlindReason`,
+accepted-findings surfacing),
+`plugin.test.ts` (harness: job, data, actions, API routes, stable re-enable key).

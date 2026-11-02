@@ -59,6 +59,18 @@ export interface ConnectorConfig {
   futureSkewSeconds: number;
   /** One row per provider family, never per account. */
   providers: ProviderEntry[];
+  /**
+   * Provider words whose `unconfigured-provider` drift is explicitly accepted
+   * (normalized lowercase, e.g. `openrouter`). Accepted findings never reach
+   * the activity feed; the plugin page shows them as accepted, not as drift.
+   */
+  ignoredProviders: string[];
+  /**
+   * Accepted `auth file <hash8>` refs (normalized to the bare lowercase
+   * 8-hex hash, e.g. `c246e171`) whose `untrusted-auth-file` drift is
+   * explicitly accepted. Same accepted-not-alerted rule as ignoredProviders.
+   */
+  ignoredAuthFileRefs: string[];
   /** Per-provider gating-window allow-list (lowercased substring match). */
   providerWindows: Record<string, string[]>;
   /** CLIProxy plugin id per provider for quota fetch (our five plugins). */
@@ -337,6 +349,13 @@ export function parseConfig(raw: unknown): { config: ConnectorConfig; validation
     );
   }
 
+  // Explicitly accepted drift: known drift that must not alert. Both lists
+  // are additive to the provider rows above — an ignored provider still needs
+  // no providers[] row, and an ignored auth-file ref stays out of the quota
+  // fetch either way (refused names are never fetched).
+  const ignoredProviders = parseIgnoredProviderList(r.ignoredProviders, errors, warnings);
+  const ignoredAuthFileRefs = parseIgnoredAuthFileRefs(r.ignoredAuthFileRefs, errors, warnings);
+
   // The management client uses pinned paths (see cliproxy.ts
   // AUTH_FILES_PATH / pluginQuotaPath) — there are deliberately no config
   // knobs for them. Unknown keys (including the removed v1 prefixMap,
@@ -365,6 +384,8 @@ export function parseConfig(raw: unknown): { config: ConnectorConfig; validation
     pluginQuotaIds,
     apiCallEnabled,
     audienceConfirmed: r.audienceConfirmed === true,
+    ignoredProviders,
+    ignoredAuthFileRefs,
   };
   return { config, validation: { ok: errors.length === 0, warnings, errors } };
 }
@@ -388,6 +409,78 @@ export function isLiveQuotaEnabled(config: ConnectorConfig, provider: string): b
   const explicit = config.apiCallEnabled[word];
   if (typeof explicit === "boolean") return explicit;
   return DEFAULT_LIVE_QUOTA_PROVIDERS[word] ?? false;
+}
+
+/**
+ * Parse `ignoredProviders`: provider words whose `unconfigured-provider` drift
+ * is explicitly accepted. Entries are trimmed and lowercased (provider words
+ * are matched lowercase); duplicates warn and collapse.
+ */
+function parseIgnoredProviderList(
+  raw: unknown,
+  errors: string[],
+  warnings: string[],
+): string[] {
+  if (raw === undefined || raw === null) return [];
+  if (!Array.isArray(raw) || !raw.every((s) => typeof s === "string" && s.trim())) {
+    errors.push("ignoredProviders must be a list of non-empty provider words (e.g. [\"openrouter\"]).");
+    return [];
+  }
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const [index, entry] of (raw as string[]).entries()) {
+    const provider = entry.trim().toLowerCase();
+    if (seen.has(provider)) {
+      warnings.push(`ignoredProviders[${index}] duplicates ${JSON.stringify(provider)}; keeping one entry.`);
+      continue;
+    }
+    seen.add(provider);
+    out.push(provider);
+  }
+  return out;
+}
+
+/** Prefix the plugin page shows before an untrusted auth-file's short hash. */
+export const AUTH_FILE_REF_PREFIX = "auth file ";
+
+/**
+ * Parse `ignoredAuthFileRefs`: accepted `auth file <hash8>` refs whose
+ * `untrusted-auth-file` drift is explicitly accepted. Entries may be the bare
+ * hash (`c246e171`) or the full ref as shown on the plugin page
+ * (`auth file c246e171`); both normalize to the bare lowercase 8-hex hash.
+ * Anything else errors loudly so a typo cannot silently accept nothing.
+ */
+function parseIgnoredAuthFileRefs(
+  raw: unknown,
+  errors: string[],
+  warnings: string[],
+): string[] {
+  if (raw === undefined || raw === null) return [];
+  if (!Array.isArray(raw) || !raw.every((s) => typeof s === "string" && (s as string).trim())) {
+    errors.push(
+      `ignoredAuthFileRefs must be a list of non-empty "auth file <hash8>" refs as shown on the plugin page (e.g. ["auth file c246e171"]).`,
+    );
+    return [];
+  }
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const [index, entry] of (raw as string[]).entries()) {
+    let ref = entry.trim().toLowerCase();
+    if (ref.startsWith(AUTH_FILE_REF_PREFIX)) ref = ref.slice(AUTH_FILE_REF_PREFIX.length).trim();
+    if (!/^[0-9a-f]{8}$/.test(ref)) {
+      errors.push(
+        `ignoredAuthFileRefs[${index}] must be an "auth file <hash8>" ref as shown on the plugin page; got ${JSON.stringify(entry)}.`,
+      );
+      continue;
+    }
+    if (seen.has(ref)) {
+      warnings.push(`ignoredAuthFileRefs[${index}] duplicates ${JSON.stringify(ref)}; keeping one entry.`);
+      continue;
+    }
+    seen.add(ref);
+    out.push(ref);
+  }
+  return out;
 }
 
 /**
