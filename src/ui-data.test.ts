@@ -55,6 +55,26 @@ function row(over: Partial<AccountUsageRow> = {}): AccountUsageRow {
   };
 }
 
+/** Row with one quota window per observedAt (null = pre-observedAt cache). */
+function quotaRow(key: string, checkedAt: string, ...observedAts: Array<string | null>): AccountUsageRow {
+  return row({
+    key,
+    checkedAt,
+    limits: observedAts.map((observedAt, i) => ({
+      id: `claude:5h:${i}`,
+      label: "Claude unified 5h",
+      usedPercent: 20,
+      remainingPercent: 80,
+      resetsAt: null,
+      limitReached: false,
+      allowed: true,
+      gating: true,
+      observedAt,
+      models: null,
+    })),
+  });
+}
+
 const LAST_SYNC = {
   startedAt: NOW,
   finishedAt: NOW,
@@ -689,11 +709,26 @@ describe("skipped sync honesty", () => {
     const usage = buildUsageData({
       now: NOW,
       config: testConfig(),
-      rows: { "acct-aaa": row({ checkedAt: "2026-11-01T11:00:00.000Z" }) },
+      rows: { "acct-aaa": quotaRow("acct-aaa", "2026-11-01T11:00:00.000Z", "2026-11-01T11:00:00.000Z") },
       lastSync: { ...LAST_SYNC, finishedAt: NOW },
     });
     // The summary finished later than the quota read; the page shows the read.
     expect(usage.quotaFetchedAt).toBe("2026-11-01T11:00:00.000Z");
+  });
+
+  it("reports the passive observation age, not the row fetch, for quota windows", () => {
+    const usage = buildUsageData({
+      now: NOW,
+      config: testConfig(),
+      rows: {
+        idle: quotaRow("acct-idle", NOW, "2026-11-01T09:00:00.000Z"),
+        multi: quotaRow("acct-multi", NOW, "2026-11-01T08:00:00.000Z", "2026-11-01T10:30:00.000Z"),
+      },
+      lastSync: LAST_SYNC,
+    });
+    // Both rows were fetched at NOW, but the passive observations behind the
+    // displayed figures are hours old; the timestamp is the latest one.
+    expect(usage.quotaFetchedAt).toBe("2026-11-01T10:30:00.000Z");
   });
 
   it("ignores quota-blind rows and unparseable row timestamps", () => {
@@ -702,13 +737,17 @@ describe("skipped sync honesty", () => {
       config: testConfig(),
       rows: {
         blind: row({ key: "acct-blind", limits: [], checkedAt: "2026-11-01T13:00:00.000Z" }),
-        broken: row({ key: "acct-broken", checkedAt: "not-a-time" }),
-        fresh: row({ key: "acct-fresh", checkedAt: "2026-11-01T11:30:00.000Z" }),
-        older: row({ key: "acct-older", checkedAt: "2026-11-01T10:00:00.000Z" }),
+        broken: quotaRow("acct-broken", "not-a-time", null),
+        garbageObs: quotaRow("acct-garbage", "2026-11-01T13:30:00.000Z", "not-a-time"),
+        fresh: quotaRow("acct-fresh", "2026-11-01T11:30:00.000Z", "2026-11-01T11:30:00.000Z"),
+        older: quotaRow("acct-older", "2026-11-01T10:00:00.000Z", "2026-11-01T10:00:00.000Z"),
+        legacy: quotaRow("acct-legacy", "2026-11-01T09:00:00.000Z", null),
       },
       lastSync: LAST_SYNC,
     });
-    // Latest valid checkedAt among rows that actually carry quota windows.
+    // Latest valid per-window observation (observedAt, else the row fetch).
+    // Quota-blind rows, rows with no parseable time, and windows with garbage
+    // observations never contribute, even with a fresher row fetch.
     expect(usage.quotaFetchedAt).toBe("2026-11-01T11:30:00.000Z");
   });
 

@@ -165,8 +165,10 @@ The plugin ships two pages over the same sync cache:
     before any state write, so lanes carry provider words and counts only.
     Labelled "requests": there is no per-lane token split from any lawful
     read-only source, and OAuth lanes are invisible to the endpoint, so the page
-    says both outright. The section timestamp is the latest cached quota-row
-    fetch, never the sync finish time.
+    says both outright. The quota section timestamp is the latest per-window
+    quota observation (`observedAt`, else the row fetch), never the sync
+    finish time — a passive window observed hours ago keeps its own age even
+    when its cache row was refreshed minutes ago.
   - **Lane map**: the static agent-lane → provider/model table derived from the
     cost-integration plan §1.3 on 2026-11-01, flagged verbatim
     "Config-derived mapping (derived 2026-11-01). Not ledger data." Re-deriving

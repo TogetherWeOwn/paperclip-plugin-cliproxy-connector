@@ -284,7 +284,7 @@ export interface UsagePageData {
   providers: ProviderCard[];
   earliestReset: string | null;
   earliestResetIn: string | null;
-  /** When the cached quota windows behind `providers` were fetched. */
+  /** Latest per-window observation behind `providers` (observedAt, else row fetch). */
   quotaFetchedAt: string | null;
   spend: SpendSection;
   usage: UsageCountsSection;
@@ -525,20 +525,29 @@ function earliestKnownReset(providers: ProviderCard[]): string | null {
 }
 
 /**
- * Latest valid `checkedAt` across cached rows that carry quota windows. Rows
- * without limits (quota-blind providers, best-effort quota failures) never
- * contribute: the section timestamp must reflect an actual quota fetch.
+ * Latest per-window observation across cached rows that carry quota windows.
+ * Each window contributes its `observedAt` (passive `auth-files` signals carry
+ * their own observation time, which only refreshes when the account serves
+ * traffic), falling back to the row's `checkedAt` for rows cached before
+ * per-window `observedAt` existed. Rows without limits (quota-blind providers,
+ * best-effort quota failures) never contribute, and windows with no parseable
+ * time never contribute: the section timestamp must reflect the age of the
+ * displayed figures, not a cache refresh that left them untouched.
  */
 function latestQuotaCheckedAt(rows: Record<string, AccountUsageRow>): string | null {
   let latest: string | null = null;
   let latestMs = NaN;
   for (const row of Object.values(rows)) {
     if (row.limits.length === 0) continue;
-    const ms = Date.parse(row.checkedAt);
-    if (Number.isNaN(ms)) continue;
-    if (latest === null || ms > latestMs) {
-      latest = row.checkedAt;
-      latestMs = ms;
+    const rowMs = Date.parse(row.checkedAt);
+    for (const window of row.limits) {
+      const candidate = window.observedAt ?? row.checkedAt;
+      const ms = window.observedAt != null ? Date.parse(window.observedAt) : rowMs;
+      if (candidate == null || Number.isNaN(ms)) continue;
+      if (latest === null || ms > latestMs) {
+        latest = candidate;
+        latestMs = ms;
+      }
     }
   }
   return latest;
@@ -599,7 +608,10 @@ export function buildUsageData(args: {
     // `finishedAt` is sync completion time (later than the quota reads), and a
     // best-effort quota failure can still save a successful summary. Only rows
     // that actually carry quota windows qualify; null when none do. Skipped
-    // runs write no rows, so they can never masquerade as a fresh fetch.
+    // runs write no rows, so they can never masquerade as a fresh fetch. Each
+    // window contributes its own observation time (`observedAt`, else the row
+    // fetch), so a passive window observed hours ago is never stamped with a
+    // minutes-old cache refresh.
     quotaFetchedAt: latestQuotaCheckedAt(rows),
     spend: {
       configured: config.openRouterSecretRef !== undefined && config.openRouterSecretRef !== null,
