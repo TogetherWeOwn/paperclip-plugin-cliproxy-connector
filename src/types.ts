@@ -205,6 +205,69 @@ export interface SyncFailure {
   lastLoggedAt?: string;
 }
 
+/**
+ * Provider-side spend snapshot (OpenRouter credits). Stored under its own
+ * state key, never mixed into quota rows. Only the four numeric/identity
+ * fields below are kept — the raw credits payload is never persisted.
+ */
+export interface ProviderSpend {
+  /** Always `openrouter`: the only spend source today. */
+  provider: "openrouter";
+  /** `data.total_credits` from the credits endpoint, when parseable. */
+  totalCredits: number;
+  /** `data.total_usage` from the credits endpoint, when parseable. */
+  totalUsage: number;
+  /** ISO time the credits were fetched. Every usage-page section shows this. */
+  fetchedAt: string;
+}
+
+/**
+ * Spend state: the last-known snapshot plus the latest soft failure note
+ * (scrubbed). A failed fetch keeps the previous snapshot and records its
+ * note here, so the page shows last-known data with its timestamp instead of
+ * a fresh-looking or silently empty section.
+ */
+export interface StoredSpend {
+  data: ProviderSpend | null;
+  note: string | null;
+}
+
+/** One aggregated recent-request bucket (server-generated time label only). */
+export interface RequestBucket {
+  /** Bucket label as reported by CLIProxy (e.g. a `HH:MM` label), never free text. */
+  time: string;
+  success: number;
+  failed: number;
+}
+
+/**
+ * Per-provider request counts aggregated in the worker from
+ * `GET /v0/management/api-key-usage`. The composite `base_url|api_key` keys
+ * are discarded during aggregation and structurally cannot reach this shape:
+ * there is no key field, only provider-level totals.
+ */
+export interface ProviderRequestCounts {
+  /** Normalized lowercase provider word (`unknown` when CLIProxy reports none). */
+  provider: string;
+  success: number;
+  failed: number;
+  total: number;
+  recent: RequestBucket[];
+  /** ISO time the counts were fetched. Every usage-page section shows this. */
+  fetchedAt: string;
+}
+
+/**
+ * Request-count state: the last-known per-provider aggregates plus the
+ * latest soft failure note (scrubbed). A failed fetch keeps the previous
+ * aggregates and records its note here.
+ */
+export interface StoredRequestCounts {
+  lanes: ProviderRequestCounts[];
+  fetchedAt: string | null;
+  note: string | null;
+}
+
 /** Result of one sync run (persisted summary + returned to the on-demand route). */
 export interface SyncSummary {
   startedAt: string;

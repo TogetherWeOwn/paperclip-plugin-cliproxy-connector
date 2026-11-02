@@ -16,6 +16,8 @@ import {
 import type {
   AccountUsageRow,
   DriftLedger,
+  StoredRequestCounts,
+  StoredSpend,
   StrikeBudgetState,
   SyncFailure,
   SyncSummary,
@@ -108,6 +110,10 @@ interface Store {
   /** Null = no ledger ever persisted (pre-upgrade); {} = seeded/cleared. */
   ledger: DriftLedger | null;
   activity: Array<{ message: string; metadata?: Record<string, unknown> }>;
+  spend: StoredSpend | null;
+  savedSpend: StoredSpend | null;
+  counts: StoredRequestCounts | null;
+  savedCounts: StoredRequestCounts | null;
 }
 
 function store(over?: Partial<Store>): Store {
@@ -120,6 +126,10 @@ function store(over?: Partial<Store>): Store {
     failure: null,
     ledger: null,
     activity: [],
+    spend: null,
+    savedSpend: null,
+    counts: null,
+    savedCounts: null,
     ...over,
   };
 }
@@ -133,6 +143,14 @@ function deps(s: Store, fetchImpl?: typeof fetch): SyncDeps {
     resolveSecret: async () => KEY,
     resolveClientSecret: async () => `${KEY}-client`,
     fetchImpl,
+    loadSpend: async () => s.spend,
+    saveSpend: async (next) => {
+      s.savedSpend = next;
+    },
+    loadRequestCounts: async () => s.counts,
+    saveRequestCounts: async (next) => {
+      s.savedCounts = next;
+    },
     loadStrike: async () => s.strike,
     saveStrike: async (next) => {
       s.strike = next;
@@ -2181,6 +2199,190 @@ describe("stable activity keys + state-change logging", () => {
     expect(summary.acceptedDrift ?? []).toEqual([]);
     expect(s.activity).toHaveLength(1);
     expect(s.activity[0]?.message).toBe(ACTIVITY_DRIFT_DETECTED);
+    assertNoKeyLeak(s);
+  });
+});
+
+describe("read-model extras (OpenRouter spend + request counts)", () => {
+  const SPEND_SECRET = "or-live-secret-value-fixture";
+
+  function countsBody() {
+    return {
+      anthropic: {
+        "https://api.example.invalid|fixture-key-alpha": {
+          success: 10,
+          failed: 2,
+          recent_requests: [{ time: "12:00", success: 10, failed: 2 }],
+        },
+        "https://api.example.invalid|fixture-key-beta": { success: 5, failed: 1 },
+      },
+    };
+  }
+
+  function readModelFetch(over?: { countsStatus?: number; countsBody?: unknown }) {
+    const base = mockFetch();
+    const seen: string[] = [];
+    const fetch = vi.fn(async (input: string | URL | Request): Promise<Response> => {
+      seen.push(String(input));
+      const url = new URL(String(input));
+      if (url.pathname === "/v0/management/api-key-usage") {
+        if (over?.countsStatus) return new Response("nope", { status: over.countsStatus });
+        return jsonResponse(200, over?.countsBody ?? countsBody());
+      }
+      return base(input);
+    });
+    return { fetch, seen };
+  }
+
+  function creditsFetch(status = 200, body: unknown = { data: { total_credits: 100, total_usage: 37.5 } }) {
+    return vi.fn(async () => new Response(JSON.stringify(body), { status }));
+  }
+
+  function configWithExtras(over: Record<string, unknown> = {}) {
+    const raw = baseConfigRaw();
+    return parseConfig({ ...raw, ...over }).config;
+  }
+
+  function assertNoReadModelLeak(s: Store, secrets: string[] = [KEY, SPEND_SECRET]) {
+    const blob = JSON.stringify([s.activity, s.savedSummary, s.savedSpend, s.savedCounts, s.failure]);
+    for (const secret of secrets) expect(blob).not.toContain(secret);
+  }
+
+  it("stores the credits snapshot and clears the note on success", async () => {
+    const s = store();
+    const { fetch } = readModelFetch();
+    const config = configWithExtras({ openRouterSecretRef: { uid: "or-1" } });
+    const d = deps(s, fetch as unknown as typeof fetch);
+    d.config = config;
+    d.resolveSecret = async () => SPEND_SECRET;
+    d.httpFetch = creditsFetch() as never;
+    const summary = await runSync(d, { running: false });
+    expect(summary.skipped).toBe(false);
+    expect(s.savedSpend).toEqual({
+      data: { provider: "openrouter", totalCredits: 100, totalUsage: 37.5, fetchedAt: NOW },
+      note: null,
+    });
+    expect(summary.errors.join(" ")).not.toMatch(/spend/);
+    assertNoReadModelLeak(s);
+  });
+
+  it("unconfigured spend skips silently: no state write, no error", async () => {
+    const s = store();
+    const { fetch } = readModelFetch();
+    const d = deps(s, fetch as unknown as typeof fetch);
+    d.httpFetch = creditsFetch() as never;
+    const summary = await runSync(d, { running: false });
+    expect(summary.skipped).toBe(false);
+    expect(s.savedSpend).toBeNull();
+    expect(summary.errors.join(" ")).not.toMatch(/spend/);
+  });
+
+  it("a configured spend read without httpFetch skips without touching state", async () => {
+    const s = store();
+    const { fetch } = readModelFetch();
+    const d = deps(s, fetch as unknown as typeof fetch);
+    d.config = configWithExtras({ openRouterSecretRef: { uid: "or-1" } });
+    const summary = await runSync(d, { running: false });
+    expect(summary.skipped).toBe(false);
+    expect(s.savedSpend).toBeNull();
+  });
+
+  it("a failed spend fetch keeps last-known with a scrubbed note and never fails the sync", async () => {
+    const prev = {
+      data: { provider: "openrouter" as const, totalCredits: 50, totalUsage: 10, fetchedAt: NOW },
+      note: null,
+    };
+    const s = store({ spend: prev });
+    const { fetch } = readModelFetch();
+    const d = deps(s, fetch as unknown as typeof fetch);
+    d.config = configWithExtras({ openRouterSecretRef: { uid: "or-1" } });
+    d.resolveSecret = async () => SPEND_SECRET;
+    d.httpFetch = creditsFetch(500) as never;
+    const summary = await runSync(d, { running: false });
+    expect(summary.skipped).toBe(false);
+    expect(s.savedSpend?.data).toEqual(prev.data);
+    expect(s.savedSpend?.note).toMatch(/last-known/);
+    expect(s.savedSpend?.note).not.toContain(SPEND_SECRET);
+    expect(summary.errors.join(" ")).toMatch(/last-known/);
+    assertNoReadModelLeak(s);
+  });
+
+  it("an unresolvable spend secret warns without failing the sync", async () => {
+    const s = store();
+    const { fetch } = readModelFetch();
+    const d = deps(s, fetch as unknown as typeof fetch);
+    d.config = configWithExtras({ openRouterSecretRef: { uid: "or-1" } });
+    // The management key resolves; only the dedicated spend ref is broken.
+    d.resolveSecret = async (ref: unknown) => {
+      if ((ref as { uid?: string })?.uid === "or-1") throw new Error("vault boom");
+      return SPEND_SECRET;
+    };
+    d.httpFetch = creditsFetch() as never;
+    const summary = await runSync(d, { running: false });
+    expect(summary.skipped).toBe(false);
+    expect(s.savedSpend).toEqual({ data: null, note: expect.stringMatching(/last-known/) });
+    assertNoReadModelLeak(s);
+  });
+
+  it("flag-off request counts write nothing even when the endpoint would answer", async () => {
+    const s = store();
+    const { fetch, seen } = readModelFetch();
+    const summary = await runSync(deps(s, fetch as unknown as typeof fetch), { running: false });
+    expect(summary.skipped).toBe(false);
+    expect(s.savedCounts).toBeNull();
+    expect(seen.some((u) => u.includes("api-key-usage"))).toBe(false);
+  });
+
+  it("flag-on counts aggregate lanes by provider with no key material anywhere (T1)", async () => {
+    const s = store();
+    const { fetch, seen } = readModelFetch();
+    const d = deps(s, fetch as unknown as typeof fetch);
+    d.config = configWithExtras({ apiKeyUsageEnabled: true });
+    const summary = await runSync(d, { running: false });
+    expect(summary.skipped).toBe(false);
+    expect(s.savedCounts?.lanes).toMatchObject([{ provider: "anthropic", success: 15, failed: 3, total: 18 }]);
+    expect(s.savedCounts?.fetchedAt).toBe(NOW);
+    expect(s.savedCounts?.note).toBeNull();
+    const blob = JSON.stringify([s.savedCounts, summary.errors, s.activity]);
+    expect(blob).not.toContain("fixture-key-alpha");
+    expect(blob).not.toContain("fixture-key-beta");
+    expect(blob).not.toContain("api.example.invalid");
+    // The destructive usage-queue endpoint is never probed (T8).
+    expect(seen.some((u) => u.includes("usage-queue"))).toBe(false);
+    assertNoReadModelLeak(s);
+  });
+
+  it("a 401 on api-key-usage fails closed: no rethrow, no strike, one warning, no further probe (T3)", async () => {
+    const s = store();
+    const { fetch, seen } = readModelFetch({ countsStatus: 401 });
+    const d = deps(s, fetch as unknown as typeof fetch);
+    d.config = configWithExtras({ apiKeyUsageEnabled: true });
+    const summary = await runSync(d, { running: false });
+    expect(summary.skipped).toBe(false);
+    expect(s.strike.failures).toEqual([]);
+    expect(s.strike.secretBad).toBe(false);
+    expect(s.strike.disabled).toBe(false);
+    expect(s.savedCounts).toEqual({
+      lanes: [],
+      fetchedAt: null,
+      note: expect.stringMatching(/paused until the next successful sync/),
+    });
+    expect(summary.errors.join(" ")).toMatch(/paused until the next successful sync/);
+    // Exactly one request-count probe this run.
+    expect(seen.filter((u) => u.includes("api-key-usage"))).toHaveLength(1);
+    assertNoKeyLeak(s);
+  });
+
+  it("email-shaped provider words are scrubbed from stored notes (T5)", async () => {
+    const s = store();
+    const { fetch } = readModelFetch({ countsBody: { "evil@example.com": "junk" } });
+    const d = deps(s, fetch as unknown as typeof fetch);
+    d.config = configWithExtras({ apiKeyUsageEnabled: true });
+    const summary = await runSync(d, { running: false });
+    expect(summary.skipped).toBe(false);
+    expect(s.savedCounts?.lanes).toEqual([]);
+    expect(s.savedCounts?.note).not.toBeNull();
+    expect(JSON.stringify([s.savedCounts, summary.errors])).not.toContain("evil@example.com");
     assertNoKeyLeak(s);
   });
 });

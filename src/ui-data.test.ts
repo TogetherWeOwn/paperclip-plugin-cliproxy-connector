@@ -534,3 +534,141 @@ describe("via provider API provenance", () => {
     expect(usage.providers[0]?.accounts[0]?.limits[0]?.viaProviderApi).toBe(true);
   });
 });
+
+describe("read-model sections (spend, usage, lane map, links)", () => {
+  function spendConfig() {
+    const { config, validation } = parseConfig({
+      cliproxyBaseUrl: "http://127.0.0.1:8317",
+      managementKeyHeader: "X-Test-Key",
+      managementSecretRef: { uid: "secret-1" },
+      openRouterSecretRef: { uid: "secret-or-1" },
+      apiKeyUsageEnabled: true,
+      providers: [{ provider: "claude", connectionId: "conn-claude", completeInventory: true }],
+      audienceConfirmed: true,
+    });
+    expect(validation.ok).toBe(true);
+    return config;
+  }
+
+  it("shows spend as not configured without a secret, and usage off by default", () => {
+    const usage = buildUsageData({ now: NOW, config: testConfig(), rows: {}, lastSync: null });
+    expect(usage.spend).toEqual({
+      configured: false,
+      totalCredits: null,
+      totalUsage: null,
+      remaining: null,
+      fetchedAt: null,
+      note: null,
+    });
+    expect(usage.usage.enabled).toBe(false);
+    expect(usage.usage.lanes).toEqual([]);
+    expect(usage.quotaFetchedAt).toBeNull();
+  });
+
+  it("projects the spend snapshot with remaining math and its timestamp", () => {
+    const usage = buildUsageData({
+      now: NOW,
+      config: spendConfig(),
+      rows: {},
+      lastSync: LAST_SYNC,
+      spend: {
+        data: { provider: "openrouter", totalCredits: 100, totalUsage: 37.5, fetchedAt: NOW },
+        note: null,
+      },
+    });
+    expect(usage.spend).toEqual({
+      configured: true,
+      totalCredits: 100,
+      totalUsage: 37.5,
+      remaining: 62.5,
+      fetchedAt: NOW,
+      note: null,
+    });
+    expect(usage.quotaFetchedAt).toBe(NOW);
+  });
+
+  it("carries a soft spend note with last-known figures instead of blanking", () => {
+    const usage = buildUsageData({
+      now: NOW,
+      config: spendConfig(),
+      rows: {},
+      lastSync: LAST_SYNC,
+      spend: {
+        data: { provider: "openrouter", totalCredits: 50, totalUsage: 10, fetchedAt: NOW },
+        note: "openrouter spend: unavailable this run; showing last-known.",
+      },
+    });
+    expect(usage.spend.configured).toBe(true);
+    expect(usage.spend.totalCredits).toBe(50);
+    expect(usage.spend.note).toMatch(/last-known/);
+  });
+
+  it("passes request-count lanes through with the fidelity note and timestamp", () => {
+    const lanes = [
+      { provider: "anthropic", success: 15, failed: 3, total: 18, recent: [], fetchedAt: NOW },
+    ];
+    const usage = buildUsageData({
+      now: NOW,
+      config: spendConfig(),
+      rows: {},
+      lastSync: LAST_SYNC,
+      counts: { lanes, fetchedAt: NOW, note: null },
+    });
+    expect(usage.usage.enabled).toBe(true);
+    expect(usage.usage.lanes).toEqual(lanes);
+    expect(usage.usage.fetchedAt).toBe(NOW);
+    expect(usage.usage.fidelityNote).toMatch(/Request counts only/);
+    expect(usage.usage.fidelityNote).toMatch(/No per-lane token split/);
+  });
+
+  it("flags the lane map as config-derived with its derivation date", () => {
+    const usage = buildUsageData({ now: NOW, config: testConfig(), rows: {}, lastSync: null });
+    expect(usage.laneMap.derivedAt).toBe("2026-11-01");
+    expect(usage.laneMap.flag).toMatch(/Config-derived mapping \(derived 2026-11-01\)/);
+    expect(usage.laneMap.flag).toMatch(/Not ledger data/);
+    expect(usage.laneMap.lanes).toEqual([
+      { lane: "wonder-full", agents: 7, provider: "anthropic", model: "opus" },
+      { lane: "spark", agents: 3, provider: "anthropic", model: "opus" },
+      { lane: "opus", agents: 2, provider: "anthropic", model: "opus" },
+    ]);
+  });
+
+  it("links out with literal native paths only", () => {
+    const usage = buildUsageData({ now: NOW, config: testConfig(), rows: {}, lastSync: null });
+    expect(usage.links).toEqual({ costsUrl: "/costs", budgetsUrl: "/budgets/overview" });
+  });
+
+  it("round-trips through JSON with no functions (T7 data-only builder)", () => {
+    const usage = buildUsageData({
+      now: NOW,
+      config: spendConfig(),
+      rows: {},
+      lastSync: LAST_SYNC,
+      spend: {
+        data: { provider: "openrouter", totalCredits: 100, totalUsage: 37.5, fetchedAt: NOW },
+        note: "note",
+      },
+      counts: {
+        lanes: [{ provider: "anthropic", success: 1, failed: 0, total: 1, recent: [], fetchedAt: NOW }],
+        fetchedAt: NOW,
+        note: null,
+      },
+    });
+    expect(JSON.parse(JSON.stringify(usage))).toEqual(usage);
+  });
+
+  it("carries no internal references or absolute URLs (no card ids, no host links)", () => {
+    const usage = buildUsageData({
+      now: NOW,
+      config: spendConfig(),
+      rows: {},
+      lastSync: { ...LAST_SYNC, errors: ["openrouter spend: unavailable this run; showing last-known."] },
+      spend: { data: null, note: "openrouter spend: unavailable this run; showing last-known." },
+      counts: { lanes: [], fetchedAt: null, note: null },
+    });
+    const blob = JSON.stringify(usage);
+    expect(blob).not.toMatch(/two-\d+/i);
+    expect(blob.toLowerCase()).not.toContain("paperclip");
+    expect(blob).not.toMatch(/https?:\/\//);
+  });
+});

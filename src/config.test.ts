@@ -215,6 +215,31 @@ describe("client API key secret_ref (/v1/models derivation)", () => {
   });
 });
 
+describe("read-model keys (OpenRouter spend, request counts)", () => {
+  it("leaves both unset by default: spend reads as not configured, counts stay off", () => {
+    const { config, validation } = parseConfig(base());
+    expect(validation.ok).toBe(true);
+    expect(config.openRouterSecretRef).toBeNull();
+    expect(config.apiKeyUsageEnabled).toBe(false);
+  });
+
+  it("accepts a dedicated OpenRouter secret_ref object; legacy strings fail closed", () => {
+    const good = parseConfig(base({ openRouterSecretRef: { uid: "secret-or-1" } }));
+    expect(good.validation.ok).toBe(true);
+    expect(good.config.openRouterSecretRef).toEqual({ uid: "secret-or-1" });
+    const bad = parseConfig(base({ openRouterSecretRef: "legacy-uuid" }));
+    expect(bad.validation.ok).toBe(false);
+    expect(bad.validation.errors.some((e) => e.includes("openRouterSecretRef"))).toBe(true);
+  });
+
+  it("accepts apiKeyUsageEnabled true; non-booleans fail closed", () => {
+    expect(parseConfig(base({ apiKeyUsageEnabled: true })).config.apiKeyUsageEnabled).toBe(true);
+    const bad = parseConfig(base({ apiKeyUsageEnabled: "yes" }));
+    expect(bad.validation.ok).toBe(false);
+    expect(bad.validation.errors.some((e) => e.includes("apiKeyUsageEnabled"))).toBe(true);
+  });
+});
+
 describe("security knobs (kept from v1)", () => {
   it("requires loopback base URL, explicit key header, and secret_ref object", () => {
     expect(parseConfig(base({ cliproxyBaseUrl: "https://x.example" })).validation.ok).toBe(false);

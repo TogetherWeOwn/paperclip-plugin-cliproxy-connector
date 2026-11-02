@@ -77,6 +77,43 @@ describe("construction and allow-list", () => {
     expect(fetch).not.toHaveBeenCalled();
   });
 
+  it("admits api-key-usage exactly, and refuses any query string", async () => {
+    const seen: string[] = [];
+    const fetch = vi.fn(async (url: string) => {
+      seen.push(url);
+      return json(200, {});
+    });
+    await client(fetch).getApiKeyUsage();
+    expect(seen).toEqual(["http://127.0.0.1:8317/v0/management/api-key-usage"]);
+    for (const path of [
+      "/v0/management/api-key-usage?limit=10",
+      "/v0/management/api-key-usage?auth_index=0",
+    ]) {
+      await expect(client(fetch).getJson(path)).rejects.toThrow(CliproxyConfigError);
+    }
+    // Percent-encoded spellings decode before the check, so the encoded exact
+    // path is the same pinned admission — not a bypass into something else.
+    // (The wire form keeps its encoding; the server decodes to the same path.)
+    await client(fetch).getJson("/v0/management/%61pi-key-usage");
+    expect(seen).toEqual([
+      "http://127.0.0.1:8317/v0/management/api-key-usage",
+      "http://127.0.0.1:8317/v0/management/%61pi-key-usage",
+    ]);
+  });
+
+  it("keeps refusing the usage-queue family while api-key-usage stays admitted", async () => {
+    const fetch = vi.fn(async () => json(200, {}));
+    for (const path of [
+      "/v0/management/usage-queue",
+      "/v0/management/usage-queues",
+      "/v0/management/api-key-usage-queue",
+      "/v0/management/usage",
+    ]) {
+      await expect(client(fetch).getJson(path)).rejects.toThrow(CliproxyConfigError);
+    }
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
   it("attaches the key header only after origin validation, and sends GET", async () => {
     let seen: { method?: string; headers?: Headers } = {};
     const fetch = vi.fn(async (_url: string, init?: RequestInit) => {

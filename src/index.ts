@@ -9,6 +9,11 @@ export type {
   DriftLedgerEntry,
   StrikeBudgetState,
   ModelOverlap,
+  ProviderSpend,
+  StoredSpend,
+  ProviderRequestCounts,
+  RequestBucket,
+  StoredRequestCounts,
 } from "./types.js";
 export {
   deriveProviderModels,
@@ -40,3 +45,12 @@ export {
   ACTIVITY_REMINDER_INTERVAL_MS,
 } from "./sync.js";
 export { parseConfig, effectiveReservePercent } from "./config.js";
+export {
+  fetchOpenRouterCredits,
+  parseOpenRouterCredits,
+  OPENROUTER_CREDITS_URL,
+  OPENROUTER_HOST,
+  OpenRouterBodyError,
+} from "./openrouter.js";
+export type { OpenRouterFetch } from "./openrouter.js";
+export { parseApiKeyUsage, RequestCountsBodyError } from "./request-counts.js";

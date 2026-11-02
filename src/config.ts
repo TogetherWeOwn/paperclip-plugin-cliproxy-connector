@@ -43,6 +43,22 @@ export interface ConnectorConfig {
    * a warning; quota aggregation still runs), required for full function.
    */
   clientApiKeySecretRef?: unknown;
+  /**
+   * Board `secret_ref` for the OpenRouter API key, used only for the
+   * read-only `GET <OPENROUTER_CREDITS_URL>` spend read (see
+   * `src/openrouter.ts`). A dedicated ref: never reuse a CLIProxy key for a
+   * public host. Resolved per run and never persisted. Optional: missing →
+   * the usage page shows "not configured", never an error.
+   */
+  openRouterSecretRef?: unknown;
+  /**
+   * Optional request-count sync: `GET /v0/management/api-key-usage` once per
+   * sync, aggregated by provider in the worker (composite `base_url|api_key`
+   * keys are discarded before any state write). Default off: the endpoint
+   * only observes `api_key` auths and OAuth lanes stay invisible, so counts
+   * are request-count fidelity for api-key lanes, never a token split.
+   */
+  apiKeyUsageEnabled?: boolean;
   /** Sync cadence in minutes. The cron job runs every 5; larger values skip. */
   syncIntervalMinutes: number;
   /** Default reserve: providers at or below this remaining % are not headroom. */
@@ -197,6 +213,22 @@ export function parseConfig(raw: unknown): { config: ConnectorConfig; validation
     );
   } else if (typeof r.clientApiKeySecretRef !== "object") {
     errors.push("clientApiKeySecretRef must be the secret_ref object shape; legacy string UUIDs fail closed.");
+  }
+  if (r.openRouterSecretRef !== undefined && r.openRouterSecretRef !== null) {
+    // Dedicated ref only: a CLIProxy key must never travel to a public host.
+    // Missing is a normal state (the page shows "not configured"), never an
+    // error — so no warning here either.
+    if (typeof r.openRouterSecretRef !== "object") {
+      errors.push("openRouterSecretRef must be the secret_ref object shape; legacy string UUIDs fail closed.");
+    }
+  }
+  let apiKeyUsageEnabled = false;
+  if (r.apiKeyUsageEnabled !== undefined && r.apiKeyUsageEnabled !== null) {
+    if (typeof r.apiKeyUsageEnabled !== "boolean") {
+      errors.push("apiKeyUsageEnabled must be a boolean; it defaults to false (request-count sync off).");
+    } else {
+      apiKeyUsageEnabled = r.apiKeyUsageEnabled;
+    }
   }
 
   const reservePercent = num(r.reservePercent, DEFAULTS.reservePercent);
@@ -372,6 +404,8 @@ export function parseConfig(raw: unknown): { config: ConnectorConfig; validation
     managementKeyHeader,
     managementSecretRef: r.managementSecretRef,
     clientApiKeySecretRef: r.clientApiKeySecretRef ?? null,
+    openRouterSecretRef: r.openRouterSecretRef ?? null,
+    apiKeyUsageEnabled,
     syncIntervalMinutes,
     reservePercent,
     perPoolReservePercent,

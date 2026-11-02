@@ -247,9 +247,11 @@ type UsageSortKey = "remaining" | "reset";
  * (`cliproxy-usage`); this page never triggers a live read, and the worker
  * never calls the destructive usage-queue endpoint.
  *
- * Request/token counters are intentionally absent: CLIProxy exposes no
- * read-only per-account counters, and the connector shows only what the
- * sync already caches.
+ * Read-model sections below the provider cards (spend, per-lane request
+ * counts, lane map, native cost links) come from the same cache via
+ * `cliproxy-usage`. Request counts are request-count fidelity for api-key
+ * lanes only (labelled "requests", never tokens); there is no per-lane token
+ * split from any lawful read-only source, and OAuth lanes stay invisible.
  */
 export function CliProxyUsagePage({ context }: PluginPageProps) {
   const companyId = useCompanyId(context);
@@ -327,6 +329,48 @@ export function CliProxyUsagePage({ context }: PluginPageProps) {
           Earliest known reset: {data.earliestReset} ({data.earliestResetIn})
         </div>
       )}
+      {data.quotaFetchedAt && <div>Quota windows fetched {data.quotaFetchedAt}.</div>}
+      <div style={{ border: "1px solid #444", borderRadius: 6, padding: 12 }}>
+        <strong>Provider spend (OpenRouter)</strong>
+        {!data.spend.configured && <div>not configured</div>}
+        {data.spend.configured && data.spend.totalCredits === null && <div>No spend data yet — run a sync.</div>}
+        {data.spend.configured && data.spend.totalCredits !== null && (
+          <div>
+            {data.spend.totalCredits} credits · {data.spend.totalUsage ?? "?"} used
+            {data.spend.remaining !== null ? ` · ${data.spend.remaining} remaining` : ""}
+          </div>
+        )}
+        {data.spend.fetchedAt && <div>Fetched {data.spend.fetchedAt}.</div>}
+        {data.spend.note && <div>{data.spend.note}</div>}
+      </div>
+      {data.usage.enabled && (
+        <div style={{ border: "1px solid #444", borderRadius: 6, padding: 12 }}>
+          <strong>Per-lane usage (requests, api-key lanes only)</strong>
+          {data.usage.lanes.length === 0 && <div>No request counts yet — run a sync.</div>}
+          {data.usage.lanes.map((lane) => (
+            <div key={lane.provider}>
+              {lane.provider}: {lane.total} requests ({lane.success} ok, {lane.failed} failed)
+            </div>
+          ))}
+          {data.usage.fetchedAt && <div>Fetched {data.usage.fetchedAt}.</div>}
+          <div style={{ fontSize: 12 }}>{data.usage.fidelityNote}</div>
+          {data.usage.note && <div>{data.usage.note}</div>}
+        </div>
+      )}
+      <div style={{ border: "1px solid #444", borderRadius: 6, padding: 12 }}>
+        <strong>Lane map</strong>
+        <div style={{ fontSize: 12 }}>{data.laneMap.flag}</div>
+        {data.laneMap.lanes.map((lane) => (
+          <div key={lane.lane}>
+            {lane.lane}: {lane.agents} agents → {lane.provider}/{lane.model}
+          </div>
+        ))}
+        <div>Derived {data.laneMap.derivedAt}.</div>
+      </div>
+      <div>
+        Native cost views: <a href={data.links.costsUrl}>Costs</a> ·{" "}
+        <a href={data.links.budgetsUrl}>Budgets</a>
+      </div>
       {data.providers.map((p) => (
         <div key={p.provider} style={{ border: "1px solid #444", borderRadius: 6, padding: 12 }}>
           <div style={{ display: "flex", gap: 8, alignItems: "center" }}>

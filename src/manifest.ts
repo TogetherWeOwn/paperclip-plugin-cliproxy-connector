@@ -15,6 +15,19 @@ export const STRIKE_STATE_KEY = "strike-budget";
 /** Latest sync failure (non-auth errors, unresolvable secrets). Never touches `last-sync`. */
 export const LAST_ERROR_STATE_KEY = "last-error";
 /**
+ * Last-known OpenRouter spend snapshot + soft failure note (see
+ * `StoredSpend`). Written only by the spend read, read only by the usage
+ * page builder. A failed fetch keeps the previous snapshot.
+ */
+export const SPEND_STATE_KEY = "provider-spend";
+/**
+ * Last-known per-provider request counts + soft failure note (see
+ * `StoredRequestCounts`). Aggregated by provider in the worker — composite
+ * `base_url|api_key` keys never reach this state. Written only by the
+ * request-count read, read only by the usage page builder.
+ */
+export const REQUEST_COUNTS_STATE_KEY = "request-counts";
+/**
  * Drift ledger for state-change activity logging: per drift key the first/last
  * seen times plus the last time it produced an activity row. New findings log
  * once, cleared findings log once, and persistent findings remind at most

@@ -20,8 +20,10 @@ import {
   LAST_SYNC_STATE_KEY,
   PAGE_DATA_KEY,
   REENABLE_ACTION_KEY,
+  REQUEST_COUNTS_STATE_KEY,
   RESYNC_ACTION_KEY,
   ROWS_STATE_KEY,
+  SPEND_STATE_KEY,
   STATE_NAMESPACE,
   STRIKE_STATE_KEY,
   SYNC_JOB_KEY,
@@ -40,6 +42,8 @@ import {
 import type {
   AccountUsageRow,
   DriftLedger,
+  StoredRequestCounts,
+  StoredSpend,
   StrikeBudgetState,
   SyncFailure,
   SyncSummary,
@@ -190,6 +194,35 @@ async function loadDriftLedger(ctx: PluginContext, companyId: string): Promise<D
   return null;
 }
 
+/**
+ * Last-known OpenRouter spend snapshot for the usage page. Null when no sync
+ * has stored one yet; shape-checked so a corrupt row reads as absent, never as
+ * spend data.
+ */
+async function loadSpend(ctx: PluginContext, companyId: string): Promise<StoredSpend | null> {
+  const raw = await ctx.state.get(key(companyId, SPEND_STATE_KEY));
+  if (raw !== null && typeof raw === "object" && !Array.isArray(raw)) {
+    return raw as StoredSpend;
+  }
+  return null;
+}
+
+/**
+ * Last-known per-provider request counts for the usage page. Aggregation
+ * (composite `base_url|api_key` keys dropped) happens in the sync before this
+ * state is written, so loads here structurally cannot see key material.
+ */
+async function loadRequestCounts(
+  ctx: PluginContext,
+  companyId: string,
+): Promise<StoredRequestCounts | null> {
+  const raw = await ctx.state.get(key(companyId, REQUEST_COUNTS_STATE_KEY));
+  if (raw !== null && typeof raw === "object" && !Array.isArray(raw)) {
+    return raw as StoredRequestCounts;
+  }
+  return null;
+}
+
 async function resolveCompany(
   ctx: PluginContext,
   companyId: string,
@@ -237,12 +270,22 @@ const plugin = definePlugin({
     ctx.data.register(USAGE_DATA_KEY, async (params) => {
       const companyId = String((params as Record<string, unknown>).companyId ?? "");
       const config = await resolveCompany(ctx, companyId).then((r) => r.config);
-      const [rows, lastSync, lastFailure] = await Promise.all([
+      const [rows, lastSync, lastFailure, spend, counts] = await Promise.all([
         loadRows(ctx, companyId),
         loadLastSync(ctx, companyId),
         loadLastFailure(ctx, companyId),
+        loadSpend(ctx, companyId),
+        loadRequestCounts(ctx, companyId),
       ]);
-      return buildUsageData({ now: new Date().toISOString(), config, rows, lastSync, lastFailure });
+      return buildUsageData({
+        now: new Date().toISOString(),
+        config,
+        rows,
+        lastSync,
+        lastFailure,
+        spend,
+        counts,
+      });
     });
     ctx.data.register(WIDGET_DATA_KEY, async (params) => {
       const companyId = String((params as Record<string, unknown>).companyId ?? "");
@@ -389,6 +432,18 @@ async function runCompanySync(
       // Same per-run, never-persisted rule as the management key: both
       // secrets resolve inside the sync run and live in memory only.
       resolveClientSecret: (ref) => ctx.secrets.resolve(ref as never, { companyId }),
+      // Public egress for the OpenRouter credits read only (fixed endpoint
+      // constant in `openrouter.ts`; the secret travels as its `Authorization`
+      // header). Omitted → the spend read is skipped, same as unconfigured.
+      httpFetch: (url, init) => ctx.http.fetch(url, init),
+      loadSpend: () => loadSpend(ctx, companyId),
+      saveSpend: async (s) => {
+        await ctx.state.set(key(companyId, SPEND_STATE_KEY), s);
+      },
+      loadRequestCounts: () => loadRequestCounts(ctx, companyId),
+      saveRequestCounts: async (s) => {
+        await ctx.state.set(key(companyId, REQUEST_COUNTS_STATE_KEY), s);
+      },
       // Worker-local loopback transport, not `ctx.http.fetch`: the host runs
       // every plugin fetch through its SSRF guard, which refuses loopback —
       // but this plugin requires a loopback `cliproxyBaseUrl`, so the host

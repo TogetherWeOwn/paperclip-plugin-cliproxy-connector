@@ -40,6 +40,17 @@ export const AUTH_FILES_PATH = "/v0/management/auth-files";
 const PLUGIN_QUOTA_SHAPE = /^\/v0\/management\/plugins\/[A-Za-z0-9][A-Za-z0-9_-]*\/quota$/;
 
 /**
+ * Pinned request-count shape: `GET /v0/management/api-key-usage` (v8:
+ * `/observability/usage/api-keys`, same handler — the v0 path stays the only
+ * admitted one). Per-provider request counts (success/failed + recent
+ * buckets) for `api_key` auths, keyed `base_url|api_key`. The worker
+ * aggregates by provider and discards the composite keys before any state
+ * write (see `src/request-counts.ts`, threat T1). Query strings are refused:
+ * the endpoint takes no parameters.
+ */
+export const API_KEY_USAGE_PATH = "/v0/management/api-key-usage";
+
+/**
  * Pinned `api-call` management path. POST-only, and only reachable
  * through `postApiCall` with one of the frozen templates below — the
  * GET allow-list (`assertAllowListed`) still refuses this path outright.
@@ -490,6 +501,15 @@ function assertAllowListed(url: URL, what: string): void {
     }
     return;
   }
+  if (pathname === API_KEY_USAGE_PATH) {
+    // Pinned request-count shape: no query string (the endpoint takes no
+    // parameters). Anything else — including a smuggled query that could
+    // alter the read — rejects before any network happens.
+    if ([...url.searchParams.keys()].length > 0) {
+      throw new CliproxyConfigError(`api-key-usage request carries no query string (${what})`);
+    }
+    return;
+  }
   if (pathname !== AUTH_FILES_PATH) {
     throw new CliproxyConfigError(`path is outside the pinned GET allow-list: ${pathname}`);
   }
@@ -742,6 +762,17 @@ export class CliproxyManagementClient {
     // pinned shape. Anything else rejects before any network happens.
     // (`async` so the validation throw surfaces as a rejection.)
     return this.getJson(authFileModelsPath(name));
+  }
+
+  /**
+   * GET the per-provider request counts (`api-key` auths only). No query
+   * string: the pinned shape above refuses parameters before any network
+   * happens. Best-effort like every quota read — the caller decides auth
+   * handling (401/403 on this endpoint warns and skips without spending
+   * strikes; see the sync's fail-closed request-count path).
+   */
+  async getApiKeyUsage(): Promise<unknown> {
+    return this.getJson(API_KEY_USAGE_PATH);
   }
 
   /**

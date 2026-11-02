@@ -37,13 +37,23 @@ import {
   parseModelsPayload,
   type ServedModel,
 } from "./models.js";
-import { hasAntigravityQuotaGroups, hashIdentity, parseAuthFiles, type ParsedAccount } from "./parsers.js";
+import { fetchOpenRouterCredits, type OpenRouterFetch } from "./openrouter.js";
+import {
+  hasAntigravityQuotaGroups,
+  hashIdentity,
+  parseAuthFiles,
+  sanitizeStatusMessage,
+  type ParsedAccount,
+} from "./parsers.js";
+import { parseApiKeyUsage } from "./request-counts.js";
 import type {
   AccountUsageRow,
   DriftFinding,
   DriftLedger,
   DriftLedgerEntry,
   ModelOverlap,
+  StoredRequestCounts,
+  StoredSpend,
   StrikeBudgetState,
   SyncFailure,
   SyncSummary,
@@ -171,7 +181,19 @@ export interface SyncDeps {
    * `GET /v1/models` only. Per run, memory only, same as the management key.
    */
   resolveClientSecret: (ref: unknown) => Promise<string>;
+  /**
+   * Host outbound fetch for the OpenRouter credits read. Omitted in unit
+   * tests that do not cover spend (the read is skipped without it, exactly
+   * like a missing secret ref). The worker passes `ctx.http.fetch`.
+   */
+  httpFetch?: OpenRouterFetch;
   fetchImpl?: ManagementFetch;
+  /** Last-known spend snapshot + soft note (own state key, never quota rows). */
+  loadSpend: () => Promise<StoredSpend | null>;
+  saveSpend: (s: StoredSpend) => Promise<void>;
+  /** Last-known request-count aggregates + soft note (own state key). */
+  loadRequestCounts: () => Promise<StoredRequestCounts | null>;
+  saveRequestCounts: (s: StoredRequestCounts) => Promise<void>;
   loadStrike: () => Promise<StrikeBudgetState>;
   saveStrike: (s: StrikeBudgetState) => Promise<void>;
   loadRows: () => Promise<Record<string, AccountUsageRow>>;
@@ -790,7 +812,22 @@ export async function runSync(deps: SyncDeps, inFlight: { running: boolean }): P
         }
       }
 
-      const errors = [...pluginErrors, ...warnings, ...servedSets.warnings, ...catalog.warnings, ...derivation.warnings];
+      // Provider-side read-model extras (usage page only — never ledger,
+      // routing, or quota verdicts). Both ride the sync cadence, at most one
+      // fetch each per run, and both fail soft: the last-known snapshot stays
+      // and a scrubbed note joins the warnings so the page shows stale data
+      // with its timestamp instead of fresh-looking emptiness (T9).
+      const { spendNote, countsNote } = await syncReadModelExtras(deps, client);
+
+      const errors = [
+        ...pluginErrors,
+        ...warnings,
+        ...servedSets.warnings,
+        ...catalog.warnings,
+        ...derivation.warnings,
+        ...(spendNote ? [spendNote] : []),
+        ...(countsNote ? [countsNote] : []),
+      ];
       const providerModels: Record<string, string[]> | undefined =
         catalog.available ? derivation.providerModels : undefined;
       const modelOverlaps: ModelOverlap[] | undefined =
@@ -1042,6 +1079,136 @@ async function fetchModelCatalog(
 }
 
 /**
+ * Scrub parser warnings before they reach persisted state: each warning is
+ * sanitized like a status note (emails and credential-like tokens redacted)
+ * and empty results are dropped. Returns null when nothing survives.
+ */
+export function scrubWarnings(warnings: string[]): string | null {
+  const cleaned = warnings
+    .map((w) => sanitizeStatusMessage(w))
+    .filter((w): w is string => typeof w === "string" && w.length > 0);
+  return cleaned.length > 0 ? cleaned.join(" | ") : null;
+}
+
+/**
+ * Provider-side read-model extras for the usage page: OpenRouter spend and
+ * CLIProxy request counts. Both are page-only (never ledger, routing, or
+ * quota verdicts), at most one fetch each per sync run, and both fail soft —
+ * the last-known snapshot is kept and a scrubbed note is returned for the
+ * run's warnings, so the page shows stale data with its timestamp (T9).
+ */
+async function syncReadModelExtras(
+  deps: SyncDeps,
+  client: CliproxyManagementClient,
+): Promise<{ spendNote: string | null; countsNote: string | null }> {
+  return {
+    spendNote: await syncSpend(deps),
+    countsNote: await syncRequestCounts(deps, client),
+  };
+}
+
+/**
+ * OpenRouter credits read. Unconfigured (no ref) → untouched state, no note:
+ * the page shows "not configured", never an error. Any failure keeps the
+ * last-known snapshot and records a scrubbed note. The secret is resolved
+ * per run, travels only as the `Authorization` header to the fixed endpoint
+ * constant, and never reaches persisted state (redaction asserted in tests).
+ */
+async function syncSpend(deps: SyncDeps): Promise<string | null> {
+  const ref = deps.config.openRouterSecretRef;
+  if (ref === undefined || ref === null) return null;
+  if (!deps.httpFetch) return null;
+  const prev = await deps.loadSpend().catch(() => null);
+  const keep = async (note: string | null) => {
+    await deps.saveSpend({ data: prev?.data ?? null, note });
+  };
+  let secret = "";
+  try {
+    secret = await deps.resolveSecret(ref);
+  } catch (err) {
+    const note = scrubWarnings([
+      `openrouter spend: could not resolve the OpenRouter secret (${err instanceof Error ? err.message : "unknown error"}); showing last-known.`,
+    ]);
+    await keep(note);
+    return note;
+  }
+  if (!secret) {
+    const note = "openrouter spend: OpenRouter secret resolved empty; showing last-known.";
+    await keep(note);
+    return note;
+  }
+  try {
+    const data = await fetchOpenRouterCredits({ httpFetch: deps.httpFetch, secret, fetchedAt: deps.now });
+    await deps.saveSpend({ data, note: null });
+    return null;
+  } catch (err) {
+    // Defense-in-depth before storage: the message never interpolates the
+    // secret, but a transport error could theoretically echo request detail —
+    // so the live value is split out first, then the scrubber runs.
+    const raw = err instanceof Error ? err.message : "fetch failed";
+    const note = scrubWarnings([`openrouter spend: ${raw.split(secret).join("[redacted]")}; showing last-known.`]);
+    await keep(note);
+    return note;
+  } finally {
+    secret = "";
+  }
+}
+
+/**
+ * CLIProxy request-count read (optional, default off). The payload's
+ * composite `base_url|api_key` keys are aggregated by provider in the worker
+ * and discarded before any state write — stored lanes carry provider words
+ * and counts only (T1). Auth rejections fail closed WITHOUT spending strikes
+ * or stopping the run (the management key already proved good against
+ * `auth-files` this run): one warning, no further request-count probes until
+ * the next successful sync (T3). Anything else warns per run and keeps the
+ * last-known aggregates.
+ */
+async function syncRequestCounts(
+  deps: SyncDeps,
+  client: CliproxyManagementClient,
+): Promise<string | null> {
+  if (!deps.config.apiKeyUsageEnabled) return null;
+  const prev = await deps.loadRequestCounts().catch(() => null);
+  const keep = async (note: string | null) => {
+    await deps.saveRequestCounts({
+      lanes: prev?.lanes ?? [],
+      fetchedAt: prev?.fetchedAt ?? null,
+      note,
+    });
+  };
+  let payload: unknown;
+  try {
+    payload = await client.getApiKeyUsage();
+  } catch (err) {
+    if (err instanceof CliproxyAuthError) {
+      const note =
+        `request counts: CLIProxy rejected the key on api-key-usage (HTTP ${err.status}); ` +
+        `request-count sync paused until the next successful sync. No probe beyond this run.`;
+      await keep(note);
+      return note;
+    }
+    const raw = err instanceof Error ? err.message : "fetch failed";
+    // Client messages are pathname-only and the path builder omits values,
+    // so this scrub is defense-in-depth (same rule as the served-set fetch).
+    const note = scrubWarnings([`request counts: unavailable this run (${raw}); showing last-known.`]);
+    await keep(note);
+    return note;
+  }
+  try {
+    const { lanes, warnings } = parseApiKeyUsage(payload, deps.now);
+    const note = warnings.length > 0 ? scrubWarnings(warnings) : null;
+    await deps.saveRequestCounts({ lanes, fetchedAt: deps.now, note });
+    return note;
+  } catch (err) {
+    const raw = err instanceof Error ? err.message : "fetch failed";
+    const note = scrubWarnings([`request counts: unreadable payload (${raw}); showing last-known.`]);
+    await keep(note);
+    return note;
+  }
+}
+
+/**
  * Turn parsed accounts (keyed by stable row key) into cache rows + per-
  * provider drift findings. Exported so route-level regression tests run the
  * real sync mapping instead of hand-built rows.
@@ -1079,7 +1246,10 @@ export function accountsToRows(
       quotaBlind: a.quotaBlind,
       quotaBlindReason: a.quotaBlindReason,
       accountHash: a.accountHash,
-      lastError: a.parseWarnings.length > 0 ? a.parseWarnings.join(" | ") : null,
+      // Resolved open check: parse warnings can carry upstream-shaped text
+      // (window names, plan labels), so every warning is scrubbed like a
+      // status note BEFORE storage — `lastError` never holds key material.
+      lastError: scrubWarnings(a.parseWarnings),
       coolingDown: a.coolingDown,
       cooldownUntil: a.cooldownUntil,
     };
