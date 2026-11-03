@@ -98,13 +98,15 @@ function StateBadge({ state }: { state: string }) {
 /** Paid-credits line for one account (Codex `x-codex-credits-*`), or null. */
 function creditsText(credits: ProviderAccountDetail["credits"]): string | null {
   if (!credits) return null;
-  const state = credits.unlimited
-    ? "unlimited"
-    : credits.hasCredits === true
-      ? "available"
-      : credits.hasCredits === false
-        ? "none left"
-        : "unknown";
+  // Same rule as the routing verdict (`positive`): has-credits false or a
+  // balance of 0 or less is none left, whatever the other headers say.
+  const state = credits.positive
+    ? credits.unlimited
+      ? "unlimited"
+      : "available"
+    : credits.hasCredits === false || (credits.balance !== null && credits.balance <= 0)
+      ? "none left"
+      : "unknown";
   const balance = credits.balance !== null ? ` · balance ${credits.balance}` : "";
   const seen = credits.observedAt ? ` · seen ${credits.observedAt}` : "";
   return `credits ${state}${balance}${seen}`;

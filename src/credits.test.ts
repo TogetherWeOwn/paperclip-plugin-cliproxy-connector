@@ -174,6 +174,36 @@ describe("parseAuthFiles: credits ride on the account row", () => {
     expect(accounts[0]?.credits).toEqual({ hasCredits: true, unlimited: null, balance: 12, observedAt: NOW });
   });
 
+  it("never stamps an undated reading with the fetch time; a dated one replaces it", () => {
+    const undatedOnly = parseAuthFiles(
+      [
+        {
+          id: "REDACTED-CODEX-UNDATED",
+          provider: "codex",
+          quota: { signals: { "x-codex-credits-has-credits": "true", "x-codex-credits-balance": "5" } },
+        },
+      ],
+      { now: NOW, allowLists: DEFAULT_PROVIDER_WINDOWS },
+    );
+    expect(undatedOnly.accounts[0]?.credits).toMatchObject({ hasCredits: true, balance: 5, observedAt: null });
+
+    const older = iso(NOW_MS - 10 * 60_000);
+    const mixed = parseAuthFiles(
+      [
+        {
+          id: "REDACTED-CODEX-MIXED",
+          provider: "codex",
+          quota: { signals: { "x-codex-credits-has-credits": "true", "x-codex-credits-balance": "5" } },
+          model_quotas: {
+            "gpt-6.1-sol": { observed_at: older, signals: { "x-codex-credits-has-credits": "false" } },
+          },
+        },
+      ],
+      { now: NOW, allowLists: DEFAULT_PROVIDER_WINDOWS },
+    );
+    expect(mixed.accounts[0]?.credits).toMatchObject({ hasCredits: false, observedAt: older });
+  });
+
   it("drops credits on disabled accounts", () => {
     const { accounts } = parseAuthFiles(
       [
@@ -252,6 +282,13 @@ describe("aggregate: window-exhausted plus credits-available", () => {
     );
     expect(a.state).toBe("unknown");
     expect(a.headroomAccounts).toBe(0);
+  });
+
+  it("an undated credits reading is unknown, never fresh headroom", () => {
+    const a = assess([row({ credits: credits({ observedAt: null }) })], true);
+    expect(a.state).toBe("unknown");
+    expect(a.headroomAccounts).toBe(0);
+    expect(a.creditHeadroomAccounts).toBe(0);
   });
 
   it("credits never cover a 429 quota cooldown", () => {

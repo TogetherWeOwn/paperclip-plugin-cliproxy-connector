@@ -2223,8 +2223,14 @@ export function parseAuthFiles(
       limits.push(...stampLimits(parsed.limits, input.observed, opts.now));
       if (!planType && parsed.planType) planType = parsed.planType;
       if (parsed.credits) {
-        const reading = { ...parsed.credits, observedAt: parsed.credits.observedAt ?? opts.now };
-        if (!credits || Date.parse(reading.observedAt) > Date.parse(credits.observedAt ?? "")) credits = reading;
+        // Unlike quota windows, an undated credits reading is never stamped
+        // with the fetch time: re-listing the same snapshot does not prove
+        // the balance still exists, so it stays undated (never fresh
+        // headroom) and any dated reading replaces it.
+        const reading = parsed.credits;
+        const readingMs = reading.observedAt ? Date.parse(reading.observedAt) : Number.NEGATIVE_INFINITY;
+        const currentMs = credits?.observedAt ? Date.parse(credits.observedAt) : Number.NEGATIVE_INFINITY;
+        if (!credits || readingMs > currentMs) credits = reading;
       }
     }
 

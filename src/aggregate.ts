@@ -257,7 +257,12 @@ function assessAccount(
     // carries the verdict (some window is covered): unknown, never out —
     // nothing bounds a wait on a balance. With nothing covered the windows
     // decide below, so a stale reading never vetoes fresh window headroom.
-    const creditsAge = windowObservationAgeMs(row.credits?.observedAt, row.checkedAt, nowMs, futureSkewMs);
+    // An undated reading is stale: the row fetch time proves nothing about
+    // the balance.
+    const creditsObservedAt = row.credits?.observedAt ?? null;
+    const creditsAge = creditsObservedAt
+      ? windowObservationAgeMs(creditsObservedAt, row.checkedAt, nowMs, futureSkewMs)
+      : null;
     if (creditsAge !== null && creditsAge <= maxAge) return { kind: "headroom", viaCredits: covered.length > 0 };
     if (covered.length > 0) {
       return { kind: "unknown", reason: "paid credits cover the quota windows but the credits reading is stale; unknown." };
