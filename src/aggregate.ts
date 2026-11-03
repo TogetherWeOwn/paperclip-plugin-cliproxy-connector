@@ -18,6 +18,14 @@
  *   rechecks at the recheck cadence instead of sleeping past a distant reset.
  * - `unknown` otherwise, including stale data and zero visible accounts.
  *   Never claims headroom.
+ * - Paid credits (TWO-2107, opt-in per provider row via
+ *   `creditsCountAsHeadroom`): a positive credits reading covers the
+ *   account's limiting quota windows, because the upstream keeps serving
+ *   from the balance. A fresh reading is headroom; a stale one is `unknown`
+ *   (fail open, never wait on a window the balance pays past). Credits never
+ *   cover a 429 cooldown, a `retry-after` watermark or an unavailable
+ *   account, and `has-credits: false` or a non-positive balance covers
+ *   nothing.
  *
  * Two ages (inherited from the v1 router): cache age (row `checkedAt`, the
  * sync fetch time) tells whether sync is alive — an expired cache is
@@ -30,7 +38,7 @@
 
 import { effectiveReservePercent, graceMs, maxAgeMs, type ConnectorConfig } from "./config.js";
 import { hasAdmissionSignal, namespaceMatchesProvider, normalizeProvider } from "./parsers.js";
-import type { AccountUsageRow, Freshness, ProviderState, UsageLimitRow } from "./types.js";
+import type { AccountUsageRow, CreditsReading, Freshness, ProviderState, UsageLimitRow } from "./types.js";
 
 export interface ProviderAssessment {
   provider: string;
@@ -45,6 +53,8 @@ export interface ProviderAssessment {
   waitResumeOff: boolean;
   enabledAccounts: number;
   headroomAccounts: number;
+  /** Headroom accounts whose headroom comes from paid credits (TWO-2107). */
+  creditHeadroomAccounts: number;
   /** Human reason; always non-empty. */
   reason: string;
 }
@@ -132,8 +142,30 @@ function windowAppliesToModel(window: UsageLimitRow, model: string | null, provi
   });
 }
 
+/**
+ * True when a credits reading says the upstream keeps serving from a paid
+ * balance: `unlimited`, or `has-credits: true` with a positive (or absent)
+ * balance. `has-credits: false` or a non-positive balance is never cover.
+ */
+export function creditsPositive(credits: CreditsReading | null | undefined): boolean {
+  if (!credits) return false;
+  if (credits.hasCredits === false) return false;
+  if (credits.unlimited === true) return true;
+  if (credits.hasCredits !== true) return false;
+  return credits.balance === null || credits.balance > 0;
+}
+
+/**
+ * Windows a positive credits balance can cover: quota windows only. A 429
+ * cooldown or a `retry-after` watermark means the upstream refused traffic,
+ * credits or not, so those always keep gating.
+ */
+function creditCoverable(w: UsageLimitRow): boolean {
+  return !w.id.endsWith(":retry-after") && !w.id.includes(":quota-cooldown");
+}
+
 type AccountVerdict =
-  | { kind: "headroom" }
+  | { kind: "headroom"; viaCredits?: boolean }
   | { kind: "out"; resets: string[] }
   | { kind: "unknown"; reason: string };
 
@@ -145,6 +177,7 @@ function assessAccount(
   maxAge: number,
   grace: number,
   futureSkewMs: number,
+  creditsCover: boolean,
 ): AccountVerdict {
   // Cooling with a future recovery time is positively out whatever the
   // windows say; an unavailable account with no future recovery is still
@@ -168,6 +201,7 @@ function assessAccount(
   const admission = hasAdmissionSignal(normalizeProvider(row.provider));
   const limiting: string[] = [];
   const unknownWindows: string[] = [];
+  const covered: string[] = [];
   let headroom = false;
   for (const w of applicable) {
     const resetMs = w.resetsAt ? parseTime(w.resetsAt) : null;
@@ -178,6 +212,10 @@ function assessAccount(
       if (w.allowed === null && !admission) return "unknown";
       return "unknown";
     })();
+    if (verdict === "limiting" && creditsCover && creditCoverable(w)) {
+      covered.push(w.id);
+      continue;
+    }
     if (verdict === "limiting" && resetMs !== null) {
       if (resetMs > nowMs) {
         // Exhausted with a future reset: still true whatever the observation
@@ -213,6 +251,14 @@ function assessAccount(
   }
 
   if (limiting.length > 0) return { kind: "out", resets: [] };
+  if (creditsCover) {
+    // The balance pays past every quota window, so the credits reading is
+    // the evidence: fresh is headroom whatever the windows say, stale is
+    // unknown (never out — nothing bounds a wait on a balance).
+    const creditsAge = windowObservationAgeMs(row.credits?.observedAt, row.checkedAt, nowMs, futureSkewMs);
+    if (creditsAge !== null && creditsAge <= maxAge) return { kind: "headroom", viaCredits: covered.length > 0 };
+    return { kind: "unknown", reason: "paid credits cover the quota windows but the credits reading is stale; unknown." };
+  }
   // Positive headroom requires fresh evidence on EVERY applicable window: a
   // single unknown window (missing or stale telemetry) vetoes headroom, or a
   // healthy 5h reading would mask an exhausted 7d window.
@@ -227,6 +273,8 @@ export function aggregateProvider(args: {
   model: string | null;
   rows: AccountUsageRow[];
   completeInventory: boolean;
+  /** Provider row opt-in: positive paid credits count as headroom (TWO-2107). */
+  creditsCountAsHeadroom?: boolean;
   config: ConnectorConfig;
   now: string;
   poolId?: string;
@@ -256,6 +304,7 @@ export function aggregateProvider(args: {
       waitResumeOff,
       enabledAccounts: 0,
       headroomAccounts: 0,
+      creditHeadroomAccounts: 0,
       reason: `no enabled ${provider} accounts in the sync cache; unknown (never headroom).`,
     };
   }
@@ -275,6 +324,7 @@ export function aggregateProvider(args: {
       waitResumeOff,
       enabledAccounts: enabled.length,
       headroomAccounts: 0,
+      creditHeadroomAccounts: 0,
       reason: `telemetry for ${provider} has no usable fetch time; unknown.`,
     };
   }
@@ -290,11 +340,13 @@ export function aggregateProvider(args: {
       waitResumeOff,
       enabledAccounts: enabled.length,
       headroomAccounts: 0,
+      creditHeadroomAccounts: 0,
       reason: `telemetry for ${provider} is beyond the grace window; unknown (never headroom).`,
     };
   }
 
   let headroomAccounts = 0;
+  let creditHeadroomAccounts = 0;
   // Per-account recovery bounds: an account recovers only when ALL of its
   // limiting windows clear, so its bound is the LATEST required reset (not the
   // earliest). The provider wakes when the FIRST account may have recovered,
@@ -302,9 +354,11 @@ export function aggregateProvider(args: {
   const perAccountBounds: number[] = [];
   let allOut = true;
   for (const row of enabled) {
-    const verdict = assessAccount(row, model, nowMs, reserve, maxAge, grace, futureSkewMs);
+    const creditsCover = args.creditsCountAsHeadroom === true && creditsPositive(row.credits);
+    const verdict = assessAccount(row, model, nowMs, reserve, maxAge, grace, futureSkewMs, creditsCover);
     if (verdict.kind === "headroom") {
       headroomAccounts += 1;
+      if (verdict.viaCredits) creditHeadroomAccounts += 1;
       allOut = false;
     } else if (verdict.kind === "out") {
       const bounds: number[] = [];
@@ -315,6 +369,9 @@ export function aggregateProvider(args: {
       let hasUnboundedLimiting = false;
       for (const w of row.limits) {
         if (!w.gating || !windowAppliesToModel(w, model, provider)) continue;
+        // Covered windows never bound the wait: only the uncovered ones
+        // (429 cooldown, retry-after) put this account out.
+        if (creditsCover && creditCoverable(w)) continue;
         const resetMs = w.resetsAt ? parseTime(w.resetsAt) : null;
         // Any limiting signal counts, including low-remaining windows whose
         // `allowed` is still true: the account cannot route until they clear.
@@ -353,7 +410,8 @@ export function aggregateProvider(args: {
       waitResumeOff,
       enabledAccounts: enabled.length,
       headroomAccounts,
-      reason: `${headroomAccounts}/${enabled.length} enabled ${provider} account(s) show fresh headroom${model ? ` for model ${model}` : ""}.`,
+      creditHeadroomAccounts,
+      reason: `${headroomAccounts}/${enabled.length} enabled ${provider} account(s) show fresh headroom${model ? ` for model ${model}` : ""}${creditHeadroomAccounts > 0 ? ` (${creditHeadroomAccounts} on paid credits past exhausted quota windows)` : ""}.`,
     };
   }
   if (allOut && args.completeInventory) {
@@ -374,6 +432,7 @@ export function aggregateProvider(args: {
       waitResumeOff: false,
       enabledAccounts: enabled.length,
       headroomAccounts: 0,
+      creditHeadroomAccounts: 0,
       reason: `every enabled ${provider} account is positively out${model ? ` for model ${model}` : ""}; retry at ${retryAt}.`,
     };
   }
@@ -386,6 +445,7 @@ export function aggregateProvider(args: {
     waitResumeOff,
     enabledAccounts: enabled.length,
     headroomAccounts: 0,
+    creditHeadroomAccounts: 0,
     reason: allOut
       ? `every enabled ${provider} account is out, but inventory is not confirmed complete; unknown (wait/resume off).`
       : `no enabled ${provider} account shows fresh headroom${model ? ` for model ${model}` : ""}; unknown.`,

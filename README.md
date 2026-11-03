@@ -144,7 +144,10 @@ The plugin ships two pages over the same sync cache:
   never count toward the badge); plus a filterable (provider, status, blind-only)
   and sortable (remaining %, reset — unknowns last) per-account table showing the
   masked account label (`acct-<13 shown>…`, full key never rendered), plan, priority,
-  status, cooldown countdown, per-window bars and the display-only `metrics`.
+  status, cooldown countdown, per-window bars and the display-only `metrics`. Codex
+  accounts that report credits show the credit state (available, unlimited, none left),
+  balance and observation time; provider rows with `creditsCountAsHeadroom` say so and
+  count the accounts routing on credits.
   `summary[]` text is scrubbed like status notes (emails and credential-like tokens
   redacted) before it reaches the page. Both pages are
   read-only over already synced state; the connector never calls the destructive
@@ -191,7 +194,7 @@ The plugin ships two pages over the same sync cache:
 | `perPoolReservePercent` | `{}` | Per-pool override, wins over everything. |
 | `recheckSeconds` | `60` | Wait before re-probing unknown/stale telemetry. |
 | `maxAgeMultiplier` / `graceMultiplier` | `2` / `3` | Freshness = sync interval × 2; grace = freshness × 3. |
-| `providers` | `[]` | One `{ provider, connectionId, completeInventory }` row per CLIProxy provider family. The provider word is the raw auth-file string (e.g. `cloudflare-workers-ai`); any string is accepted, duplicates error, and a row that matches no accounts drift-warns as having zero enabled accounts. Empty warns. |
+| `providers` | `[]` | One `{ provider, connectionId, completeInventory }` row per CLIProxy provider family. The provider word is the raw auth-file string (e.g. `cloudflare-workers-ai`); any string is accepted, duplicates error, and a row that matches no accounts drift-warns as having zero enabled accounts. Empty warns. Optional `creditsCountAsHeadroom: true` (default off) lets a fresh positive Codex credits reading (`x-codex-credits-has-credits: true` with a positive or absent `x-codex-credits-balance`, or `x-codex-credits-unlimited: true`) count as headroom while quota windows are exhausted, for providers where the owner allows credit spend. `has-credits: false` or a non-positive balance blocks again; a 429 cooldown, `retry-after` or an unavailable account still gates; a stale reading is `unknown` (fail open). Only `codex` reports credits; other providers warn. |
 | `providerWindows` | spike matrix §2 | Per-provider gating-window allow-lists (lowercased substrings). Includes Devin `daily`/`weekly` alongside `5h`. |
 | `pluginQuotaIds` | `{}` | CLIProxy plugin id per provider for quota fetch. Wins over `quota_plugin_id` discovery from the `auth-files` list. Fetched per auth file with its `auth_index` (v8.0.49+); entries without one keep one provider-level fetch. |
 | `apiCallEnabled` | `{}` (on for `antigravity`/`devin`/`meta`, off otherwise) | Per-provider kill switch for the pinned live `api-call` rounds (`{"antigravity": false}` disables all credential-bearing provider-API calls for that family). Upstream 401/403 already backs an account off for 1 hour; this switch is the manual off-ramp. |

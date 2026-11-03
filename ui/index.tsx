@@ -95,6 +95,27 @@ function StateBadge({ state }: { state: string }) {
   return <span style={{ ...tone, borderRadius: 4, padding: "1px 6px", fontSize: 12 }}>{state}</span>;
 }
 
+/** Paid-credits line for one account (Codex `x-codex-credits-*`), or null. */
+function creditsText(credits: ProviderAccountDetail["credits"]): string | null {
+  if (!credits) return null;
+  const state = credits.unlimited
+    ? "unlimited"
+    : credits.hasCredits === true
+      ? "available"
+      : credits.hasCredits === false
+        ? "none left"
+        : "unknown";
+  const balance = credits.balance !== null ? ` · balance ${credits.balance}` : "";
+  const seen = credits.observedAt ? ` · seen ${credits.observedAt}` : "";
+  return `credits ${state}${balance}${seen}`;
+}
+
+/** Provider-row note for the credits opt-in, or null when it is off. */
+function creditsPolicyText(p: { creditsCountAsHeadroom: boolean; creditHeadroomAccounts: number }): string | null {
+  if (!p.creditsCountAsHeadroom) return null;
+  return `paid credits count as headroom${p.creditHeadroomAccounts > 0 ? ` (${p.creditHeadroomAccounts} account${p.creditHeadroomAccounts === 1 ? "" : "s"} routing on credits)` : ""}`;
+}
+
 export function CliProxyPage({ context }: PluginPageProps) {
   const companyId = useCompanyId(context);
   const { data, loading, error, refresh } = usePluginData<PageData>("cliproxy-page", { companyId });
@@ -228,6 +249,7 @@ export function CliProxyPage({ context }: PluginPageProps) {
             connection {p.connectionId} · completeInventory {p.completeInventory ? "confirmed" : "not confirmed"} ·{" "}
             {p.enabledAccounts} enabled account{p.enabledAccounts === 1 ? "" : "s"}
             {p.headroomAccounts > 0 ? `, ${p.headroomAccounts} with headroom` : ""}
+            {creditsPolicyText(p) ? ` · ${creditsPolicyText(p)}` : ""}
             {p.retryAt ? (
               <span title={p.retryAt}> · retry {p.retryAt} ({formatCountdown(p.retryAt, nowMs)})</span>
             ) : (
@@ -268,6 +290,7 @@ export function CliProxyPage({ context }: PluginPageProps) {
                     {a.planType ? ` · plan ${a.planType}` : ""}
                     {a.priority !== null ? ` · priority ${a.priority}` : ""} · checked {a.checkedAt}
                     {a.quotaBlind && ` · quota-blind${a.quotaBlindReason ? `: ${a.quotaBlindReason}` : ""}`}
+                    {creditsText(a.credits) ? ` · ${creditsText(a.credits)}` : ""}
                     {a.coolingDown && (
                       <span title={a.cooldownUntil ?? undefined}>
                         {` · cooling down${a.cooldownUntil ? ` until ${a.cooldownUntil} (${formatCountdown(a.cooldownUntil, nowMs)})` : ""}`}
@@ -482,6 +505,7 @@ export function CliProxyUsagePage({ context }: PluginPageProps) {
               ""
             )}
             {` · sync ${p.freshness}`}
+            {creditsPolicyText(p) ? ` · ${creditsPolicyText(p)}` : ""}
           </div>
           <div>{p.reason}</div>
           {p.models.length > 0 && (
@@ -568,6 +592,12 @@ export function CliProxyUsagePage({ context }: PluginPageProps) {
               )}
             </div>
             {a.statusMessage && <div>Note: {a.statusMessage}</div>}
+            {a.credits && (
+              <div title={a.credits.observedAt ?? undefined}>
+                {creditsText(a.credits)}
+                {!a.credits.positive && a.credits.hasCredits !== null && " · not headroom"}
+              </div>
+            )}
             {a.limits.length === 0 && <div>No quota windows — unknown.</div>}
             {a.limits.map((l) => (
               <div key={l.id} title={l.resetsAt ?? undefined}>
