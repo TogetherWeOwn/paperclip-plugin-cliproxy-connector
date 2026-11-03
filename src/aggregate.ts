@@ -158,9 +158,11 @@ export function creditsPositive(credits: CreditsReading | null | undefined): boo
 /**
  * Windows a positive credits balance can cover: quota windows only. A 429
  * cooldown or a `retry-after` watermark means the upstream refused traffic,
- * credits or not, so those always keep gating.
+ * credits or not, and a spend-control block caps paid spend itself, so those
+ * always keep gating.
  */
 function creditCoverable(w: UsageLimitRow): boolean {
+  if (w.spendControlBlocked === true) return false;
   return !w.id.endsWith(":retry-after") && !w.id.includes(":quota-cooldown");
 }
 

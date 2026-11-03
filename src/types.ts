@@ -63,6 +63,12 @@ export interface UsageLimitRow {
    * the router ignores this field.
    */
   metrics?: string[] | null;
+  /**
+   * True when the provider's spend control blocked this window
+   * (`spend_control_blocked` on a legacy signal). Paid credits never cover it:
+   * a spend-control block exists to cap paid spend.
+   */
+  spendControlBlocked?: boolean;
 }
 
 /**

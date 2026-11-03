@@ -317,6 +317,45 @@ describe("aggregate: window-exhausted plus credits-available", () => {
     expect(a.state).toBe("exhausted");
   });
 
+  it("credits never cover a spend-control block (parsed account)", () => {
+    const parsed = (spendControlBlocked: boolean) =>
+      parseAuthFiles(
+        [
+          {
+            id: "REDACTED-CODEX-SPEND",
+            provider: "codex",
+            quota: {
+              observed_at: NOW,
+              signals: [
+                spendControlBlocked
+                  ? { window: "secondary", spend_control_blocked: true, reset_at: WEEK_RESET }
+                  : { window: "secondary", used_percent: 100, reset_at: WEEK_RESET },
+              ],
+            },
+            model_quotas: {
+              "gpt-6.1-sol": {
+                observed_at: NOW,
+                signals: { "x-codex-credits-has-credits": "true", "x-codex-credits-balance": "12" },
+              },
+            },
+          },
+        ],
+        { now: NOW, allowLists: DEFAULT_PROVIDER_WINDOWS },
+      ).accounts[0]!;
+
+    const blocked = parsed(true);
+    expect(blocked.limits.find((l) => l.id === "codex:secondary")?.spendControlBlocked).toBe(true);
+    const a = assess([row({ limits: blocked.limits, credits: blocked.credits })], true);
+    expect(a.state).toBe("exhausted");
+    expect(a.headroomAccounts).toBe(0);
+    expect(a.creditHeadroomAccounts).toBe(0);
+
+    // Control: the same exhausted window without the spend-control flag is covered.
+    const plain = parsed(false);
+    expect(plain.limits.find((l) => l.id === "codex:secondary")?.spendControlBlocked).toBeUndefined();
+    expect(assess([row({ limits: plain.limits, credits: plain.credits })], true).state).toBe("allowed");
+  });
+
   it("credits never cover an unavailable (cooling) account", () => {
     const a = assess([row({ coolingDown: true, cooldownUntil: iso(NOW_MS + 600_000) })], true);
     expect(a.state).toBe("exhausted");

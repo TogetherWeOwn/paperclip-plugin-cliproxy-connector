@@ -489,6 +489,7 @@ function makeLimit(init: {
   models?: string[] | null;
   metrics?: string[] | null;
   viaProviderApi?: boolean | null;
+  spendControlBlocked?: boolean;
 }): UsageLimitRow {
   return {
     id: init.id,
@@ -503,6 +504,7 @@ function makeLimit(init: {
     models: init.models ?? null,
     metrics: init.metrics ?? null,
     viaProviderApi: init.viaProviderApi ?? null,
+    ...(init.spendControlBlocked ? { spendControlBlocked: true } : {}),
   };
 }
 
@@ -1835,6 +1837,7 @@ export function parseLegacySignalList(
         gating: isGatingWindow(provider, window, allowList, { scope, spendControl: spendBlocked }),
         observedAt,
         models: opts?.models ?? null,
+        spendControlBlocked: spendBlocked,
       }),
     );
   }
