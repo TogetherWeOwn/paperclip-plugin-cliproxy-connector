@@ -1512,6 +1512,7 @@ export function accountsToRows(
       lastError: scrubWarnings(a.parseWarnings),
       coolingDown: a.coolingDown,
       cooldownUntil: a.cooldownUntil,
+      credits: a.credits,
     };
   }
   if (unkeyed > 0) {

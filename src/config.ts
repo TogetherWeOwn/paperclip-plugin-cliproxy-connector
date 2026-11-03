@@ -25,6 +25,15 @@ export interface ProviderEntry {
    * or `unknown`, never `exhausted` (fail open, never wait).
    */
   completeInventory: boolean;
+  /**
+   * The owner allows paid-credit spend on this provider (TWO-2107). A fresh
+   * positive credits reading (Codex `x-codex-credits-has-credits: true` with
+   * a positive or absent balance, or `unlimited`) then counts as headroom
+   * while quota windows are exhausted; `has-credits: false` or a
+   * non-positive balance blocks again. A 429 cooldown or `retry-after` still
+   * gates. Absent (the default) means false: credits stay display-only.
+   */
+  creditsCountAsHeadroom?: boolean;
 }
 
 export interface ConnectorConfig {
@@ -297,10 +306,17 @@ export function parseConfig(raw: unknown): { config: ConnectorConfig; validation
       } else {
         seenConnections.set(connectionId, provider);
       }
+      const creditsCountAsHeadroom = entryRaw.creditsCountAsHeadroom === true;
+      if (creditsCountAsHeadroom && provider !== "codex") {
+        warnings.push(
+          `${where}.creditsCountAsHeadroom has no effect for ${JSON.stringify(provider)}: only codex accounts report credits.`,
+        );
+      }
       providers.push({
         provider,
         connectionId,
         completeInventory: entryRaw.completeInventory === true,
+        ...(creditsCountAsHeadroom ? { creditsCountAsHeadroom } : {}),
       });
     }
   }

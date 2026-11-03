@@ -32,7 +32,7 @@
 
 import { createHash } from "node:crypto";
 import { SINGLE_SEGMENT } from "./config.js";
-import type { AccountStatus, UsageLimitRow } from "./types.js";
+import type { AccountStatus, CreditsReading, UsageLimitRow } from "./types.js";
 
 /* ------------------------------------------------------------------ */
 /* small defensive accessors                                           */
@@ -489,6 +489,7 @@ function makeLimit(init: {
   models?: string[] | null;
   metrics?: string[] | null;
   viaProviderApi?: boolean | null;
+  spendControlBlocked?: boolean;
 }): UsageLimitRow {
   return {
     id: init.id,
@@ -503,6 +504,7 @@ function makeLimit(init: {
     models: init.models ?? null,
     metrics: init.metrics ?? null,
     viaProviderApi: init.viaProviderApi ?? null,
+    ...(init.spendControlBlocked ? { spendControlBlocked: true } : {}),
   };
 }
 
@@ -1490,6 +1492,8 @@ export interface ParsedSignals {
   observedAt: string | null;
   /** Plan label carried by the signals (Codex `x-codex-plan-type`), if any. */
   planType: string | null;
+  /** Codex `x-codex-credits-*` reading, or null when the signals carry none. */
+  credits: CreditsReading | null;
   warnings: string[];
 }
 
@@ -1565,6 +1569,9 @@ export function parseHeaderSignals(
   let ignored = 0;
   let retryAfterSeconds: number | null = null;
   let planType: string | null = null;
+  let credits: CreditsReading | null = null;
+  const creditsReading = (): CreditsReading =>
+    (credits ??= { hasCredits: null, unlimited: null, balance: null, observedAt });
 
   for (const [rawKey, rawValue] of Object.entries(signals)) {
     const key = rawKey.toLowerCase().replace(/_/g, "-");
@@ -1584,10 +1591,29 @@ export function parseHeaderSignals(
       continue;
     }
     if (provider === "codex" && key === "x-codex-credits-has-credits") {
-      if (value.toLowerCase() === "false") acc("credits").limitReached = true;
+      const v = value.toLowerCase();
+      if (v === "false") {
+        acc("credits").limitReached = true;
+        creditsReading().hasCredits = false;
+      } else if (v === "true") creditsReading().hasCredits = true;
+      else ignored += 1;
       continue;
     }
-    if (provider === "codex" && key === "x-codex-credits-balance") continue; // informational only
+    if (provider === "codex" && key === "x-codex-credits-unlimited") {
+      const v = value.toLowerCase();
+      if (v === "true" || v === "false") creditsReading().unlimited = v === "true";
+      else ignored += 1;
+      continue;
+    }
+    if (provider === "codex" && key === "x-codex-credits-balance") {
+      // Never gates by itself: the router reads it only for providers that
+      // opt in with `creditsCountAsHeadroom` (a non-positive balance then
+      // never counts as headroom).
+      const balance = Number(value);
+      if (Number.isFinite(balance)) creditsReading().balance = balance;
+      else ignored += 1;
+      continue;
+    }
     if (provider === "codex" && key.endsWith("-limit-name")) {
       // The tier is part of the window identity, exactly as in the metric
       // branch below: a bare `secondary` limit-name belongs to `secondary`
@@ -1747,12 +1773,12 @@ export function parseHeaderSignals(
       }),
     );
   }
-  if (Object.keys(signals).length > 0 && limits.length === 0 && retryAfterSeconds === null) {
+  if (Object.keys(signals).length > 0 && limits.length === 0 && retryAfterSeconds === null && credits === null) {
     warnings.push(
       `${provider}: ${ignored} quota signal${ignored === 1 ? "" : "s"} carried no usable window; treating this observation as unknown.`,
     );
   }
-  return { limits, observedAt, planType, warnings };
+  return { limits, observedAt, planType, credits, warnings };
 }
 
 /**
@@ -1771,7 +1797,7 @@ export function parseLegacySignalList(
   const limits: UsageLimitRow[] = [];
   if (!Array.isArray(signals)) {
     warnings.push(`${provider}: quota signals are not a header map or window list; treating as unknown.`);
-    return { limits, observedAt, planType: null, warnings };
+    return { limits, observedAt, planType: null, credits: null, warnings };
   }
   for (const s of signals) {
     const o = asObj(s);
@@ -1811,10 +1837,11 @@ export function parseLegacySignalList(
         gating: isGatingWindow(provider, window, allowList, { scope, spendControl: spendBlocked }),
         observedAt,
         models: opts?.models ?? null,
+        spendControlBlocked: spendBlocked,
       }),
     );
   }
-  return { limits, observedAt, planType: null, warnings };
+  return { limits, observedAt, planType: null, credits: null, warnings };
 }
 
 /* ------------------------------------------------------------------ */
@@ -1893,6 +1920,8 @@ export interface ParsedAccount {
   accountHash: string | null;
   coolingDown: boolean;
   cooldownUntil: string | null;
+  /** Newest Codex credits reading across the entry's observations, if any. */
+  credits: CreditsReading | null;
   parseWarnings: string[];
 }
 
@@ -2169,6 +2198,9 @@ export function parseAuthFiles(
     const parseWarnings: string[] = [];
     let planType: string | null =
       getStr(entry, "plan", "planType", "Plan", "account_type", "AccountType") ?? null;
+    // Credits are account-wide (one balance per account), whichever
+    // observation carried them: the newest reading wins.
+    let credits: CreditsReading | null = null;
     for (const input of signalInputs) {
       if ("__legacy" in input.signals) {
         const parsed = parseLegacySignalList(parserKey, (input.signals as Record<string, unknown>).__legacy, input.observed, allowList, {
@@ -2193,6 +2225,16 @@ export function parseAuthFiles(
       }
       limits.push(...stampLimits(parsed.limits, input.observed, opts.now));
       if (!planType && parsed.planType) planType = parsed.planType;
+      if (parsed.credits) {
+        // Unlike quota windows, an undated credits reading is never stamped
+        // with the fetch time: re-listing the same snapshot does not prove
+        // the balance still exists, so it stays undated (never fresh
+        // headroom) and any dated reading replaces it.
+        const reading = parsed.credits;
+        const readingMs = reading.observedAt ? Date.parse(reading.observedAt) : Number.NEGATIVE_INFINITY;
+        const currentMs = credits?.observedAt ? Date.parse(credits.observedAt) : Number.NEGATIVE_INFINITY;
+        if (!credits || readingMs > currentMs) credits = reading;
+      }
     }
 
     // Per-file payloads win: an account carrying an `auth_index` attaches
@@ -2431,6 +2473,7 @@ export function parseAuthFiles(
       // telemetry" (unknown) apart from "no recovery bound at all" (out).
       // Nulling it here dead-coded that branch and re-waited forever.
       cooldownUntil: nextRetryAfter,
+      credits: disabled ? null : credits,
       parseWarnings: [...parseWarnings, ...(pluginQuota?.warnings ?? [])],
     });
   }
