@@ -18,7 +18,7 @@
  * on this page; until then the audience notice below stays on screen.
  */
 
-import { aggregateProvider } from "./aggregate.js";
+import { aggregateProvider, creditsPositive } from "./aggregate.js";
 import { graceMs, maxAgeMs, type ConnectorConfig } from "./config.js";
 import { providerDisplayName } from "./models.js";
 import { normalizeProvider, quotaBlindReason } from "./parsers.js";
@@ -80,6 +80,18 @@ export interface ProviderAccountDetail {
   coolingDown: boolean;
   cooldownUntil: string | null;
   cooldownIn: string | null;
+  /**
+   * Latest paid-credits reading (Codex `x-codex-credits-*`), or null when the
+   * account reports none. `positive` says whether it would count as headroom
+   * for a provider row with `creditsCountAsHeadroom`.
+   */
+  credits: {
+    hasCredits: boolean | null;
+    unlimited: boolean | null;
+    balance: number | null;
+    observedAt: string | null;
+    positive: boolean;
+  } | null;
 }
 
 export interface AccountCardLimit {
@@ -109,6 +121,10 @@ export interface ProviderCard {
   displayName: string;
   connectionId: string;
   completeInventory: boolean;
+  /** Provider row opt-in: positive paid credits count as headroom (TWO-2107). */
+  creditsCountAsHeadroom: boolean;
+  /** Headroom accounts that route on paid credits past exhausted windows. */
+  creditHeadroomAccounts: number;
   state: ProviderState;
   retryAt: string | null;
   retryIn: string | null;
@@ -422,6 +438,7 @@ function toAccountDetail(
     coolingDown: row.coolingDown,
     cooldownUntil: row.cooldownUntil,
     cooldownIn: resetIn(row.cooldownUntil, nowMs),
+    credits: row.credits ? { ...row.credits, positive: creditsPositive(row.credits) } : null,
   };
 }
 
@@ -444,6 +461,7 @@ function buildProviderCards(args: {
         model: null,
         rows: allRows,
         completeInventory: entry.completeInventory,
+        creditsCountAsHeadroom: entry.creditsCountAsHeadroom,
         config,
         now,
         poolId: undefined,
@@ -464,6 +482,8 @@ function buildProviderCards(args: {
         displayName: providerDisplayName(entry.provider),
         connectionId: entry.connectionId,
         completeInventory: entry.completeInventory,
+        creditsCountAsHeadroom: entry.creditsCountAsHeadroom === true,
+        creditHeadroomAccounts: verdict.creditHeadroomAccounts,
         state: verdict.state,
         retryAt: verdict.retryAt,
         retryIn: resetIn(verdict.retryAt, nowMs),

@@ -138,6 +138,26 @@ export interface AccountUsageRow {
   coolingDown: boolean;
   /** ISO time a cooldown lifts, when the provider reports one. */
   cooldownUntil: string | null;
+  /**
+   * Latest paid-credits reading from the passive signals (Codex
+   * `x-codex-credits-*`), or null/absent when the account reports none.
+   * Display only unless the provider row opts in with
+   * `creditsCountAsHeadroom`, which lets a positive reading cover exhausted
+   * quota windows (never a 429 cooldown or `retry-after`).
+   */
+  credits?: CreditsReading | null;
+}
+
+/** One paid-credits reading (Codex `x-codex-credits-*` headers). */
+export interface CreditsReading {
+  /** `x-codex-credits-has-credits`, when parseable. */
+  hasCredits: boolean | null;
+  /** `x-codex-credits-unlimited`, when parseable. */
+  unlimited: boolean | null;
+  /** `x-codex-credits-balance` as a number, when parseable. */
+  balance: number | null;
+  /** ISO time of the observation the reading came from. */
+  observedAt: string | null;
 }
 
 /** Aggregate routing state for one provider (and requested model). */
