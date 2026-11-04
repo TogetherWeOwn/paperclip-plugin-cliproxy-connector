@@ -124,8 +124,8 @@ export interface ConnectorConfig {
   /** Operator confirms the page audience exposure is intended (proposal §4.4). */
   audienceConfirmed: boolean;
   /**
-   * Opt-in to show account emails in labels. Default false: email patterns
-   * never become account labels, and raw emails never render either way.
+   * Opt-in to show raw account emails in labels. Default false: email-shaped
+   * labels are hidden; raw emails render only when this option is enabled.
    */
   showAccountEmails?: boolean;
 }

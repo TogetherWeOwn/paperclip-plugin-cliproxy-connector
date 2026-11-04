@@ -184,6 +184,11 @@ export function tokenContainsEmail(tok: string): boolean {
   return false;
 }
 
+/** Shared credential judgment for a whitespace-delimited upstream text token. */
+export function isCredentialToken(tok: string): boolean {
+  return /[A-Za-z0-9_\-]{20,}/.test(tok) || isCredentialCore(trimEdgePunct(tok));
+}
+
 /**
  * Scrub an upstream `status_message` before it reaches the plugin page.
  * Emails become `[redacted-email]` — whole tokens and addresses glued to
@@ -209,10 +214,8 @@ export function sanitizeStatusMessage(raw: string | null): string | null {
       // token, so a suffix cannot smuggle an address past the check.
       // Linear edge trim (see `trimEdgePunct`) — the regex form trips
       // CodeQL js/polynomial-redos.
-      const core = trimEdgePunct(tok);
       if (tokenContainsEmail(tok)) return "[redacted-email]";
-      if (/[A-Za-z0-9_\-]{20,}/.test(tok)) return "[redacted]";
-      if (isCredentialCore(core)) return "[redacted]";
+      if (isCredentialToken(tok)) return "[redacted]";
       return tok;
     })
     .join(" ");
@@ -678,8 +681,8 @@ const SIGN_IN_COOLDOWN_REASONS = new Set(["invalid_grant", "unauthorized"]);
  * `AKIA1234`, `ab12cd34ef`) rejects. A leading secret marker (`sk-…`,
  * `token.…`) rejects even when every segment is short, and opaque 20+
  * separator-free runs reject like the status-message scrubber's rule.
- * A rejected model key yields no model gating; callers keep the raw trimmed
- * word for display-only reasons.
+ * A rejected model key yields no model gating; a rejected reason becomes
+ * the neutral, non-gating `unknown`.
  */
 const COOLDOWN_TOKEN_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$/;
 
@@ -712,7 +715,7 @@ export function parseCooldowns(entry: Json): ParsedCooldown[] {
     const scopeRaw = getStr(o, "scope", "Scope");
     const reasonRaw = getStr(o, "reason", "Reason");
     if (!reasonRaw) continue;
-    const reason = scrubCooldownToken(reasonRaw)?.toLowerCase() ?? reasonRaw.trim().toLowerCase();
+    const reason = scrubCooldownToken(reasonRaw)?.toLowerCase() ?? "unknown";
     const scope = (scopeRaw ?? "credential").trim().toLowerCase() || "credential";
     const modelRaw = getStr(o, "model_key", "modelKey", "model", "Model");
     const modelKey = modelRaw ? (scrubCooldownToken(modelRaw)?.toLowerCase() ?? null) : null;
@@ -1982,8 +1985,8 @@ export function parseAuthFiles(
      */
     apiCallObservedAt?: string | null;
     /**
-     * Operator opt-in to show account emails in labels. Default false: email
-     * patterns never become labels (and raw emails never render either way).
+     * Operator opt-in to show raw account emails in labels. Default false:
+     * email-shaped labels are hidden; raw emails render only with this opt-in.
      */
     showAccountEmails?: boolean;
   },

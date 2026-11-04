@@ -2089,6 +2089,39 @@ describe("Group A: cooldowns[], sign-in badge, account labels", () => {
     expect(isGatingCooldown(expired, NOW_MS)).toBe(false);
   });
 
+  it.each([
+    "sk-live-a1b2c3d4",
+    "0123456789abcdef0123456789abcdef",
+    "PLANTEDCREDENTIALCANARY",
+    "ab12cd34ef",
+    "user@example.com",
+    "not a reason token",
+  ])("uses a neutral fallback for rejected cooldown reasons: %s", (reason) => {
+    const cooldowns = parseCooldowns({
+      cooldowns: [
+        { reason: ` ${reason} `, retry_at: FUTURE },
+        { scope: "model", model_key: "claude-opus-4-5", reason, retry_at: FUTURE },
+      ],
+    });
+    expect(cooldowns).toHaveLength(2);
+    for (const cooldown of cooldowns) {
+      expect(cooldown.reason).toBe("unknown");
+      expect(isGatingCooldown(cooldown, NOW_MS)).toBe(false);
+      expect(isModelGatingCooldown(cooldown, NOW_MS)).toBe(false);
+    }
+    expect(JSON.stringify(cooldowns)).not.toContain(reason.toLowerCase());
+  });
+
+  it("preserves normalized safe cooldown reasons", () => {
+    const reasons = [
+      "quota", "credential_quota", "payment_required", "mystery_reason", "invalid_grant", "unauthorized",
+    ];
+    const cooldowns = parseCooldowns({
+      cooldowns: reasons.map((reason) => ({ reason: ` ${reason.toUpperCase()} `, retry_at: FUTURE })),
+    });
+    expect(cooldowns.map((cooldown) => cooldown.reason)).toEqual(reasons);
+  });
+
   it("model-scoped quota cooldowns gate per model via models: [model_key]", () => {
     const cooldowns = parseCooldowns({
       cooldowns: [{ scope: "model", model_key: "claude-opus-4-5", reason: "quota", retry_at: FUTURE }],

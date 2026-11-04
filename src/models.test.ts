@@ -52,6 +52,35 @@ describe("parseModelsPayload", () => {
     expect(models).toEqual([{ id: "claude-opus-4-5", ownedBy: null, displayName: null }]);
   });
 
+  it.each([
+    "sk-live-a1b2c3d4",
+    "0123456789abcdef0123456789abcdef",
+    "PLANTED_CREDENTIAL_CANARY",
+    "ab12cd34ef",
+    "(ab12cd34ef),",
+    "token=ab12cd34ef",
+  ])("rejects credential-shaped display names, whole or embedded: %s", (credential) => {
+    for (const displayName of [credential, `Available for ${credential}`, `Model:${credential}`]) {
+      expect(scrubDisplayName(displayName)).toBeNull();
+      const { models } = parseModelsPayload({
+        data: [{ id: "claude-opus-4-5", display_name: displayName }],
+      });
+      expect(models).toEqual([{ id: "claude-opus-4-5", ownedBy: null, displayName: null }]);
+    }
+  });
+
+  it("checks credentials before capping and preserves benign display names", () => {
+    expect(scrubDisplayName(`${"Friendly Model ".repeat(6)}ab12cd34ef`)).toBeNull();
+    for (const name of ["Claude Opus 4.5", "GPT-4o mini", "Llama 3.3 70B", "claude-3.5-sonnet"]) {
+      expect(scrubDisplayName(` ${name} `)).toBe(name);
+    }
+    const longName = "Friendly Model ".repeat(6).trim();
+    expect(scrubDisplayName(longName)).toBe(`${longName.slice(0, 77)}...`);
+    for (const empty of [null, undefined, 42, "", "   "]) {
+      expect(scrubDisplayName(empty)).toBeNull();
+    }
+  });
+
   it("warns on an empty payload instead of claiming models", () => {
     const { models, warnings } = parseModelsPayload({ data: [] });
     expect(models).toEqual([]);
