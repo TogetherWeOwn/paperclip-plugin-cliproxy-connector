@@ -1042,6 +1042,20 @@ describe("sanitizeStatusMessage", () => {
     expect(scrubbed).toContain("[redacted]");
   });
 
+  it("checks every compound metadata value while keeping benign operational pairs", () => {
+    for (const metadata of [
+      "token=ab12cd34ef&mode=fast",
+      "mode=fast&token=ab12cd34ef",
+      "error=429&token=ab12cd34ef&retry=5",
+      "token=ab12cd34ef=",
+    ]) {
+      expect(sanitizeStatusMessage(`retry ${metadata} later`)).toBe("retry [redacted] later");
+    }
+    for (const metadata of ["error=429&retry=5", "model=gpt-4o-mini&error=429", "error=429&retry=5&mode=fast"]) {
+      expect(sanitizeStatusMessage(metadata)).toBe(metadata);
+    }
+  });
+
   it("redacts internal-digit slugs and label:credential tokens, keeps timestamps", () => {
     const scrubbed =
       sanitizeStatusMessage("key sk-live-abc123def, token:ab12cd34ef seen 2026-11-01T12:00:00Z") ?? "";

@@ -253,8 +253,14 @@ export function sanitizeStatusMessage(raw: string | null): string | null {
  * (`sk-2026-11-01-ab12` redacts).
  */
 function isOperationalToken(tok: string): boolean {
-  const eq = tok.lastIndexOf("=");
-  if (eq >= 0) return !isCredentialCore(tok.slice(eq + 1));
+  if (tok.includes("=")) {
+    // Compound metadata is operational only when every value is safe.
+    return tok.split("&").every((pair) => {
+      const parts = pair.split("=");
+      const values = parts.length > 1 ? parts.slice(1) : parts;
+      return values.every((value) => !isCredentialCore(value));
+    });
+  }
   if (
     /^\d{4}-\d{2}-\d{2}([T ]\d{2}:\d{2}(:\d{2}(\.\d+)?)?(Z|[+-]\d{2}:?\d{2})?)?$/.test(tok) ||
     /^\d{2}:\d{2}(:\d{2})?$/.test(tok)

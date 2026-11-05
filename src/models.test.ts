@@ -69,6 +69,22 @@ describe("parseModelsPayload", () => {
     }
   });
 
+  it("rejects compound metadata with a credential-shaped value in any position", () => {
+    for (const metadata of [
+      "token=ab12cd34ef&mode=fast",
+      "mode=fast&token=ab12cd34ef",
+      "error=429&token=ab12cd34ef&retry=5",
+      "token=ab12cd34ef=",
+    ]) {
+      expect(scrubDisplayName(metadata)).toBeNull();
+      const { models } = parseModelsPayload({
+        data: [{ id: "claude-opus-4-5", display_name: metadata }],
+      });
+      expect(models[0]?.displayName).toBeNull();
+    }
+    expect(scrubDisplayName("error=429&retry=5")).toBe("error=429&retry=5");
+  });
+
   it("checks credentials before capping and preserves benign display names", () => {
     expect(scrubDisplayName(`${"Friendly Model ".repeat(6)}ab12cd34ef`)).toBeNull();
     for (const name of ["Claude Opus 4.5", "GPT-4o mini", "Llama 3.3 70B", "claude-3.5-sonnet"]) {
