@@ -196,7 +196,7 @@ export function isCredentialToken(tok: string): boolean {
  * looks credential-like — a 20+ word-char run, or 8+ chars mixing letters
  * with digits (short API keys, session ids) — becomes `[redacted]`. Tokens
  * with operational shapes (timestamps, versions, benign `k=v` pairs like
- * `error=429`, lowercase hyphenated slugs like model ids) pass through so
+ * `error=429`, hyphenated model names regardless of casing) pass through so
  * the page keeps reset times and model names. The note is capped at
  * 120 chars. Plain notes ("ok", "429 rate limited") pass through unchanged.
  */
@@ -227,7 +227,7 @@ export function sanitizeStatusMessage(raw: string | null): string | null {
  * A letter+digit token that is operational, not a credential: timestamps,
  * versions and URLs (punctuation bare keys/session ids almost never
  * contain), `k=v` pairs whose value is not itself credential-shaped
- * (`error=429` keeps; `token=ab12cd34ef` redacts), and lowercase hyphenated
+ * (`error=429` keeps; `token=ab12cd34ef` redacts), and case-insensitive hyphenated
  * slugs without credential tells (`gpt-4o-mini`, `claude-sonnet-4-5` model
  * ids pass; `sk-live-abc123` and `sk-live-a1b2c3d4` still redact).
  * `:`/`/` tokens are operational only when no separated segment is itself
@@ -258,7 +258,7 @@ function isOperationalToken(tok: string): boolean {
     return tok.split("&").every((pair) => {
       const parts = pair.split("=");
       const values = parts.length > 1 ? parts.slice(1) : parts;
-      return values.every((value) => !isCredentialCore(value));
+      return values.every((value) => !isCredentialToken(value));
     });
   }
   if (
@@ -340,7 +340,7 @@ function isVersionShapedPart(seg: string): boolean {
 }
 
 /**
- * Lowercase hyphenated slug (`gpt-4o-mini`) that is not credential-shaped.
+ * Case-insensitive hyphenated slug (`GPT-4o-mini`) that is not credential-shaped.
  * Every non-initial segment must be a model-id part: a word (`mini`), a
  * small number (`4`, `70`), a leading run plus letters (`4o`, `70b`), or a
  * trailing single digit (`v3`, `o1`). Anything else — an internal digit run
@@ -353,7 +353,7 @@ function isVersionShapedPart(seg: string): boolean {
  * explicit budget of 1, since dots already had their own fallback.
  */
 function isSlugLike(core: string, maxMixed?: number): boolean {
-  const parts = core.split("-");
+  const parts = core.toLowerCase().split("-");
   if (parts.length < 2 || !/^[a-z]+$/.test(parts[0] as string)) return false;
   const rest = parts.slice(1) as string[];
   const mixed = rest.filter((seg) => /[a-z]/.test(seg) && /[0-9]/.test(seg));

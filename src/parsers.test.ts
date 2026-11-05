@@ -1056,6 +1056,25 @@ describe("sanitizeStatusMessage", () => {
     }
   });
 
+  it("judges punctuated compound values like standalone status tokens", () => {
+    for (const value of ["gpt-4o-mini", "2026-11-01T12:00Z", "ab12cd34ef", "sk-live-abc123"]) {
+      for (const wrapped of [value, `"${value}"`, `(${value}),`]) {
+        const metadata = `model=${wrapped}&error=429`;
+        const expected = sanitizeStatusMessage(wrapped) === "[redacted]" ? "[redacted]" : metadata;
+        expect(sanitizeStatusMessage(metadata)).toBe(expected);
+      }
+    }
+  });
+
+  it("preserves capitalized model names without relaxing credential checks", () => {
+    for (const name of ["GPT-4o-mini", "Gemini-2.5-Pro", "Claude-3.5-Sonnet"]) {
+      expect(sanitizeStatusMessage(`retry ${name}, later`)).toBe(`retry ${name}, later`);
+    }
+    for (const name of ["SK-LIVE-abc123", "Sk-Live-A1b2c3d4", "Sk-Live-A1-B2-C3-D4"]) {
+      expect(sanitizeStatusMessage(name)).toBe("[redacted]");
+    }
+  });
+
   it("redacts internal-digit slugs and label:credential tokens, keeps timestamps", () => {
     const scrubbed =
       sanitizeStatusMessage("key sk-live-abc123def, token:ab12cd34ef seen 2026-11-01T12:00:00Z") ?? "";
