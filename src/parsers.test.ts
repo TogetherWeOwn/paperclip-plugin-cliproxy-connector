@@ -1075,6 +1075,14 @@ describe("sanitizeStatusMessage", () => {
     }
   });
 
+  it("redacts secret-prefixed status metadata regardless of casing or separator", () => {
+    for (const name of ["sk-live-a1-b2", "SK-LIVE-A1-B2", "Sk.Live.A1.B2", "Token-Prod-A1"]) {
+      expect(sanitizeStatusMessage(name)).toBe("[redacted]");
+      expect(sanitizeStatusMessage(`retry (${name}), later`)).toBe("retry [redacted] later");
+      expect(sanitizeStatusMessage(`model=${name}&error=429`)).toBe("[redacted]");
+    }
+  });
+
   it("redacts internal-digit slugs and label:credential tokens, keeps timestamps", () => {
     const scrubbed =
       sanitizeStatusMessage("key sk-live-abc123def, token:ab12cd34ef seen 2026-11-01T12:00:00Z") ?? "";

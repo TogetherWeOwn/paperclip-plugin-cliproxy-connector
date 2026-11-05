@@ -313,8 +313,8 @@ function isCredentialCore(core: string): boolean {
 }
 
 /**
- * A leading dot-segment that marks a dotted token as secret-shaped: the
- * usual key-material prefixes. Common subdomain words (`api`, `auth`) are
+ * A leading segment that marks a dotted or hyphenated token as secret-shaped:
+ * the usual key-material prefixes. Common subdomain words (`api`, `auth`) are
  * deliberately absent — `api.example.com` keeps via the slug judgment or
  * the fallback, and must not redact.
  */
@@ -355,6 +355,7 @@ function isVersionShapedPart(seg: string): boolean {
 function isSlugLike(core: string, maxMixed?: number): boolean {
   const parts = core.toLowerCase().split("-");
   if (parts.length < 2 || !/^[a-z]+$/.test(parts[0] as string)) return false;
+  if (SECRET_DOT_PREFIX.test(parts[0] as string)) return false;
   const rest = parts.slice(1) as string[];
   const mixed = rest.filter((seg) => /[a-z]/.test(seg) && /[0-9]/.test(seg));
   const budget = maxMixed ?? parts.filter((seg) => /^[a-z]+$/.test(seg)).length;

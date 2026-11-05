@@ -116,6 +116,18 @@ describe("parseModelsPayload", () => {
     },
   );
 
+  it("rejects secret-prefixed display metadata regardless of casing or separator", () => {
+    for (const name of ["sk-live-a1-b2", "SK-LIVE-A1-B2", "Sk.Live.A1.B2", "Token-Prod-A1"]) {
+      for (const displayName of [name, `Available for (${name}),`, `model=${name}&error=429`]) {
+        expect(scrubDisplayName(displayName)).toBeNull();
+        const { models } = parseModelsPayload({
+          data: [{ id: "routing-id", display_name: displayName }],
+        });
+        expect(models).toEqual([{ id: "routing-id", ownedBy: null, displayName: null }]);
+      }
+    }
+  });
+
   it("checks credentials before capping and preserves benign display names", () => {
     expect(scrubDisplayName(`${"Friendly Model ".repeat(6)}ab12cd34ef`)).toBeNull();
     for (const name of ["Claude Opus 4.5", "GPT-4o mini", "Llama 3.3 70B", "claude-3.5-sonnet"]) {
