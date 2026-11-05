@@ -1042,6 +1042,47 @@ describe("sanitizeStatusMessage", () => {
     expect(scrubbed).toContain("[redacted]");
   });
 
+  it("checks every compound metadata value while keeping benign operational pairs", () => {
+    for (const metadata of [
+      "token=ab12cd34ef&mode=fast",
+      "mode=fast&token=ab12cd34ef",
+      "error=429&token=ab12cd34ef&retry=5",
+      "token=ab12cd34ef=",
+    ]) {
+      expect(sanitizeStatusMessage(`retry ${metadata} later`)).toBe("retry [redacted] later");
+    }
+    for (const metadata of ["error=429&retry=5", "model=gpt-4o-mini&error=429", "error=429&retry=5&mode=fast"]) {
+      expect(sanitizeStatusMessage(metadata)).toBe(metadata);
+    }
+  });
+
+  it("judges punctuated compound values like standalone status tokens", () => {
+    for (const value of ["gpt-4o-mini", "2026-11-01T12:00Z", "ab12cd34ef", "sk-live-abc123"]) {
+      for (const wrapped of [value, `"${value}"`, `(${value}),`]) {
+        const metadata = `model=${wrapped}&error=429`;
+        const expected = sanitizeStatusMessage(wrapped) === "[redacted]" ? "[redacted]" : metadata;
+        expect(sanitizeStatusMessage(metadata)).toBe(expected);
+      }
+    }
+  });
+
+  it("preserves capitalized model names without relaxing credential checks", () => {
+    for (const name of ["GPT-4o-mini", "Gemini-2.5-Pro", "Claude-3.5-Sonnet"]) {
+      expect(sanitizeStatusMessage(`retry ${name}, later`)).toBe(`retry ${name}, later`);
+    }
+    for (const name of ["SK-LIVE-abc123", "Sk-Live-A1b2c3d4", "Sk-Live-A1-B2-C3-D4"]) {
+      expect(sanitizeStatusMessage(name)).toBe("[redacted]");
+    }
+  });
+
+  it("redacts secret-prefixed status metadata regardless of casing or separator", () => {
+    for (const name of ["sk-live-a1-b2", "SK-LIVE-A1-B2", "Sk.Live.A1.B2", "Token-Prod-A1"]) {
+      expect(sanitizeStatusMessage(name)).toBe("[redacted]");
+      expect(sanitizeStatusMessage(`retry (${name}), later`)).toBe("retry [redacted] later");
+      expect(sanitizeStatusMessage(`model=${name}&error=429`)).toBe("[redacted]");
+    }
+  });
+
   it("redacts internal-digit slugs and label:credential tokens, keeps timestamps", () => {
     const scrubbed =
       sanitizeStatusMessage("key sk-live-abc123def, token:ab12cd34ef seen 2026-11-01T12:00:00Z") ?? "";
@@ -2087,6 +2128,39 @@ describe("Group A: cooldowns[], sign-in badge, account labels", () => {
     expect(isGatingCooldown(pay, NOW_MS)).toBe(false);
     expect(isGatingCooldown(mystery, NOW_MS)).toBe(false);
     expect(isGatingCooldown(expired, NOW_MS)).toBe(false);
+  });
+
+  it.each([
+    "sk-live-a1b2c3d4",
+    "0123456789abcdef0123456789abcdef",
+    "PLANTEDCREDENTIALCANARY",
+    "ab12cd34ef",
+    "user@example.com",
+    "not a reason token",
+  ])("uses a neutral fallback for rejected cooldown reasons: %s", (reason) => {
+    const cooldowns = parseCooldowns({
+      cooldowns: [
+        { reason: ` ${reason} `, retry_at: FUTURE },
+        { scope: "model", model_key: "claude-opus-4-5", reason, retry_at: FUTURE },
+      ],
+    });
+    expect(cooldowns).toHaveLength(2);
+    for (const cooldown of cooldowns) {
+      expect(cooldown.reason).toBe("unknown");
+      expect(isGatingCooldown(cooldown, NOW_MS)).toBe(false);
+      expect(isModelGatingCooldown(cooldown, NOW_MS)).toBe(false);
+    }
+    expect(JSON.stringify(cooldowns)).not.toContain(reason.toLowerCase());
+  });
+
+  it("preserves normalized safe cooldown reasons", () => {
+    const reasons = [
+      "quota", "credential_quota", "payment_required", "mystery_reason", "invalid_grant", "unauthorized",
+    ];
+    const cooldowns = parseCooldowns({
+      cooldowns: reasons.map((reason) => ({ reason: ` ${reason.toUpperCase()} `, retry_at: FUTURE })),
+    });
+    expect(cooldowns.map((cooldown) => cooldown.reason)).toEqual(reasons);
   });
 
   it("model-scoped quota cooldowns gate per model via models: [model_key]", () => {

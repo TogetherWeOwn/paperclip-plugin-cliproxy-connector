@@ -52,6 +52,94 @@ describe("parseModelsPayload", () => {
     expect(models).toEqual([{ id: "claude-opus-4-5", ownedBy: null, displayName: null }]);
   });
 
+  it.each([
+    "sk-live-a1b2c3d4",
+    "0123456789abcdef0123456789abcdef",
+    "PLANTED_CREDENTIAL_CANARY",
+    "ab12cd34ef",
+    "(ab12cd34ef),",
+    "token=ab12cd34ef",
+  ])("rejects credential-shaped display names, whole or embedded: %s", (credential) => {
+    for (const displayName of [credential, `Available for ${credential}`, `Model:${credential}`]) {
+      expect(scrubDisplayName(displayName)).toBeNull();
+      const { models } = parseModelsPayload({
+        data: [{ id: "claude-opus-4-5", display_name: displayName }],
+      });
+      expect(models).toEqual([{ id: "claude-opus-4-5", ownedBy: null, displayName: null }]);
+    }
+  });
+
+  it("rejects compound metadata with a credential-shaped value in any position", () => {
+    for (const metadata of [
+      "token=ab12cd34ef&mode=fast",
+      "mode=fast&token=ab12cd34ef",
+      "error=429&token=ab12cd34ef&retry=5",
+      "token=ab12cd34ef=",
+    ]) {
+      expect(scrubDisplayName(metadata)).toBeNull();
+      const { models } = parseModelsPayload({
+        data: [{ id: "claude-opus-4-5", display_name: metadata }],
+      });
+      expect(models[0]?.displayName).toBeNull();
+    }
+    expect(scrubDisplayName("error=429&retry=5")).toBe("error=429&retry=5");
+  });
+
+  it.each(["GPT-4o-mini", "Gemini-2.5-Pro", "Claude-3.5-Sonnet"])(
+    "preserves capitalized model display names: %s",
+    (name) => {
+      expect(scrubDisplayName(name)).toBe(name);
+      const { models } = parseModelsPayload({
+        data: [{ id: "routing-id", display_name: name }],
+      });
+      expect(models).toEqual([{ id: "routing-id", ownedBy: null, displayName: name }]);
+    },
+  );
+
+  it("judges punctuated compound values like standalone display tokens", () => {
+    for (const value of ["gpt-4o-mini", "2026-11-01T12:00Z", "ab12cd34ef", "sk-live-abc123"]) {
+      for (const wrapped of [value, `"${value}"`, `(${value}),`]) {
+        const expected = scrubDisplayName(wrapped) === null ? null : `model=${wrapped}&error=429`;
+        expect(scrubDisplayName(`model=${wrapped}&error=429`)).toBe(expected);
+        const { models } = parseModelsPayload({
+          data: [{ id: "routing-id", display_name: `model=${wrapped}&error=429` }],
+        });
+        expect(models[0]?.displayName).toBe(expected);
+      }
+    }
+  });
+
+  it.each(["SK-LIVE-abc123", "Sk-Live-A1b2c3d4", "Sk-Live-A1-B2-C3-D4"])(
+    "still rejects capitalized credential-shaped names: %s",
+    (name) => {
+      expect(scrubDisplayName(name)).toBeNull();
+    },
+  );
+
+  it("rejects secret-prefixed display metadata regardless of casing or separator", () => {
+    for (const name of ["sk-live-a1-b2", "SK-LIVE-A1-B2", "Sk.Live.A1.B2", "Token-Prod-A1"]) {
+      for (const displayName of [name, `Available for (${name}),`, `model=${name}&error=429`]) {
+        expect(scrubDisplayName(displayName)).toBeNull();
+        const { models } = parseModelsPayload({
+          data: [{ id: "routing-id", display_name: displayName }],
+        });
+        expect(models).toEqual([{ id: "routing-id", ownedBy: null, displayName: null }]);
+      }
+    }
+  });
+
+  it("checks credentials before capping and preserves benign display names", () => {
+    expect(scrubDisplayName(`${"Friendly Model ".repeat(6)}ab12cd34ef`)).toBeNull();
+    for (const name of ["Claude Opus 4.5", "GPT-4o mini", "Llama 3.3 70B", "claude-3.5-sonnet"]) {
+      expect(scrubDisplayName(` ${name} `)).toBe(name);
+    }
+    const longName = "Friendly Model ".repeat(6).trim();
+    expect(scrubDisplayName(longName)).toBe(`${longName.slice(0, 77)}...`);
+    for (const empty of [null, undefined, 42, "", "   "]) {
+      expect(scrubDisplayName(empty)).toBeNull();
+    }
+  });
+
   it("warns on an empty payload instead of claiming models", () => {
     const { models, warnings } = parseModelsPayload({ data: [] });
     expect(models).toEqual([]);

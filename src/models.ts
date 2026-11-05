@@ -37,7 +37,7 @@
  *   mentioned in the README.
  */
 
-import { NAMESPACE_TO_PROVIDER, isEmailLike, tokenContainsEmail } from "./parsers.js";
+import { NAMESPACE_TO_PROVIDER, isCredentialToken, isEmailLike, tokenContainsEmail } from "./parsers.js";
 
 export interface ServedModel {
   /** Served id, lowercased for matching. */
@@ -76,7 +76,7 @@ export function providerDisplayName(provider: string): string {
   return PROVIDER_DISPLAY_NAMES[word] ?? provider;
 }
 
-/** Scrub a `display_name` the same way as other upstream text (display only). */
+/** Reject email/credential-shaped display names before capping; callers fall back to the id. */
 export function scrubDisplayName(raw: unknown): string | null {
   if (typeof raw !== "string") return null;
   const s = raw.trim();
@@ -85,7 +85,7 @@ export function scrubDisplayName(raw: unknown): string | null {
   // (`"Available for user@example.com"`); rejects fall back to the id.
   if (isEmailLike(s)) return null;
   for (const tok of s.split(/\s+/)) {
-    if (tokenContainsEmail(tok)) return null;
+    if (tokenContainsEmail(tok) || isCredentialToken(tok)) return null;
   }
   const capped = s.length > 80 ? `${s.slice(0, 77)}...` : s;
   return capped;

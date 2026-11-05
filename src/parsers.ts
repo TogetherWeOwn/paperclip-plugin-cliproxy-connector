@@ -184,6 +184,11 @@ export function tokenContainsEmail(tok: string): boolean {
   return false;
 }
 
+/** Shared credential judgment for a whitespace-delimited upstream text token. */
+export function isCredentialToken(tok: string): boolean {
+  return /[A-Za-z0-9_\-]{20,}/.test(tok) || isCredentialCore(trimEdgePunct(tok));
+}
+
 /**
  * Scrub an upstream `status_message` before it reaches the plugin page.
  * Emails become `[redacted-email]` — whole tokens and addresses glued to
@@ -191,7 +196,7 @@ export function tokenContainsEmail(tok: string): boolean {
  * looks credential-like — a 20+ word-char run, or 8+ chars mixing letters
  * with digits (short API keys, session ids) — becomes `[redacted]`. Tokens
  * with operational shapes (timestamps, versions, benign `k=v` pairs like
- * `error=429`, lowercase hyphenated slugs like model ids) pass through so
+ * `error=429`, hyphenated model names regardless of casing) pass through so
  * the page keeps reset times and model names. The note is capped at
  * 120 chars. Plain notes ("ok", "429 rate limited") pass through unchanged.
  */
@@ -209,10 +214,8 @@ export function sanitizeStatusMessage(raw: string | null): string | null {
       // token, so a suffix cannot smuggle an address past the check.
       // Linear edge trim (see `trimEdgePunct`) — the regex form trips
       // CodeQL js/polynomial-redos.
-      const core = trimEdgePunct(tok);
       if (tokenContainsEmail(tok)) return "[redacted-email]";
-      if (/[A-Za-z0-9_\-]{20,}/.test(tok)) return "[redacted]";
-      if (isCredentialCore(core)) return "[redacted]";
+      if (isCredentialToken(tok)) return "[redacted]";
       return tok;
     })
     .join(" ");
@@ -224,7 +227,7 @@ export function sanitizeStatusMessage(raw: string | null): string | null {
  * A letter+digit token that is operational, not a credential: timestamps,
  * versions and URLs (punctuation bare keys/session ids almost never
  * contain), `k=v` pairs whose value is not itself credential-shaped
- * (`error=429` keeps; `token=ab12cd34ef` redacts), and lowercase hyphenated
+ * (`error=429` keeps; `token=ab12cd34ef` redacts), and case-insensitive hyphenated
  * slugs without credential tells (`gpt-4o-mini`, `claude-sonnet-4-5` model
  * ids pass; `sk-live-abc123` and `sk-live-a1b2c3d4` still redact).
  * `:`/`/` tokens are operational only when no separated segment is itself
@@ -250,8 +253,14 @@ export function sanitizeStatusMessage(raw: string | null): string | null {
  * (`sk-2026-11-01-ab12` redacts).
  */
 function isOperationalToken(tok: string): boolean {
-  const eq = tok.lastIndexOf("=");
-  if (eq >= 0) return !isCredentialCore(tok.slice(eq + 1));
+  if (tok.includes("=")) {
+    // Compound metadata is operational only when every value is safe.
+    return tok.split("&").every((pair) => {
+      const parts = pair.split("=");
+      const values = parts.length > 1 ? parts.slice(1) : parts;
+      return values.every((value) => !isCredentialToken(value));
+    });
+  }
   if (
     /^\d{4}-\d{2}-\d{2}([T ]\d{2}:\d{2}(:\d{2}(\.\d+)?)?(Z|[+-]\d{2}:?\d{2})?)?$/.test(tok) ||
     /^\d{2}:\d{2}(:\d{2})?$/.test(tok)
@@ -304,8 +313,8 @@ function isCredentialCore(core: string): boolean {
 }
 
 /**
- * A leading dot-segment that marks a dotted token as secret-shaped: the
- * usual key-material prefixes. Common subdomain words (`api`, `auth`) are
+ * A leading segment that marks a dotted or hyphenated token as secret-shaped:
+ * the usual key-material prefixes. Common subdomain words (`api`, `auth`) are
  * deliberately absent — `api.example.com` keeps via the slug judgment or
  * the fallback, and must not redact.
  */
@@ -331,7 +340,7 @@ function isVersionShapedPart(seg: string): boolean {
 }
 
 /**
- * Lowercase hyphenated slug (`gpt-4o-mini`) that is not credential-shaped.
+ * Case-insensitive hyphenated slug (`GPT-4o-mini`) that is not credential-shaped.
  * Every non-initial segment must be a model-id part: a word (`mini`), a
  * small number (`4`, `70`), a leading run plus letters (`4o`, `70b`), or a
  * trailing single digit (`v3`, `o1`). Anything else — an internal digit run
@@ -344,8 +353,9 @@ function isVersionShapedPart(seg: string): boolean {
  * explicit budget of 1, since dots already had their own fallback.
  */
 function isSlugLike(core: string, maxMixed?: number): boolean {
-  const parts = core.split("-");
+  const parts = core.toLowerCase().split("-");
   if (parts.length < 2 || !/^[a-z]+$/.test(parts[0] as string)) return false;
+  if (SECRET_DOT_PREFIX.test(parts[0] as string)) return false;
   const rest = parts.slice(1) as string[];
   const mixed = rest.filter((seg) => /[a-z]/.test(seg) && /[0-9]/.test(seg));
   const budget = maxMixed ?? parts.filter((seg) => /^[a-z]+$/.test(seg)).length;
@@ -678,8 +688,8 @@ const SIGN_IN_COOLDOWN_REASONS = new Set(["invalid_grant", "unauthorized"]);
  * `AKIA1234`, `ab12cd34ef`) rejects. A leading secret marker (`sk-…`,
  * `token.…`) rejects even when every segment is short, and opaque 20+
  * separator-free runs reject like the status-message scrubber's rule.
- * A rejected model key yields no model gating; callers keep the raw trimmed
- * word for display-only reasons.
+ * A rejected model key yields no model gating; a rejected reason becomes
+ * the neutral, non-gating `unknown`.
  */
 const COOLDOWN_TOKEN_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$/;
 
@@ -712,7 +722,7 @@ export function parseCooldowns(entry: Json): ParsedCooldown[] {
     const scopeRaw = getStr(o, "scope", "Scope");
     const reasonRaw = getStr(o, "reason", "Reason");
     if (!reasonRaw) continue;
-    const reason = scrubCooldownToken(reasonRaw)?.toLowerCase() ?? reasonRaw.trim().toLowerCase();
+    const reason = scrubCooldownToken(reasonRaw)?.toLowerCase() ?? "unknown";
     const scope = (scopeRaw ?? "credential").trim().toLowerCase() || "credential";
     const modelRaw = getStr(o, "model_key", "modelKey", "model", "Model");
     const modelKey = modelRaw ? (scrubCooldownToken(modelRaw)?.toLowerCase() ?? null) : null;
@@ -1982,8 +1992,8 @@ export function parseAuthFiles(
      */
     apiCallObservedAt?: string | null;
     /**
-     * Operator opt-in to show account emails in labels. Default false: email
-     * patterns never become labels (and raw emails never render either way).
+     * Operator opt-in to show raw account emails in labels. Default false:
+     * email-shaped labels are hidden; raw emails render only with this opt-in.
      */
     showAccountEmails?: boolean;
   },
