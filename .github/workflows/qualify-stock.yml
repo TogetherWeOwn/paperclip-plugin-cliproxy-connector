@@ -1,0 +1,99 @@
+name: qualify-stock
+
+on:
+  pull_request:
+    paths: [qualification/**, .github/workflows/qualify-stock.yml]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: qualify-stock-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  stock-host:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      CANDIDATE_SHA: c129014d765b400d8e547ff469499cd3c34429ff
+      HOST_SOURCE_SHA: d69631b01b9c658f80bf8bed389863dce82643e1
+      STOCK_IMAGE: ghcr.io/paperclipai/paperclip@sha256:281d80a20c0b333c519f158c77cd18a5096d086f648ed490d218ac7c8bc48e39
+      QUALIFICATION_CONTAINER: connector-qualification-${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          path: workflow
+          persist-credentials: false
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: TogetherWeOwn/paperclip-plugin-cliproxy-connector
+          ref: c129014d765b400d8e547ff469499cd3c34429ff
+          path: candidate
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24
+      - name: Verify lane invariants
+        run: node --test workflow/qualification/policy.test.mjs
+      - name: Build the exact candidate with install hooks disabled
+        working-directory: candidate
+        env:
+          npm_config_ignore_scripts: 'true'
+          npm_config_min_release_age: '3'
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$CANDIDATE_SHA"
+          test -z "$(git status --porcelain)"
+          npm install --global npm@11.19.0 --ignore-scripts --min-release-age=3
+          test "$(npm --version)" = 11.19.0
+          test "$(npm config get ignore-scripts)" = true
+          test "$(npm config get min-release-age)" = 3
+          npm ci
+          npm run build
+          test "$(node -p "require('./node_modules/@paperclipai/plugin-sdk/package.json').version")" = 2026.1023.0
+          test -z "$(git status --porcelain)"
+      - name: Prepare immutable stock image and evidence directory
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/connector-evidence"
+          docker pull "$STOCK_IMAGE"
+          docker image inspect "$STOCK_IMAGE" > "$RUNNER_TEMP/connector-evidence/image.json"
+          node workflow/qualification/identity.mjs candidate "$RUNNER_TEMP/connector-evidence"
+      - name: Start job-scoped stock host with no network or persistent storage
+        run: |
+          set -euo pipefail
+          docker run --detach --name "$QUALIFICATION_CONTAINER" \
+            --network none --pids-limit 2048 --memory 5g --cpus 2 \
+            --mount "type=bind,source=$GITHUB_WORKSPACE/candidate,target=/qualification/candidate,readonly" \
+            --mount "type=bind,source=$GITHUB_WORKSPACE/workflow/qualification,target=/qualification/driver,readonly" \
+            --mount "type=bind,source=$RUNNER_TEMP/connector-evidence,target=/qualification/evidence" \
+            --env PAPERCLIP_DEPLOYMENT_MODE=local_trusted \
+            --env PAPERCLIP_DEPLOYMENT_EXPOSURE=private \
+            --env HOST=127.0.0.1 --env SERVE_UI=true \
+            --env HEARTBEAT_SCHEDULER_ENABLED=false \
+            "$STOCK_IMAGE"
+          docker inspect "$QUALIFICATION_CONTAINER" > "$RUNNER_TEMP/connector-evidence/container.json"
+      - name: Probe installed candidate through stock host APIs
+        run: docker exec "$QUALIFICATION_CONTAINER" node /qualification/driver/preflight.mjs
+      - name: Capture and dispose job-local resources
+        if: always()
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/connector-evidence"
+          if docker container inspect "$QUALIFICATION_CONTAINER" >/dev/null 2>&1; then
+            docker logs "$QUALIFICATION_CONTAINER" > "$RUNNER_TEMP/connector-evidence/host.log" 2>&1
+            docker rm --force --volumes "$QUALIFICATION_CONTAINER"
+          fi
+          if docker container inspect "$QUALIFICATION_CONTAINER" >/dev/null 2>&1; then
+            exit 1
+          fi
+          printf '{"explicitContainerRemoval":true,"nativeBackstop":"GitHub-hosted job VM disposal","externalStorage":false,"recurringIdleRuntime":false}\n' > "$RUNNER_TEMP/connector-evidence/cleanup.json"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always()
+        with:
+          name: connector-stock-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/connector-evidence
+          if-no-files-found: error
+          retention-days: 7
