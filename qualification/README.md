@@ -16,11 +16,17 @@ acceptance are still required. Do not use this lane as installation authority.
 - Stock host source: `d69631b01b9c658f80bf8bed389863dce82643e1`, the source baseline
   associated with the stock `2026.1106.0` host.
 - Stock Linux AMD64 image manifest:
-  `ghcr.io/paperclipai/paperclip@sha256:281d80a20c0b333c519f158c77cd18a5096d086f648ed490d218ac7c8bc48e39`.
-  Its OCI revision matches the host source. The published image reports a git-derived
-  build version; the lane records actual health, server-package and build versions
-  separately. It does not rewrite them to a release number or assert equality with
-  the npm release artifact. Release/package equivalence remains to be reconciled.
+  `ghcr.io/paperclipai/paperclip@sha256:12ae7579165cbf11d8db71ef69cf01ff48660383e78541b6b2eba38939fa30c9`.
+  Resolved from release tag `2026.1106.0`; its OCI revision matches the host source
+  and its OCI version is `2026.1106.0`. The lane verifies that release label and
+  the actual health version, while recording server-package and build versions
+  separately. It never overrides the host version or claims byte equality with
+  the separate npm artifact.
+  The first preflight used a different same-source image that reported
+  `2026.1005.0+845.git.d69631b01` and failed installation with HTTP 400. The stock
+  loader rejects versions below the candidate's minimum `2026.1023.0`; source
+  identity alone is therefore insufficient. That failed run is retained, not
+  relabeled as release qualification.
 - `identity.json` records workflow checkout SHA separately from event SHA (a PR event
   can name a synthetic merge), candidate tree/package/lock hashes, SDK version,
   built worker/UI hashes, run/attempt/job and image manifest/config identity.

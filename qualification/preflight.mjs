@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { readFileSync, writeFileSync } from 'node:fs';
-import { digest, filesUnder, HOST_SOURCE } from './identity.mjs';
+import { assertHostRelease, digest, filesUnder, HOST_SOURCE } from './identity.mjs';
 
 const base = 'http://127.0.0.1:3100';
 const evidence = '/qualification/evidence';
@@ -21,8 +21,15 @@ async function api(path, body) {
     body: body === undefined ? undefined : JSON.stringify(body),
     signal: AbortSignal.timeout(15_000),
   });
-  assert(response.ok, `${path}: HTTP ${response.status}`);
-  return response.json();
+  const payload = await response.json();
+  if (!response.ok) {
+    // This namespace contains only synthetic data. Retain the bounded stock
+    // error, never a request body, config response or secret reference value.
+    const detail = typeof payload.error === 'string' ? payload.error.slice(0, 1200) : 'No stock error message';
+    report.httpFailure = { path, status: response.status, detail };
+    throw new Error(`${path}: HTTP ${response.status}: ${detail}`);
+  }
+  return payload;
 }
 
 async function ready() {
@@ -56,7 +63,10 @@ try {
     report.hostFiles[file] = digest(file);
   }
   report.actualServerPackageVersion = JSON.parse(readFileSync('/app/server/package.json', 'utf8')).version;
-  report.checks.push('stock host reached health readiness');
+  assertHostRelease(health.version);
+  assert.equal(health.deploymentMode, 'local_trusted');
+  assert.equal(health.deploymentExposure, 'private');
+  report.checks.push('exact stock release reached health readiness');
 
   // This is the installed path the stock loader consumes, not an SDK mock or
   // an import of the candidate into this driver process.

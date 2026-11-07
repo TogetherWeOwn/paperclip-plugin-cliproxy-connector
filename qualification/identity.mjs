@@ -6,7 +6,13 @@ import { resolve, relative, join } from 'node:path';
 
 export const CANDIDATE = 'c129014d765b400d8e547ff469499cd3c34429ff';
 export const HOST_SOURCE = 'd69631b01b9c658f80bf8bed389863dce82643e1';
-export const HOST_IMAGE = 'sha256:281d80a20c0b333c519f158c77cd18a5096d086f648ed490d218ac7c8bc48e39';
+export const HOST_RELEASE = '2026.1106.0';
+export const HOST_IMAGE = 'sha256:12ae7579165cbf11d8db71ef69cf01ff48660383e78541b6b2eba38939fa30c9';
+
+export function assertHostRelease(version) {
+  assert.equal(typeof version, 'string');
+  assert.equal(version.split('+')[0], HOST_RELEASE, `Unexpected stock host release: ${version}`);
+}
 
 export function digest(file) {
   return createHash('sha256').update(readFileSync(file)).digest('hex');
@@ -25,6 +31,7 @@ if (process.argv[1] && resolve(process.argv[1]) === resolve(import.meta.filename
   const evidence = resolve(process.argv[3]);
   const [image] = JSON.parse(readFileSync(join(evidence, 'image.json'), 'utf8'));
   assert.equal(image.Config.Labels['org.opencontainers.image.revision'], HOST_SOURCE);
+  assertHostRelease(image.Config.Labels['org.opencontainers.image.version']);
   assert.equal(image.Architecture, 'amd64');
   assert(image.RepoDigests.includes(`ghcr.io/paperclipai/paperclip@${HOST_IMAGE}`));
   assert.equal(execFileSync('git', ['-C', candidate, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim(), CANDIDATE);

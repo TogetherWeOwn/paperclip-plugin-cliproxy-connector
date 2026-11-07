@@ -3,7 +3,7 @@ import { test } from 'node:test';
 import { readFileSync, mkdtempSync, writeFileSync, symlinkSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { CANDIDATE, HOST_SOURCE, HOST_IMAGE, digest, filesUnder } from './identity.mjs';
+import { CANDIDATE, HOST_SOURCE, HOST_IMAGE, assertHostRelease, digest, filesUnder } from './identity.mjs';
 
 const workflow = readFileSync(new URL('../.github/workflows/qualify-stock.yml', import.meta.url), 'utf8');
 const driver = readFileSync(new URL('./preflight.mjs', import.meta.url), 'utf8');
@@ -16,6 +16,16 @@ test('workflow keeps candidate, workflow and stock identities separate', () => {
   assert(workflow.includes('path: candidate'));
   assert(workflow.includes('persist-credentials: false'));
   assert(!workflow.includes('secrets.'));
+});
+
+test('matching source alone cannot qualify an older host release', () => {
+  assertHostRelease('2026.1106.0');
+  assertHostRelease('2026.1106.0+0.git.d69631b01b');
+  assert.throws(() => assertHostRelease('2026.1005.0+845.git.d69631b01'));
+  assert.throws(() => assertHostRelease('2026.1106.1'));
+  assert.throws(() => assertHostRelease('2026.1106.0-rc.1'));
+  assert.throws(() => assertHostRelease(undefined));
+  assert(driver.includes('assertHostRelease(health.version)'));
 });
 
 test('runtime cannot reach provider or production services or retain a cloud resource', () => {
