@@ -61,11 +61,11 @@ test('browser shares only the isolated namespace and has a separately pinned hoo
 test('browser request policy refuses external origins, fixture ports and mutation', () => {
   const path = '/FIX/plugins/00000000-0000-0000-0000-000000000000';
   const origin = 'http://127.0.0.1:3100';
-  for (const allowed of [path, '/assets/index.js', '/_plugins/test/ui/index.js', '/api/companies']) {
+  for (const allowed of [path, '/assets/index.js', '/fonts/InterVariable.woff2', '/_plugins/test/ui/index.js', '/api/companies']) {
     assert(permittedRequest(`${origin}${allowed}`, 'GET', path));
   }
   assert(permittedRequest(`${origin}/api/plugins/test/bridge/data`, 'POST', path));
-  for (const url of ['https://example.invalid/v1', 'http://127.0.0.1:4310/observe', `${origin}/v1/models`]) {
+  for (const url of ['https://example.invalid/v1', 'https://example.invalid/fonts/InterVariable.woff2', 'http://127.0.0.1:4310/observe', `${origin}/v1/models`, `${origin}/fonts/unexpected.woff2`]) {
     assert(!permittedRequest(url, 'GET', path));
   }
   for (const url of ['/api/plugins/test/config', '/api/plugins/test/bridge/action', '/api/companies']) {

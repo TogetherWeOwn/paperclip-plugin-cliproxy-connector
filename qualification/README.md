@@ -110,7 +110,8 @@ an explicit Security supply-chain residual, not a claim that age proves safety.
 custom render harness or substituted SDK bridge. It records candidate UI response
 SHA256 and requires equality with the independently built artifact. HTTP requests
 are restricted to the stock loopback origin: the tested navigation path, native
-API GETs, assets/plugin modules/favicon, and plugin data POSTs only. Mutating actions,
+API GETs, assets/plugin modules/favicon, the exact stock `/fonts/InterVariable.woff2`
+asset, and plugin data POSTs only. Other font paths remain denied. Mutating actions,
 configuration POSTs, other loopback ports and external origins are denied. Same-host
 native API websocket connections are allowed; others are rejected. There is no
 network mocking, clock injection, inference endpoint or global-fetch substitution.
@@ -148,6 +149,17 @@ bindings simultaneously without changing one of those requirements. Configuratio
 validation is not a native member assessment and does not remove the blind spot.
 No production configuration change, protocol switch or candidate repair is implied.
 A separately selected candidate needs its own exact-candidate qualification.
+
+Native pool inspection is not the plugin's router assessment. In the pinned stock
+source, `server/src/services/ai-connection-router.ts:106–118` reports generic account
+eligibility/cached usage. Its allocation path invokes `routeAiConnection` only after
+authorizing candidates (`:205–275`). The pool branch of the supported adapter test
+preview (`server/src/routes/agents.ts:3258–3261`) explicitly returns
+`ai_connection_pool_task_test_required` without allocating a task or contacting a
+provider. Neither surface establishes native router eligibility. Until a supported
+synthetic task/allocation path within the no-inference boundary is exercised, native
+member/model eligibility remains missing; do not substitute pool inspection or
+loosen the fixture's inference refusal.
 
 Preparation downloads the public stock image and locked candidate dependencies before
 entering this network boundary. Browser execution must use the same network namespace,
