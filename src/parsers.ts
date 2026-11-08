@@ -32,7 +32,7 @@
 
 import { createHash } from "node:crypto";
 import { SINGLE_SEGMENT } from "./config.js";
-import type { AccountStatus, CreditsReading, UsageLimitRow } from "./types.js";
+import type { AccountStatus, CreditsReading, QuotaMetric, UsageLimitRow, UsageOverage } from "./types.js";
 
 /* ------------------------------------------------------------------ */
 /* small defensive accessors                                           */
@@ -397,6 +397,7 @@ export type ProviderKey =
   | "cloudflare"
   | "zai"
   | "opencode-go"
+  | "hopper"
   | "unknown-provider";
 
 /**
@@ -409,6 +410,7 @@ export type ProviderKey =
 export function normalizeProvider(channel: unknown): ProviderKey {
   const c = String(channel ?? "").toLowerCase().replace(/[_-]/g, "-");
   if (!c) return "unknown-provider";
+  if (c === "hopper") return "hopper";
   if (c.includes("claude") || c === "anthropic") return "claude";
   if (c.includes("codex") || c === "openai") return "codex";
   if (c.includes("devin") || c.includes("cognition")) return "devin";
@@ -500,6 +502,13 @@ function makeLimit(init: {
   metrics?: string[] | null;
   viaProviderApi?: boolean | null;
   spendControlBlocked?: boolean;
+  scope?: string | null;
+  windowDurationSeconds?: number | null;
+  resetInterval?: string | null;
+  used?: number | null;
+  limit?: number | null;
+  remaining?: number | null;
+  unit?: string | null;
 }): UsageLimitRow {
   return {
     id: init.id,
@@ -514,6 +523,15 @@ function makeLimit(init: {
     models: init.models ?? null,
     metrics: init.metrics ?? null,
     viaProviderApi: init.viaProviderApi ?? null,
+    ...("scope" in init ? {
+      scope: init.scope ?? null,
+      windowDurationSeconds: init.windowDurationSeconds ?? null,
+      resetInterval: init.resetInterval ?? null,
+      used: init.used ?? null,
+      limit: init.limit ?? null,
+      remaining: init.remaining ?? null,
+      unit: init.unit ?? null,
+    } : {}),
     ...(init.spendControlBlocked ? { spendControlBlocked: true } : {}),
   };
 }
@@ -561,6 +579,50 @@ export interface ParsedPluginQuota {
   planType: string | null;
   limits: UsageLimitRow[];
   warnings: string[];
+  quotaMetrics: QuotaMetric[] | null;
+  overage: UsageOverage | null;
+}
+
+function nonnegativeNumber(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : null;
+}
+
+function nullableBoolean(value: unknown): boolean | null {
+  return typeof value === "boolean" ? value : null;
+}
+
+/** Structured numeric summary only; never persist arbitrary provider objects. */
+function parseQuotaMetrics(value: unknown): QuotaMetric[] | null {
+  if (!Array.isArray(value)) return null;
+  const metrics: QuotaMetric[] = [];
+  for (const raw of value.slice(0, 32)) {
+    const metric = asObj(raw);
+    if (!metric) continue;
+    const key = getStr(metric, "key");
+    const label = sanitizeStatusMessage(getStr(metric, "label"));
+    const amount = nonnegativeNumber(metric.value);
+    if (!key || !/^[a-z][a-z0-9_]{0,63}$/.test(key) ||
+        SECRET_DOT_PREFIX.test(key.split("_")[0]) || isCredentialCore(key) ||
+        key.split("_").some(isCredentialToken) || !label || amount === null) continue;
+    metrics.push({
+      key, label, value: amount,
+      unit: sanitizeStatusMessage(getStr(metric, "unit")),
+      format: metric.format === "currency" || metric.format === "number" ? metric.format : null,
+      currency: typeof metric.currency === "string" && /^[A-Z]{3}$/.test(metric.currency) ? metric.currency : null,
+    });
+  }
+  return metrics.length ? metrics : null;
+}
+
+function parseOverage(value: unknown): UsageOverage | null {
+  const o = asObj(value);
+  if (!o) return null;
+  return {
+    enabled: nullableBoolean(o.enabled), available: nullableBoolean(o.available),
+    unlimited: nullableBoolean(o.unlimited), used: nonnegativeNumber(o.used),
+    limit: nonnegativeNumber(o.limit), remaining: nonnegativeNumber(o.remaining),
+    balance: nonnegativeNumber(o.balance), unit: sanitizeStatusMessage(getStr(o, "unit")),
+  };
 }
 
 /**
@@ -868,12 +930,12 @@ export function parsePluginQuota(
   const root = asObj(payload);
   if (!root) {
     warnings.push(`${provider}: plugin quota payload is not an object; treating as unknown.`);
-    return { planType: null, limits, warnings };
+    return { planType: null, limits, warnings, quotaMetrics: null, overage: null };
   }
 
   const sub = getObj(root, "Subscription", "subscription");
   const planType =
-    getStr(sub ?? {}, "Plan", "plan", "TierName", "tierName", "PlanName", "planName") ?? null;
+    getStr(sub ?? {}, "TierName", "tierName", "tier_name", "Plan", "plan", "PlanName", "planName") ?? null;
 
   // Payload-level `summary[]`: display-only context merged onto every row.
   const payloadMetrics = summarizeMetrics(root.Summary ?? root.summary ?? null);
@@ -908,16 +970,23 @@ export function parsePluginQuota(
         warnings.push(`${provider}: skipping a malformed quota bucket.`);
         continue;
       }
-      const windowName =
-        getStr(bucket, "Window", "window", "Name", "name", "id", "Id") ?? "window";
+      const rawWindow = getStr(bucket, "Window", "window", "Name", "name", "id", "Id") ?? "window";
+      const windowName = provider === "meta" && rawWindow.toLowerCase() === "5h" ? "window" : rawWindow;
+      const nativeFields = {
+        scope: bucket.scope == null && bucket.Scope == null ? null : sanitizeStatusMessage(getStr(bucket, "scope", "Scope")) ?? "unknown-scope",
+        windowDurationSeconds: nonnegativeNumber(bucket.windowDurationSeconds ?? bucket.window_duration_seconds),
+        resetInterval: sanitizeStatusMessage(getStr(bucket, "resetInterval", "reset_interval")),
+        used: nonnegativeNumber(bucket.used), limit: nonnegativeNumber(bucket.limit),
+        remaining: nonnegativeNumber(bucket.remaining), unit: sanitizeStatusMessage(getStr(bucket, "unit")),
+      };
       const remaining =
-        getNum(bucket, "RemainingFraction", "remainingFraction", "remaining", "Remaining", "percent") ??
+        getNum(bucket, "RemainingFraction", "remainingFraction", "remaining_fraction") ??
         null;
       // Some shapes report percent-consumed instead of percent-remaining.
       const consumed =
-        getNum(bucket, "UsedPercent", "usedPercent", "used", "Used", "consumed") ?? null;
+        getNum(bucket, "UsedPercent", "usedPercent", "consumed") ?? null;
       const resetsAt = toIsoTimestamp(
-        bucket.ResetTime ?? bucket.resetTime ?? bucket.resetsAt ?? bucket.ResetsAt ?? null,
+        bucket.ResetTime ?? bucket.resetTime ?? bucket.reset_time ?? bucket.resetsAt ?? bucket.ResetsAt ?? null,
       );
       const description = getStr(bucket, "Description", "description");
       const scope = bucket.Scope ?? bucket.scope ?? null;
@@ -928,21 +997,22 @@ export function parsePluginQuota(
 
       let usedPercent: number | null = null;
       let remainingPercent: number | null = null;
-      if (remaining !== null && remaining >= 0 && remaining <= 1.5) {
-        // `percent` aliases: opencode-go reports 0-100 percent remaining.
-        const frac = remaining > 1 ? remaining / 100 : remaining;
+      if (remaining !== null && remaining >= 0 && remaining <= 1) {
+        const frac = remaining;
         remainingPercent = Math.max(0, Math.min(100, frac * 100));
         usedPercent = 100 - remainingPercent;
+      } else if (bucket.percent !== undefined && parseRemainingPercentField(bucket.percent) !== null) {
+        remainingPercent = parseRemainingPercentField(bucket.percent);
+        usedPercent = 100 - (remainingPercent as number);
       } else if (consumed !== null && consumed >= 0 && consumed <= 150) {
         usedPercent = Math.min(150, consumed);
         remainingPercent = Math.max(0, 100 - Math.min(100, consumed));
       }
       if (usedPercent === null && remainingPercent === null) {
-        warnings.push(`${provider}: bucket ${JSON.stringify(windowName)} has no usable percent; skipping.`);
-        continue;
+        warnings.push(`${provider}: bucket ${JSON.stringify(windowName)} has no usable percent; marking it unknown.`);
       }
 
-      const exhausted = (remainingPercent ?? 100) <= 0;
+      const exhausted = bucket.limitReached === true || bucket.allowed === false || (remainingPercent ?? 100) <= 0;
       const gating =
         opts?.softGating === true
           ? false
@@ -955,8 +1025,9 @@ export function parsePluginQuota(
           remainingPercent,
           resetsAt,
           limitReached: exhausted,
-          allowed: exhausted ? false : true,
+          allowed: exhausted ? false : remainingPercent !== null || hasAdmissionSignal(provider) ? true : null,
           gating,
+          ...nativeFields,
           // Fetched at sync time: its observation is as fresh as the cache row.
           observedAt: opts?.observedAt ?? null,
           models: null,
@@ -1017,7 +1088,23 @@ export function parsePluginQuota(
   if (limits.length === 0 && (!groups || groups.length === 0)) {
     warnings.push(`${provider}: plugin quota payload has no Groups; treating as unknown.`);
   }
-  return { planType, limits, warnings };
+  // Meta and Hopper have two account-wide windows. A surviving healthy
+  // bucket cannot silently stand in for a missing or malformed sibling.
+  if (provider === "meta" || provider === "hopper") {
+    for (const window of provider === "meta" ? ["window", "weekly"] : ["5h", "weekly"]) {
+      if (limits.some((l) => l.id === `${provider}:${window}` && l.scope == null)) continue;
+      limits.push(makeLimit({
+        id: `${provider}:${window}`, label: `${provider} ${window}`,
+        gating: opts?.softGating !== true && isGatingWindow(provider, window, allowList),
+        observedAt: opts?.observedAt ?? null,
+      }));
+    }
+  }
+  return {
+    planType, limits, warnings,
+    quotaMetrics: parseQuotaMetrics(root.summary ?? root.Summary),
+    overage: parseOverage(root.overage ?? root.Overage),
+  };
 }
 
 function capitalize(s: string): string {
@@ -1897,8 +1984,7 @@ export interface ParsedAccount {
    * This entry's advertised plugin quota route (`quota_plugin_id`), or null
    * when it advertises none, opts out (`supports_quota: false`), or the id
    * is unusable. Lets same-provider accounts on different plugins each fetch
-   * their own quota; the provider-level hint is only the fallback for rows
-   * that advertise nothing.
+   * their own quota; a sibling hint never drives a fetch.
    */
   quotaPluginId: string | null;
   /** Reconciled lifecycle state. */
@@ -1932,6 +2018,9 @@ export interface ParsedAccount {
   cooldownUntil: string | null;
   /** Newest Codex credits reading across the entry's observations, if any. */
   credits: CreditsReading | null;
+  overage?: UsageOverage | null;
+  overageObservedAt?: string | null;
+  quotaMetrics?: QuotaMetric[] | null;
   parseWarnings: string[];
 }
 
@@ -1964,6 +2053,8 @@ export function parseAuthFiles(
      * legacy provider-level payload above, when present.
      */
     pluginPayloadByAuthIndex?: Map<string, unknown>;
+    /** Exact account binding from discovery; when supplied, no index/provider fallback. */
+    pluginPayloadByAccountKey?: Map<string, unknown>;
     /**
      * Live provider-API subscription answers by credential `auth_index`
      * (pinned `POST /v0/management/api-call` templates: Antigravity
@@ -2001,6 +2092,8 @@ export function parseAuthFiles(
   accounts: ParsedAccount[];
   unkeyed: number;
   warnings: string[];
+  /** Coverage failures only; successful mixed-route discovery stays informational. */
+  quotaWarnings: string[];
   /**
    * Per-provider plugin quota ids advertised by the entries themselves
    * (`quota_plugin_id`, unless `supports_quota: false`). First valid id wins
@@ -2010,6 +2103,7 @@ export function parseAuthFiles(
   pluginQuotaHints: Map<string, string>;
 } {
   const warnings: string[] = [];
+  const informationalWarnings = new Set<string>();
   const accounts: ParsedAccount[] = [];
   const pluginQuotaHints = new Map<string, string>();
   let unkeyed = 0;
@@ -2024,7 +2118,7 @@ export function parseAuthFiles(
       : [];
   if (entries.length === 0) {
     warnings.push("auth-files payload holds no entries; every configured provider will drift-warn as having no enabled accounts.");
-    return { accounts, unkeyed, warnings, pluginQuotaHints };
+    return { accounts, unkeyed, warnings, quotaWarnings: warnings.filter((w) => !informationalWarnings.has(w)), pluginQuotaHints };
   }
 
   const seenKeys = new Map<string, number>();
@@ -2090,15 +2184,15 @@ export function parseAuthFiles(
     if (!disabled) {
       const supportsQuota = entry.supports_quota ?? entry.supportsQuota ?? null;
       const hintedId = getStr(entry, "quota_plugin_id", "quotaPluginId");
-      if (hintedId !== null && supportsQuota !== false) {
+      if (hintedId !== null && (supportsQuota === null || supportsQuota === true)) {
         if (SINGLE_SEGMENT.test(hintedId)) {
           advertisedPluginId = hintedId;
           const prior = pluginQuotaHints.get(provider);
           if (prior === undefined) pluginQuotaHints.set(provider, hintedId);
           else if (prior !== hintedId) {
-            warnings.push(
-              `${provider}: entries advertise conflicting quota plugin ids; using ${JSON.stringify(prior)}.`,
-            );
+            const notice = `${provider}: entries advertise conflicting quota plugin ids; preserving each account's own route.`;
+            warnings.push(notice);
+            informationalWarnings.add(notice);
           }
         } else {
           warnings.push(
@@ -2252,14 +2346,18 @@ export function parseAuthFiles(
     // the legacy provider-level payload. A failed per-file fetch attaches
     // nothing — it never falls back to a provider-wide fetch that would 400
     // on current builds.
-    const pluginPayload =
-      authIndex !== null
+    const pluginPayload = opts.pluginPayloadByAccountKey !== undefined
+      ? opts.pluginPayloadByAccountKey.get(key)
+      : authIndex !== null
         ? opts.pluginPayloadByAuthIndex?.get(authIndex)
         : opts.pluginPayloadByProvider?.get(provider);
     let pluginQuota: ParsedPluginQuota | null = null;
     if (pluginPayload !== undefined && !disabled) {
       pluginQuota = parsePluginQuota(parserKey, pluginPayload, allowList, {
-        softGating,
+        // Meta normalization currently drops malformed source values and hides
+        // its provider-cache age. Keep it informational until parity is proven;
+        // only the retained direct read may establish Meta headroom.
+        softGating: softGating || parserKey === "meta",
         // Plugin-quota limits are fetched right now: their observation time is
         // the sync's fetch time, never the passive `observed_at`.
         observedAt: opts.now,
@@ -2292,7 +2390,7 @@ export function parseAuthFiles(
             ? parseAntigravitySubscription(apiPayload.body, apiObservedAt, allowList)
             : provider === "devin"
               ? parseDevinQuota(apiPayload.body, apiObservedAt, allowList)
-              : provider === "meta"
+              : (provider === "meta" || provider === "meta-muse")
                 ? parseMetaQuota(apiPayload.body, apiObservedAt, allowList)
                 : null;
         if (!parsedApi) {
@@ -2352,7 +2450,7 @@ export function parseAuthFiles(
     const liveIds = new Set(apiLimits.filter((l) => usableLive(l) && accountLevel(l)).map((l) => l.id));
     const live = (l: UsageLimitRow) => (accountLevel(l) ? !liveIds.has(l.id) : true);
     const twinIds = new Set(
-      [...limits.filter(live), ...pluginLimits.filter(live)].filter(accountLevel).map((l) => l.id),
+      [...limits.filter(live), ...pluginLimits.filter(live)].filter((l) => l.gating && accountLevel(l)).map((l) => l.id),
     );
     const apiRows = apiLimits.filter((l) => usableLive(l) || !twinIds.has(l.id));
     const baseStamped = softGating
@@ -2484,10 +2582,16 @@ export function parseAuthFiles(
       // Nulling it here dead-coded that branch and re-waited forever.
       cooldownUntil: nextRetryAfter,
       credits: disabled ? null : credits,
+      quotaMetrics: disabled ? null : pluginQuota?.quotaMetrics ?? null,
+      overageObservedAt: disabled ? null : credits ? credits.observedAt : pluginQuota?.overage ? opts.now : null,
+      overage: disabled ? null : credits ? {
+        enabled: null, available: credits.hasCredits, unlimited: credits.unlimited,
+        used: null, limit: null, remaining: null, balance: credits.balance, unit: "credits",
+      } : pluginQuota?.overage ?? null,
       parseWarnings: [...parseWarnings, ...(pluginQuota?.warnings ?? [])],
     });
   }
-  return { accounts, unkeyed, warnings, pluginQuotaHints };
+  return { accounts, unkeyed, warnings, quotaWarnings: warnings.filter((w) => !informationalWarnings.has(w)), pluginQuotaHints };
 }
 
 /**

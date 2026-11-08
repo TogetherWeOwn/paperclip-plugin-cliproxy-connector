@@ -17,6 +17,8 @@ export interface ProviderEntry {
   provider: string;
   /** Paperclip connection id for this provider family (stock model ids). */
   connectionId: string;
+  /** Additional gateway connections sharing this provider's account inventory. */
+  connectionIds?: string[];
   /**
    * The operator confirms this provider has no hidden config-key credentials
    * (CLIProxy omits `claude-api-key`, `codex-api-key` incl. MetaKey/XAIKey
@@ -68,7 +70,7 @@ export interface ConnectorConfig {
    * are request-count fidelity for api-key lanes, never a token split.
    */
   apiKeyUsageEnabled?: boolean;
-  /** Sync cadence in minutes. The cron job runs every 5; larger values skip. */
+  /** Freshness baseline in minutes. Scheduling stays fixed at every five minutes. */
   syncIntervalMinutes: number;
   /** Default reserve: providers at or below this remaining % are not headroom. */
   reservePercent: number;
@@ -130,6 +132,61 @@ export interface ConnectorConfig {
   showAccountEmails?: boolean;
 }
 
+const secretRefSchema = {
+  type: "object",
+  description: "Board-created secret reference, never a raw credential. Resolved only during sync.",
+};
+const reserveSchema = { type: "number", minimum: 0, exclusiveMaximum: 50 };
+
+/** Operator settings; parseConfig remains authoritative for cross-field validation. */
+export const CONNECTOR_CONFIG_SCHEMA = {
+  type: "object",
+  required: ["cliproxyBaseUrl", "managementKeyHeader", "managementSecretRef"],
+  properties: {
+    cliproxyBaseUrl: { type: "string", description: "Loopback-only CLIProxy base URL." },
+    managementKeyHeader: { type: "string", minLength: 1 },
+    managementSecretRef: secretRefSchema,
+    clientApiKeySecretRef: secretRefSchema,
+    openRouterSecretRef: secretRefSchema,
+    providers: {
+      type: "array",
+      items: {
+        type: "object",
+        required: ["provider"],
+        anyOf: [{ required: ["connectionId"] }, {
+          required: ["connectionIds"], properties: { connectionIds: { minItems: 1 } },
+        }],
+        properties: {
+          provider: { type: "string", minLength: 1 },
+          connectionId: { type: "string", minLength: 1 },
+          connectionIds: { type: "array", items: { type: "string", minLength: 1 } },
+          completeInventory: { type: "boolean", default: false },
+          creditsCountAsHeadroom: { type: "boolean", default: false },
+        },
+      },
+    },
+    syncIntervalMinutes: {
+      type: "number", minimum: 1, maximum: 60, default: 5,
+      description: "Freshness baseline in minutes only. Polling stays fixed at every five minutes, with a one-minute minimum between syncs.",
+    },
+    reservePercent: { ...reserveSchema, default: 10 },
+    perPoolReservePercent: { type: "object", additionalProperties: reserveSchema },
+    recheckSeconds: { type: "number", default: 60 },
+    maxAgeMultiplier: { type: "number", default: 2 },
+    graceMultiplier: { type: "number", default: 3 },
+    futureSkewSeconds: { type: "number", default: 30 },
+    providerWindows: { type: "object", additionalProperties: { type: "array", items: { type: "string", minLength: 1 } } },
+    pluginQuotaIds: { type: "object", additionalProperties: { type: "string", pattern: "^[A-Za-z0-9][A-Za-z0-9_-]*$" } },
+    apiCallEnabled: { type: "object", additionalProperties: { type: "boolean" } },
+    metaQuota: { type: "object", properties: { enabled: { type: "boolean", default: true } } },
+    apiKeyUsageEnabled: { type: "boolean", default: false },
+    audienceConfirmed: { type: "boolean", default: false },
+    showAccountEmails: { type: "boolean", default: false },
+    ignoredProviders: { type: "array", items: { type: "string", minLength: 1 } },
+    ignoredAuthFileRefs: { type: "array", items: { type: "string", minLength: 1 } },
+  },
+};
+
 export const DEFAULTS = {
   syncIntervalMinutes: 5,
   reservePercent: 10,
@@ -156,6 +213,7 @@ export const DEFAULT_PROVIDER_WINDOWS: Record<string, string[]> = {
   // their time window (`parseAntigravityQuota`), and the Meta key answer
   // serves `window` + `weekly` (`parseMetaQuota`).
   meta: ["meta", "window", "weekly"],
+  hopper: ["5h", "weekly"],
   antigravity: ["antigravity", "5h", "weekly", "daily", "monthly"],
   devin: ["devin", "5h", "weekly", "daily"],
   synthetic: ["weekly", "rolling-5h", "5h", "subscription"],
@@ -195,6 +253,8 @@ export function isLoopbackUrl(raw: string): boolean {
 
 export interface ConfigValidation {
   ok: boolean;
+  /** False on operational errors; display-only drift acceptance errors do not block cached routing. */
+  routingOk: boolean;
   warnings: string[];
   errors: string[];
 }
@@ -257,8 +317,9 @@ export function parseConfig(raw: unknown): { config: ConnectorConfig; validation
   }
 
   const reservePercent = num(r.reservePercent, DEFAULTS.reservePercent);
-  if (!(reservePercent > 0 && reservePercent < 50)) {
-    errors.push(`reservePercent must be within (0, 50); got ${reservePercent}.`);
+  if (r.reservePercent !== undefined &&
+      (typeof r.reservePercent !== "number" || !Number.isFinite(r.reservePercent) || r.reservePercent < 0 || r.reservePercent >= 50)) {
+    errors.push("reservePercent must be within [0, 50); zero means no reserve.");
   }
   const syncIntervalMinutes = num(r.syncIntervalMinutes, DEFAULTS.syncIntervalMinutes);
   if (!(syncIntervalMinutes >= 1 && syncIntervalMinutes <= 60)) {
@@ -284,7 +345,19 @@ export function parseConfig(raw: unknown): { config: ConnectorConfig; validation
         continue;
       }
       const provider = str(entryRaw.provider).trim().toLowerCase();
-      const connectionId = str(entryRaw.connectionId).trim();
+      const aliases = entryRaw.connectionIds;
+      if (aliases !== undefined &&
+          (!Array.isArray(aliases) || !aliases.every((id) => typeof id === "string" && id.trim()))) {
+        errors.push(`${where}.connectionIds must be a list of non-empty Paperclip connection ids.`);
+        continue;
+      }
+      if (entryRaw.connectionId !== undefined &&
+          (typeof entryRaw.connectionId !== "string" || !entryRaw.connectionId.trim())) {
+        errors.push(`${where}.connectionId must be a non-empty Paperclip connection id when supplied.`);
+        continue;
+      }
+      const connectionIds = [...new Set(((aliases as string[] | undefined) ?? []).map((id) => id.trim()))];
+      const connectionId = str(entryRaw.connectionId).trim() || connectionIds[0] || "";
       if (!provider) {
         errors.push(`${where}.provider is required: the CLIProxy provider string from auth-files (e.g. claude, codex, meta).`);
         continue;
@@ -298,13 +371,15 @@ export function parseConfig(raw: unknown): { config: ConnectorConfig; validation
         errors.push(`${where} for ${JSON.stringify(provider)}: connectionId must be a non-empty Paperclip connection id.`);
         continue;
       }
-      const prev = seenConnections.get(connectionId);
-      if (prev !== undefined && prev !== provider) {
-        warnings.push(
-          `providers: connection ${connectionId} is mapped from both ${prev} and ${provider}; per-provider aggregates may attribute the same connection twice.`,
-        );
-      } else {
-        seenConnections.set(connectionId, provider);
+      for (const id of new Set([connectionId, ...connectionIds])) {
+        const prev = seenConnections.get(id);
+        if (prev !== undefined && prev !== provider) {
+          errors.push(
+            `providers: connection ${id} is mapped from both ${prev} and ${provider}; each connection must map to exactly one provider.`,
+          );
+        } else {
+          seenConnections.set(id, provider);
+        }
       }
       const creditsCountAsHeadroom = entryRaw.creditsCountAsHeadroom === true;
       if (creditsCountAsHeadroom && provider !== "codex") {
@@ -315,6 +390,7 @@ export function parseConfig(raw: unknown): { config: ConnectorConfig; validation
       providers.push({
         provider,
         connectionId,
+        ...(aliases !== undefined ? { connectionIds: [...new Set([connectionId, ...connectionIds])] } : {}),
         completeInventory: entryRaw.completeInventory === true,
         ...(creditsCountAsHeadroom ? { creditsCountAsHeadroom } : {}),
       });
@@ -415,8 +491,8 @@ export function parseConfig(raw: unknown): { config: ConnectorConfig; validation
   const perPoolIn = (r.perPoolReservePercent ?? {}) as Record<string, unknown>;
   if (isPlainObject(perPoolIn)) {
     for (const [poolId, value] of Object.entries(perPoolIn)) {
-      if (typeof value !== "number" || !(value > 0 && value < 50)) {
-        errors.push(`perPoolReservePercent[${poolId}] must be within (0, 50).`);
+      if (typeof value !== "number" || !Number.isFinite(value) || value < 0 || value >= 50) {
+        errors.push(`perPoolReservePercent[${poolId}] must be within [0, 50).`);
         continue;
       }
       perPoolReservePercent[poolId] = value;
@@ -433,8 +509,9 @@ export function parseConfig(raw: unknown): { config: ConnectorConfig; validation
   // are additive to the provider rows above — an ignored provider still needs
   // no providers[] row, and an ignored auth-file ref stays out of the quota
   // fetch either way (refused names are never fetched).
-  const ignoredProviders = parseIgnoredProviderList(r.ignoredProviders, errors, warnings);
-  const ignoredAuthFileRefs = parseIgnoredAuthFileRefs(r.ignoredAuthFileRefs, errors, warnings);
+  const displayErrors: string[] = [];
+  const ignoredProviders = parseIgnoredProviderList(r.ignoredProviders, displayErrors, warnings);
+  const ignoredAuthFileRefs = parseIgnoredAuthFileRefs(r.ignoredAuthFileRefs, displayErrors, warnings);
   let showAccountEmails = false;
   if (r.showAccountEmails !== undefined && r.showAccountEmails !== null) {
     if (typeof r.showAccountEmails !== "boolean") {
@@ -479,7 +556,10 @@ export function parseConfig(raw: unknown): { config: ConnectorConfig; validation
     ignoredAuthFileRefs,
     showAccountEmails,
   };
-  return { config, validation: { ok: errors.length === 0, warnings, errors } };
+  return { config, validation: {
+    ok: errors.length === 0 && displayErrors.length === 0,
+    routingOk: errors.length === 0, warnings, errors: [...errors, ...displayErrors],
+  } };
 }
 
 /**
@@ -494,6 +574,7 @@ export const DEFAULT_LIVE_QUOTA_PROVIDERS: Record<string, boolean> = {
   antigravity: true,
   devin: true,
   meta: true,
+  "meta-muse": true,
 };
 
 /** Whether the pinned live `api-call` rounds may run for a provider family. */
@@ -613,6 +694,11 @@ export function isKnownProviderWord(provider: string): boolean {
   return KNOWN_PROVIDER_WORDS.has(provider.toLowerCase());
 }
 
+/** All connection bindings for a provider, including the legacy primary id. */
+export function providerConnectionIds(entry: ProviderEntry): string[] {
+  return [...new Set([entry.connectionId, ...(entry.connectionIds ?? [])])];
+}
+
 /**
  * Effective reserve for a pool (percent remaining that still routes).
  *
@@ -629,7 +715,7 @@ export function effectiveReservePercent(
     return config.perPoolReservePercent[pool.id] as number;
   }
   const t = pool.thresholdPercent;
-  if (typeof t === "number" && Number.isFinite(t) && t > 50 && t < 100) {
+  if (typeof t === "number" && Number.isInteger(t) && t >= 1 && t <= 100) {
     return 100 - t;
   }
   return config.reservePercent;

@@ -302,7 +302,67 @@ describe("stripTrailingSlashes (non-regex trailing-slash trim)", () => {
   });
 });
 
+describe("connection aliases", () => {
+  it("accepts aliases alone and combines them with the legacy primary id", () => {
+    const { config, validation } = parseConfig(base({ providers: [
+      { provider: "codex", connectionIds: [" conn-codex ", "conn-sol", "conn-sol"] },
+      { provider: "claude", connectionId: "conn-primary", connectionIds: ["conn-alt"] },
+    ] }));
+    expect(validation.ok).toBe(true);
+    expect(config.providers[0]).toMatchObject({
+      connectionId: "conn-codex", connectionIds: ["conn-codex", "conn-sol"],
+    });
+    expect(config.providers[1]?.connectionIds).toEqual(["conn-primary", "conn-alt"]);
+  });
+
+  it("rejects ambiguous primary or alias bindings across providers", () => {
+    for (const second of [
+      { connectionId: "conn-shared" },
+      { connectionId: "conn-other", connectionIds: ["conn-shared"] },
+    ]) {
+      const { validation } = parseConfig(base({ providers: [
+        { provider: "codex", connectionId: "conn-codex", connectionIds: ["conn-shared"] },
+        { provider: "claude", ...second },
+      ] }));
+      expect(validation.ok).toBe(false);
+      expect(validation.errors.join(" ")).toContain("exactly one provider");
+    }
+  });
+
+  it.each([null, "conn-sol", [""], ["   "], [1], {}])("rejects malformed alias lists: %j", (connectionIds) => {
+    expect(parseConfig(base({ providers: [
+      { provider: "codex", connectionId: "conn-codex", connectionIds },
+    ] })).validation.ok).toBe(false);
+  });
+
+  it("rejects an empty list without a legacy binding", () => {
+    expect(parseConfig(base({ providers: [{ provider: "codex", connectionIds: [] }] })).validation.ok).toBe(false);
+  });
+});
+
 describe("reserve math (kept from v1)", () => {
+  it.each([1, 50, 51, 90, 99, 100])("honors native integer threshold %i", (thresholdPercent) => {
+    const { config } = parseConfig(base());
+    expect(effectiveReservePercent(config, { thresholdPercent })).toBe(100 - thresholdPercent);
+  });
+
+  it.each([0, 101, -1, 90.5, NaN, Infinity, "100", null])("falls back for invalid threshold %j", (thresholdPercent) => {
+    const { config } = parseConfig(base({ reservePercent: 17 }));
+    expect(effectiveReservePercent(config, { thresholdPercent })).toBe(17);
+  });
+
+  it("allows zero reserve at company and pool scope, preserving override precedence", () => {
+    const { config, validation } = parseConfig(base({ reservePercent: 0, perPoolReservePercent: { zero: 0, reserved: 25 } }));
+    expect(validation.ok).toBe(true);
+    expect(effectiveReservePercent(config, {})).toBe(0);
+    expect(effectiveReservePercent(config, { id: "zero", thresholdPercent: 1 })).toBe(0);
+    expect(effectiveReservePercent(config, { id: "reserved", thresholdPercent: 100 })).toBe(25);
+  });
+
+  it.each([-1, 50, 100, NaN, Infinity, "0"])("rejects invalid reserve %j instead of silently defaulting", (reservePercent) => {
+    expect(parseConfig(base({ reservePercent })).validation.ok).toBe(false);
+    expect(parseConfig(base({ perPoolReservePercent: { pool: reservePercent } })).validation.ok).toBe(false);
+  });
   it("pool thresholdPercent derives 100 - t; per-pool override wins", () => {
     const { config } = parseConfig(base({ reservePercent: 10, perPoolReservePercent: { "pool-x": 25 } }));
     expect(effectiveReservePercent(config, { id: "pool-x", thresholdPercent: 90 })).toBe(25);

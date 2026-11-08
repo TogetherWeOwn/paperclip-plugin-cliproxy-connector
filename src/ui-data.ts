@@ -19,7 +19,7 @@
  */
 
 import { aggregateProvider, creditsPositive } from "./aggregate.js";
-import { graceMs, maxAgeMs, type ConnectorConfig } from "./config.js";
+import { graceMs, maxAgeMs, providerConnectionIds, type ConnectorConfig } from "./config.js";
 import { providerDisplayName } from "./models.js";
 import { normalizeProvider, quotaBlindReason } from "./parsers.js";
 import { strikeWaitUntil } from "./sync.js";
@@ -96,6 +96,8 @@ export interface ProviderAccountDetail {
 
 export interface AccountCardLimit {
   id: string;
+  /** Presentation identity only; `id` retains its routing/window meaning. */
+  renderKey: string;
   label: string;
   usedPercent: number | null;
   remainingPercent: number | null;
@@ -120,6 +122,7 @@ export interface ProviderCard {
   /** Human provider label for the UI (raw word fallback, never routing). */
   displayName: string;
   connectionId: string;
+  connectionIds: string[];
   completeInventory: boolean;
   /** Provider row opt-in: positive paid credits count as headroom (TWO-2107). */
   creditsCountAsHeadroom: boolean;
@@ -402,6 +405,15 @@ function toAccountDetail(
     .map((l) => (l.resetsAt ? Date.parse(l.resetsAt) : NaN))
     .filter((t) => !Number.isNaN(t) && t > nowMs);
   const nextReset = resetMs.length > 0 ? new Date(Math.min(...resetMs)).toISOString() : null;
+  const occurrences = new Map<string, number>();
+  const renderKeys = row.limits.map((l) => {
+    // Scope/model/source separate observations of the same semantic window.
+    // Exact twins have no upstream identity: retain distinct occurrence slots.
+    const identity = JSON.stringify([l.id, l.scope ?? null, [...(l.models ?? [])].sort(), l.viaProviderApi === true]);
+    const occurrence = occurrences.get(identity) ?? 0;
+    occurrences.set(identity, occurrence + 1);
+    return JSON.stringify([identity, occurrence]);
+  });
   return {
     key: row.key,
     maskedLabel: row.key.length > 14 ? `${row.key.slice(0, 13)}…` : row.key,
@@ -416,8 +428,9 @@ function toAccountDetail(
     quotaBlindReason: blindReason,
     freshness,
     checkedAt: row.checkedAt,
-    limits: row.limits.map((l) => ({
+    limits: row.limits.map((l, i) => ({
       id: l.id,
+      renderKey: renderKeys[i],
       label: l.label,
       usedPercent: l.usedPercent,
       remainingPercent: l.remainingPercent,
@@ -481,6 +494,7 @@ function buildProviderCards(args: {
         provider: entry.provider,
         displayName: providerDisplayName(entry.provider),
         connectionId: entry.connectionId,
+        connectionIds: providerConnectionIds(entry),
         completeInventory: entry.completeInventory,
         creditsCountAsHeadroom: entry.creditsCountAsHeadroom === true,
         creditHeadroomAccounts: verdict.creditHeadroomAccounts,

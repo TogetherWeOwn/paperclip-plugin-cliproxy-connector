@@ -107,6 +107,92 @@ function redactedAuthFiles() {
   };
 }
 
+describe("typed normalized quota observations", () => {
+  it("preserves Codex overage balance and original observation age without inventing availability", () => {
+    const accounts = parseAuthFiles({ files: [{ id: "c", provider: "codex", quota: { observed_at: NOW, signals: { "x-codex-credits-balance": "12.5" } } }] }, { now: iso(NOW_MS + 60000), allowLists: DEFAULT_PROVIDER_WINDOWS }).accounts;
+    expect(accounts[0]?.overage).toMatchObject({ balance: 12.5, enabled: null, available: null, remaining: null, unit: "credits" });
+    expect(accounts[0]?.overageObservedAt).toBe(NOW);
+  });
+
+  it("preserves numeric metrics and native limits without converting absolute usage into percent", () => {
+    const parsed = parsePluginQuota("hopper", {
+      summary: [
+        { key: "account_balance_usd", label: "Balance", value: 12.5, format: "currency", currency: "USD" },
+        { key: "missing", label: "Unknown", value: null },
+        { key: "negative", label: "Bad", value: -1 },
+      ],
+      groups: [{ buckets: [
+        { window: "5h", used: 5, limit: 20, remaining: 15, unit: "USD", remainingFraction: 0.75, windowDurationSeconds: 18000 },
+        { window: "weekly", used: 7, limit: null, unit: "USD" },
+      ] }],
+      overage: { enabled: true, balance: null, available: null },
+    }, DEFAULT_PROVIDER_WINDOWS.hopper, { observedAt: NOW });
+    expect(parsed.quotaMetrics).toEqual([{ key: "account_balance_usd", label: "Balance", value: 12.5, format: "currency", currency: "USD", unit: null }]);
+    expect(parsed.limits[0]).toMatchObject({ used: 5, limit: 20, remaining: 15, unit: "USD", remainingPercent: 75, windowDurationSeconds: 18000 });
+    expect(parsed.limits.find((l) => l.id === "hopper:weekly")).toMatchObject({ usedPercent: null, remainingPercent: null, allowed: null, used: 7, limit: null, remaining: null });
+    expect(parsed.overage).toMatchObject({ enabled: true, available: null, balance: null, remaining: null });
+  });
+
+  it.each(["feature", {}, 42, ""])("does not accept feature or malformed scope as account-wide Hopper coverage: %j", (scope) => {
+    const parsed = parsePluginQuota("hopper", {
+      groups: [{ buckets: [{ window: "5h", scope, remainingFraction: 1 }, { window: "weekly", remainingFraction: 1 }] }],
+    }, DEFAULT_PROVIDER_WINDOWS.hopper, { observedAt: NOW });
+    expect(parsed.limits.find((l) => l.id === "hopper:5h" && l.gating)).toMatchObject({ remainingPercent: null, allowed: null });
+    expect(parsed.limits.filter((l) => l.id === "hopper:5h")).toHaveLength(2);
+  });
+
+  it.each(["monthly_spend_limit_usd", Array(13).fill("quota").join("_").slice(0, 64)])("preserves benign structured metric key %s", (key) => {
+    const parsed = parsePluginQuota("hopper", { summary: [{ key, label: "Balance", value: 12.5 }] }, DEFAULT_PROVIDER_WINDOWS.hopper);
+    expect(parsed.quotaMetrics?.[0]).toMatchObject({ key, value: 12.5 });
+  });
+
+  it.each(["sk_live_a1b2c3d4", "secret_private_balance", "abcdefghijklmnopqrstuvwxyz", "balance_a1b2c3d4", Array(14).fill("quota").join("_")])("refuses credential-shaped or oversized metric key %s", (key) => {
+    const parsed = parsePluginQuota("hopper", { summary: [{ key, label: "Balance", value: 12.5 }] }, DEFAULT_PROVIDER_WINDOWS.hopper);
+    expect(parsed.quotaMetrics).toBeNull();
+    expect(JSON.stringify(parsed)).not.toContain(key);
+  });
+
+  it("canonicalizes Meta windows and prefers tier while retaining incomplete coverage as unknown", () => {
+    const parsed = parsePluginQuota("meta", {
+      subscription: { plan: "subscription", tierName: "Pro" },
+      groups: [{ buckets: [{ window: "5h", remainingFraction: 0.8 }] }],
+    }, DEFAULT_PROVIDER_WINDOWS.meta, { observedAt: NOW });
+    expect(parsed.planType).toBe("Pro");
+    expect(parsed.limits.find((l) => l.id === "meta:window")).toMatchObject({ remainingPercent: 80, gating: true });
+    expect(parsed.limits.find((l) => l.id === "meta:weekly")).toMatchObject({ remainingPercent: null, allowed: null, gating: true });
+  });
+
+  it("keeps normalized Meta informational until parity and parses the exact meta-muse fallback", () => {
+    const payload = { files: [{ id: "m", provider: "meta-muse", auth_index: "m" }] };
+    const options = {
+      now: NOW, allowLists: DEFAULT_PROVIDER_WINDOWS,
+      pluginPayloadByAuthIndex: new Map([["m", { groups: [{ buckets: [{ window: "5h", remainingFraction: 1 }, { window: "weekly", remainingFraction: 1 }] }] }]]),
+    };
+    const blind = parseAuthFiles(payload, options).accounts[0];
+    expect(blind).toMatchObject({ provider: "meta-muse", quotaBlind: true });
+    expect(blind?.limits.every((l) => !l.gating)).toBe(true);
+    const fallback = parseAuthFiles(payload, {
+      ...options,
+      apiCallPayloadByAuthIndex: new Map([["m", { statusCode: 200, observedAt: NOW, body: { subs_usage: { window: { used_percent: 25 }, weekly: { used_percent: -1 } } } }]]),
+    }).accounts[0];
+    expect(fallback?.quotaBlind).toBe(false);
+    expect(fallback?.limits.filter((l) => l.gating)).toHaveLength(2);
+    expect(fallback?.limits.find((l) => l.id === "meta:weekly" && l.gating)?.remainingPercent).toBeNull();
+  });
+
+  it("keeps Hopper identity exact and balance informational, with missing weekly coverage unknown", () => {
+    expect(normalizeProvider("hopper")).toBe("hopper");
+    expect(normalizeProvider("not-hopper")).toBe("unknown-provider");
+    const parsed = parseAuthFiles({ files: [{ id: "hopper", provider: "hopper", auth_index: "h" }] }, {
+      now: NOW, allowLists: DEFAULT_PROVIDER_WINDOWS,
+      pluginPayloadByAuthIndex: new Map([["h", { summary: [{ key: "account_balance_usd", label: "Balance", value: 99 }], groups: [{ buckets: [{ window: "5h", remainingFraction: 0 }] }] }]]),
+    });
+    expect(parsed.accounts[0]).toMatchObject({ provider: "hopper", quotaBlind: false, credits: null });
+    expect(parsed.accounts[0]?.limits.find((l) => l.id === "hopper:weekly")?.remainingPercent).toBeNull();
+    expect(parsed.accounts[0]?.quotaMetrics?.[0]?.value).toBe(99);
+  });
+});
+
 describe("provider normalization (parser keys only, never identity)", () => {
   it("maps CLIProxy provider words to parser keys", () => {
     expect(normalizeProvider("claude")).toBe("claude");

@@ -87,6 +87,40 @@ const LAST_SYNC = {
 };
 
 describe("page data (per-provider)", () => {
+  it("keeps rendering keys unique for repeated semantic ids and stable across value changes", () => {
+    const config = testConfig();
+    const base = row().limits[0];
+    const account = row({ limits: [
+      { ...base, scope: "feature", gating: false },
+      { ...base, scope: null, remainingPercent: null, allowed: null },
+      { ...base, scope: "feature", gating: false },
+      { ...base, models: ["model-b", "model-a"] },
+      { ...base, models: ["model-a"] },
+      { ...base, viaProviderApi: true },
+    ] });
+    const limits = () => buildPageData({ now: NOW, config, rows: { [account.key]: account },
+      lastSync: LAST_SYNC, strike: emptyStrikeBudget() }).providers[0].accounts[0].limits;
+    const keys = limits().map((l) => l.renderKey);
+    expect(new Set(keys).size).toBe(6);
+    expect(limits().every((l) => l.id === base.id)).toBe(true);
+    account.limits = account.limits.map((l) => ({ ...l, label: "Updated", remainingPercent: 30,
+      observedAt: "2026-11-01T12:01:00Z", resetsAt: "2026-11-01T13:00:00Z",
+      models: l.models ? [...l.models].reverse() : null }));
+    expect(limits().map((l) => l.renderKey)).toEqual(keys);
+    account.limits.reverse();
+    expect(limits().map((l) => l.renderKey)).toEqual([keys[5], keys[4], keys[3], keys[0], keys[1], keys[2]]);
+  });
+  it("shows every connection alias without duplicating the provider or its accounts", () => {
+    const config = testConfig();
+    config.providers = [{ provider: "codex", connectionId: "conn-codex", connectionIds: ["conn-sol"], completeInventory: true }];
+    const page = buildPageData({ now: NOW, config,
+      rows: { "acct-aaa": row({ provider: "codex" }) }, lastSync: LAST_SYNC, strike: emptyStrikeBudget(),
+    });
+    expect(page.providers).toHaveLength(1);
+    expect(page.providers[0]?.connectionIds).toEqual(["conn-codex", "conn-sol"]);
+    expect(page.providers[0]?.accounts).toHaveLength(1);
+    expect(page.providers[0]?.enabledAccounts).toBe(1);
+  });
   it("renders one card per providers[] row with aggregate state, connection, and inventory flag", () => {
     const page = buildPageData({
       now: NOW,

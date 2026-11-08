@@ -69,6 +69,36 @@ export interface UsageLimitRow {
    * a spend-control block exists to cap paid spend.
    */
   spendControlBlocked?: boolean;
+  /** Native typed observation fields; absent telemetry is null, never zero. */
+  scope?: string | null;
+  windowDurationSeconds?: number | null;
+  resetInterval?: string | null;
+  used?: number | null;
+  limit?: number | null;
+  remaining?: number | null;
+  unit?: string | null;
+}
+
+/** Provider-reported numeric summary, informational only (never routing credit). */
+export interface QuotaMetric {
+  key: string;
+  label: string;
+  value: number;
+  unit: string | null;
+  format: "number" | "currency" | null;
+  currency: string | null;
+}
+
+/** Native overage observation; enabled alone does not prove funded availability. */
+export interface UsageOverage {
+  enabled: boolean | null;
+  available: boolean | null;
+  unlimited: boolean | null;
+  used: number | null;
+  limit: number | null;
+  remaining: number | null;
+  balance: number | null;
+  unit: string | null;
 }
 
 /**
@@ -152,6 +182,10 @@ export interface AccountUsageRow {
    * quota windows (never a 429 cooldown or `retry-after`).
    */
   credits?: CreditsReading | null;
+  overage?: UsageOverage | null;
+  /** Original credits observation time; a cache refresh does not refresh it. */
+  overageObservedAt?: string | null;
+  quotaMetrics?: QuotaMetric[] | null;
 }
 
 /** One paid-credits reading (Codex `x-codex-credits-*` headers). */
@@ -331,6 +365,8 @@ export interface SyncSummary {
    */
   acceptedDrift?: DriftFinding[];
   errors: string[];
+  /** Quota discovery/parser failures only; optional catalog/display warnings stay in errors. */
+  quotaErrors?: string[];
   skipped: boolean;
   skipReason: string | null;
   /**

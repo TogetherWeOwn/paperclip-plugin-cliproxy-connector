@@ -5,6 +5,7 @@
  * key except as a transient string inside a single sync run (resolved per run
  * via `secrets.read-ref`, kept in memory only, never persisted or logged).
  */
+import { randomUUID } from "node:crypto";
 import type { AiConnectionRouterRequest, AiConnectionRouterResult } from "@paperclipai/shared";
 import { definePlugin } from "@paperclipai/plugin-sdk";
 import type {
@@ -12,8 +13,9 @@ import type {
   PluginApiResponse,
   PluginContext,
 } from "@paperclipai/plugin-sdk";
-import { parseConfig, stripTrailingSlashes, type ConnectorConfig } from "./config.js";
+import { maxAgeMs, parseConfig, stripTrailingSlashes, type ConnectorConfig } from "./config.js";
 import { createLoopbackFetch } from "./loopback-fetch.js";
+import { buildDiagnostics, diagnosticsCacheWithinBounds, diagnosticsConfigWithinBounds, DIAGNOSTICS_DECLARATION, DIAGNOSTICS_TOOL, parseDiagnosticsParams } from "./diagnostics.js";
 import {
   DRIFT_LEDGER_STATE_KEY,
   LAST_ERROR_STATE_KEY,
@@ -226,17 +228,149 @@ async function loadRequestCounts(
 async function resolveCompany(
   ctx: PluginContext,
   companyId: string,
-): Promise<{ config: ReturnType<typeof parseConfig>["config"]; ok: boolean }> {
+): Promise<{ config: ReturnType<typeof parseConfig>["config"]; ok: boolean; routingOk: boolean; configured: boolean }> {
   const raw = await ctx.config.get(companyId);
   const { config, validation } = parseConfig(raw);
-  return { config, ok: validation.ok };
+  const configured = raw != null && !(typeof raw === "object" && !Array.isArray(raw) && Object.keys(raw).length === 0);
+  return { config, ok: validation.ok, routingOk: validation.routingOk, configured };
 }
 
 let boundCtx: PluginContext | null = null;
 
+const diagnosticsCalls = new Map<string, { since: number; count: number }>();
+let diagnosticsInFlight = 0;
+const DIAGNOSTICS_TIMEOUT_MS = 5_000;
+
+function assertDiagnosticDeadline(deadline: number): void {
+  if (Date.now() >= deadline) throw new Error("diagnostics_timeout");
+}
+
+async function diagnosticDeadline<T>(work: Promise<T>, deadline: number): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    assertDiagnosticDeadline(deadline);
+    const result = await Promise.race([work, new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new Error("diagnostics_timeout")), deadline - Date.now());
+    })]);
+    assertDiagnosticDeadline(deadline);
+    return result;
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
+type DiagnosticsResult = { status: number; body: Record<string, unknown> & { error?: string } };
+
+async function readDiagnostics(
+  ctx: PluginContext,
+  raw: unknown,
+  caller: { companyId?: string; principalId?: string; runId?: string; via: "tool" | "api" },
+): Promise<DiagnosticsResult> {
+  const started = Date.now();
+  const deadline = started + DIAGNOSTICS_TIMEOUT_MS;
+  const callId = randomUUID();
+  const safeId = (v: unknown): v is string => typeof v === "string" && v.length <= 128 && /^[A-Za-z0-9][A-Za-z0-9_-]*$/.test(v);
+  const refuse = (status: number, code: string): DiagnosticsResult => {
+    // Admission refusals must not create more host RPCs when the host is
+    // already saturated. Host-captured logging is the refusal audit path.
+    ctx.logger.warn("cliproxy_connector.diagnostics_refused", {
+      callId, code, status, tool: DIAGNOSTICS_TOOL, policyVersion: 2,
+      at: new Date(started).toISOString(), durationMs: Date.now() - started,
+      companyId: safeId(caller.companyId) ? caller.companyId : null,
+      principalId: safeId(caller.principalId) ? caller.principalId : null,
+      runId: safeId(caller.runId) ? caller.runId : null,
+    });
+    return { status, body: { error: code } };
+  };
+  if (!safeId(caller.companyId) || !safeId(caller.principalId) ||
+      (caller.via === "tool" && !safeId(caller.runId))) return refuse(403, "missing_identity");
+  const companyId = caller.companyId;
+  for (const [id, budget] of diagnosticsCalls) {
+    if (started - budget.since >= 60_000) diagnosticsCalls.delete(id);
+  }
+  // One principal cannot double the read budget by alternating tool and API.
+  const budgetKey = JSON.stringify([companyId, caller.principalId]);
+  const budget = diagnosticsCalls.get(budgetKey) ?? { since: started, count: 0 };
+  if (budget.count >= 30 || diagnosticsInFlight >= 4 || (!diagnosticsCalls.has(budgetKey) && diagnosticsCalls.size >= 1024)) {
+    return refuse(429, "diagnostics_rate_limited");
+  }
+  budget.count += 1;
+  diagnosticsCalls.set(budgetKey, budget);
+  diagnosticsInFlight += 1;
+  // The permit belongs to the actual work, including its audit, NOT to the
+  // caller's Promise.race. Timed-out, uncancellable host RPCs keep capacity
+  // occupied until they really settle; no new RPC starts after the deadline.
+  const work = (async (): Promise<DiagnosticsResult> => {
+    try {
+      let result: DiagnosticsResult;
+      const params = parseDiagnosticsParams(raw);
+      if (!params) result = { status: 400, body: { error: "invalid_parameters" } };
+      else {
+        try {
+          const rawConfig = await ctx.config.get(companyId);
+          assertDiagnosticDeadline(deadline);
+          if (!diagnosticsConfigWithinBounds(rawConfig)) throw new Error("diagnostics_config_limit");
+          const { config, validation } = parseConfig(rawConfig);
+          assertDiagnosticDeadline(deadline);
+          if (!validation.ok) result = { status: 503, body: { error: "invalid_configuration" } };
+          else {
+            const rows = Object.values(await loadRows(ctx, companyId));
+            assertDiagnosticDeadline(deadline);
+            if (!diagnosticsCacheWithinBounds(rows)) result = { status: 503, body: { error: "diagnostics_cache_limit" } };
+            else {
+              assertDiagnosticDeadline(deadline);
+              const data = buildDiagnostics(config, rows, params, new Date(started).toISOString());
+              assertDiagnosticDeadline(deadline);
+              result = data ? { status: 200, body: data } : { status: 404, body: { error: "connection_not_configured" } };
+              if (Buffer.byteLength(JSON.stringify(result.body), "utf8") > 32_768) result = { status: 503, body: { error: "diagnostics_output_limit" } };
+              assertDiagnosticDeadline(deadline);
+            }
+          }
+        } catch {
+          result = { status: 503, body: { error: "diagnostics_unavailable" } };
+        }
+      }
+      // A late read cannot enqueue a fresh audit after its response budget.
+      assertDiagnosticDeadline(deadline);
+      try {
+        await ctx.activity.log({
+          companyId, message: "cliproxy_connector.diagnostics_call",
+          metadata: {
+            callId, tool: DIAGNOSTICS_TOOL, policyVersion: 2, via: caller.via,
+            principalId: caller.principalId,
+            runId: safeId(caller.runId) ? caller.runId : null,
+            at: new Date(started).toISOString(), durationMs: Date.now() - started,
+            outcome: result.body.error ?? "allowed", status: result.status,
+          },
+        });
+        assertDiagnosticDeadline(deadline);
+      } catch {
+        return refuse(503, "audit_unavailable");
+      }
+      return result;
+    } catch {
+      return refuse(503, "diagnostics_unavailable");
+    } finally {
+      diagnosticsInFlight -= 1;
+    }
+  })();
+  try {
+    return await diagnosticDeadline(work, deadline);
+  } catch {
+    return refuse(503, "diagnostics_unavailable");
+  }
+}
+
 const plugin = definePlugin({
   async setup(ctx: PluginContext) {
     boundCtx = ctx;
+    ctx.tools.register(DIAGNOSTICS_TOOL, DIAGNOSTICS_DECLARATION, async (params, caller) => {
+      const result = await readDiagnostics(ctx, params, {
+        companyId: caller?.companyId, principalId: caller?.agentId,
+        runId: caller?.runId, via: "tool",
+      });
+      return result.status === 200 ? { data: result.body } : { error: result.body.error ?? "diagnostics_failed" };
+    });
     // The scheduler runs this job without a company scope, so the job
     // iterates every visible company itself (decision-notifier pattern).
     // Per-company failures never abort the loop.
@@ -354,6 +488,24 @@ const plugin = definePlugin({
   },
 
   async onApiRequest(input: PluginApiRequestInput): Promise<PluginApiResponse> {
+    if (input.routeKey === "diagnostics") {
+      if (!boundCtx) return { status: 503, body: { error: "worker_not_ready" } };
+      const query = input.query ?? {};
+      const { companyId, thresholdPercent, ...params } = query;
+      // Host-authorized company scope wins; duplicate/mismatched query scope,
+      // bodies and non-GET calls are never alternate authorization paths.
+      const invalid = input.method !== "GET" || (input.body != null && (typeof input.body !== "object" || Array.isArray(input.body) || Object.keys(input.body).length > 0)) ||
+        (companyId !== undefined && companyId !== input.companyId) ||
+        (thresholdPercent !== undefined && (typeof thresholdPercent !== "string" || !/^(?:[1-9]|[1-9][0-9]|100)$/.test(thresholdPercent)));
+      const actor = input.actor;
+      return readDiagnostics(boundCtx, invalid ? null : {
+        ...params, ...(thresholdPercent !== undefined ? { thresholdPercent: Number(thresholdPercent) } : {}),
+      }, {
+        companyId: input.companyId,
+        principalId: actor?.actorType === "user" ? actor.userId ?? actor.actorId : actor?.actorType === "agent" ? actor.agentId ?? actor.actorId : undefined,
+        runId: actor?.runId ?? undefined, via: "api",
+      });
+    }
     if (input.routeKey === "reenable") {
       const body = (input.body ?? {}) as Record<string, unknown>;
       const companyId = String(body.companyId ?? input.companyId ?? "");
@@ -393,7 +545,60 @@ const plugin = definePlugin({
   },
 
   async onHealth() {
-    return { status: "ok" as const };
+    if (!boundCtx) return { status: "degraded" as const, message: "Worker is not ready." };
+    try {
+      const companies = await boundCtx.companies.list();
+      let degradedCompanies = 0;
+      let configuredCompanies = 0;
+      const now = new Date().toISOString();
+      for (const company of companies) {
+        const ctx = boundCtx;
+        const { config, ok, configured } = await resolveCompany(ctx, company.id);
+        if (!configured) continue;
+        configuredCompanies += 1;
+        const [rows, lastSync, lastFailure, rawStrike] = await Promise.all([
+          loadRows(ctx, company.id),
+          loadLastSync(ctx, company.id),
+          loadLastFailure(ctx, company.id),
+          ctx.state.get(strikeKey(strikeOriginFor(config))),
+        ]);
+        const strike = isStrikeBudget(rawStrike) ? rawStrike : emptyStrikeBudget();
+        const page = buildPageData({ now, config, rows, lastSync, lastFailure, strike });
+        const syncAge = lastSync ? Date.parse(now) - Date.parse(lastSync.finishedAt) : NaN;
+        const fresh = (timestamp: string | null | undefined) => {
+          const age = Date.parse(now) - Date.parse(timestamp ?? "");
+          return Number.isFinite(age) && age >= -config.futureSkewSeconds * 1000 && age <= maxAgeMs(config);
+        };
+        // A healthy sibling is enough for routing, but not proof that all
+        // configured account observations are healthy. Health checks every
+        // enabled account's gating telemetry, including model-scoped windows.
+        const providers = new Set(config.providers.map((p) => p.provider));
+        const incompleteAccount = Object.values(rows).some((row) => {
+          if (!providers.has(row.provider) || row.status === "disabled") return false;
+          const windows = row.limits.filter((l) => l.gating);
+          return row.quotaBlind || !fresh(row.checkedAt) || windows.length === 0 || windows.some((limit) =>
+            !fresh(limit.observedAt ?? row.checkedAt) ||
+            (limit.remainingPercent === null && !limit.limitReached && limit.allowed !== false));
+        });
+        if (!ok || !Number.isFinite(syncAge) || syncAge > maxAgeMs(config) ||
+            syncAge < -config.futureSkewSeconds * 1000 ||
+            !lastSync || lastSync.skipped || (lastSync.quotaErrors ?? lastSync.errors).length > 0 || incompleteAccount ||
+            lastFailure || strike.disabled || strike.secretBad || page.drift.length > 0 ||
+            page.providers.length === 0 || page.providers.some((p) =>
+              p.freshness !== "fresh" || p.state === "unknown" || p.blindAccounts > 0)) {
+          degradedCompanies += 1;
+        }
+      }
+      const degraded = configuredCompanies === 0 || degradedCompanies > 0;
+      return {
+        status: degraded ? "degraded" as const : "ok" as const,
+        message: degraded ? "Quota coverage is missing, stale, blind or failed." : "Quota coverage is fresh.",
+        details: { companies: companies.length, configuredCompanies, degradedCompanies },
+      };
+    } catch {
+      // Health must not echo host errors or configuration into diagnostics.
+      return { status: "degraded" as const, message: "Could not read connector health state." };
+    }
   },
 });
 
@@ -540,7 +745,8 @@ export async function routeWithCache(
   ctx: PluginContext,
   params: AiConnectionRouterRequest,
 ): Promise<AiConnectionRouterResult> {
-  const { config } = await resolveCompany(ctx, params.companyId);
+  const { config, routingOk } = await resolveCompany(ctx, params.companyId);
+  if (!routingOk) return { kind: "unavailable", skipped: { "pool:configuration": "connector configuration is invalid; refusing ambiguous quota routing." } };
   const rows = Object.values(await loadRows(ctx, params.companyId));
   const { candidates, poolId, poolMode, poolThresholdPercent } = toRouterCandidates(params);
   return route({

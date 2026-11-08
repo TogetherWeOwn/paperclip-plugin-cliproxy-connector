@@ -92,6 +92,13 @@ the operator. You read redacted output only.
    `apiKeyUsageEnabled` defaults to `false`: the request-count read is opt-in (see the
    Usage & Quota section below).
    `managementKeyHeader` has no default on purpose; legacy string-UUID secrets fail closed.
+   Multiple gateway connections can share one provider row using
+   `connectionIds: ["<primary-connection-id>", "<alias-connection-id>"]` (for example,
+   different wire protocols over the same Codex account inventory). The legacy
+   `connectionId` remains supported; when both fields are supplied their union is
+   used. A connection cannot appear under two providers: ambiguous mappings fail
+   configuration validation, rather than selecting whichever row appears first.
+   Aliases share one aggregate and never duplicate the account inventory.
    `completeInventory: true` means you confirm this provider has no hidden config-key
    credentials (default `false`: the provider can only be `allowed`/`unknown`, never
    `exhausted`). `audienceConfirmed` acknowledges the page shows upstream account quota
@@ -152,6 +159,14 @@ The plugin ships two pages over the same sync cache:
   redacted) before it reaches the page. Both pages are
   read-only over already synced state; the connector never calls the destructive
   `/v0/management/usage-queue` endpoint (asserted in tests).
+  Both pages and the dashboard widget re-read the cached worker projection every
+  30 seconds while mounted with company context. This updates credit freshness,
+  reset/retry expiry and fresh-telemetry recovery without a reload or manual
+  refresh. It does not trigger a sync, provider request or credential read, and
+  stops on unmount. In-flight reads are not superseded by another poll, and
+  existing content stays mounted during background loading. Browser timer
+  throttling or a failed bridge read can delay
+  the next update; the worker, not a client-side estimate, owns routing verdicts.
 
   The Usage & Quota page adds four read-model sections over the same cache
   (every section shows its own fetch timestamp; a failed fetch keeps the
@@ -189,9 +204,9 @@ The plugin ships two pages over the same sync cache:
 | `clientApiKeySecretRef` | — (warns when missing) | `secret_ref` object (same shape) for the client API key (`GET /v1/models`). Same never-persisted rule. Missing → derivation + overlap detection off. |
 | `openRouterSecretRef` | — (page shows "not configured") | Dedicated `secret_ref` object for the OpenRouter key (spend read only). Never a CLIProxy key; resolved per run, never persisted. |
 | `apiKeyUsageEnabled` | `false` | Opt-in request-count read (`GET /v0/management/api-key-usage`, aggregated by provider in the worker). Non-boolean fails closed. |
-| `syncIntervalMinutes` | `5` | The cron runs every 5 min; larger values make runs skip. Range 1–60. |
-| `reservePercent` | `10` | Default reserve; per-pool `thresholdPercent` derives `100 − t`. |
-| `perPoolReservePercent` | `{}` | Per-pool override, wins over everything. |
+| `syncIntervalMinutes` | `5` | Freshness baseline only, range 1–60. The cron always runs every 5 min, with a fixed 1-minute minimum between syncs; this setting does not change polling frequency. |
+| `reservePercent` | `10` | Default reserve within `[0, 50)`; `0` holds nothing back. A native integer `thresholdPercent` from 1 through 100 derives `100 − t`, including zero reserve at 100. Invalid or absent thresholds use the company default. |
+| `perPoolReservePercent` | `{}` | Per-pool reserve within `[0, 50)`, including `0`; wins over the native threshold and company default. |
 | `recheckSeconds` | `60` | Wait before re-probing unknown/stale telemetry. |
 | `maxAgeMultiplier` / `graceMultiplier` | `2` / `3` | Freshness = sync interval × 2; grace = freshness × 3. |
 | `providers` | `[]` | One `{ provider, connectionId, completeInventory }` row per CLIProxy provider family. The provider word is the raw auth-file string (e.g. `cloudflare-workers-ai`); any string is accepted, duplicates error, and a row that matches no accounts drift-warns as having zero enabled accounts. Empty warns. Optional `creditsCountAsHeadroom: true` (default off) lets a fresh positive Codex credits reading (`x-codex-credits-has-credits: true` with a positive or absent `x-codex-credits-balance`, or `x-codex-credits-unlimited: true`) count as headroom while quota windows are exhausted, for providers where the owner allows credit spend. `has-credits: false` or a non-positive balance blocks again; a 429 cooldown, `retry-after` or an unavailable account still gates; a stale reading is `unknown` (fail open). Only `codex` reports credits; other providers warn. |
@@ -205,7 +220,8 @@ The plugin ships two pages over the same sync cache:
 
 ## Endpoint assumptions
 
-The management paths are pinned in code (`/v0/management/auth-files`,
+The management paths are pinned in code (`/v8/management/credentials`, with
+404-only fallback to `/v0/management/auth-files`,
 `/v0/management/auth-files/models?name=<file>` and
 `/v0/management/plugins/<segment>/quota` with exactly one `auth_index` query value,
 or no query on older builds) — there are deliberately no config knobs for
@@ -284,6 +300,51 @@ providers send is quiet (no "no quota signals" warning); a provider also sending
 `daily`/`weekly` windows. Parsers are defensive by design: unknown shapes become
 warnings + quota-blind rows, never headroom. The redacted `auth-files` fixture in
 tests mirrors the public CLIProxyAPI source shapes.
+
+### Discovery and typed observations
+
+An explicit `pluginQuotaIds[rawProvider]` wins over the account's own validated
+`quota_plugin_id`. Discovery never borrows a sibling's route; disabled accounts
+are skipped, and `supports_quota: false` or malformed capabilities do not enable
+a discovered route. A v8 account without `auth_index` is unknown rather than
+sent to a route requiring an index. The explicit v0 no-index compatibility path
+is retained; a v0 list alone is not proof of a historical server version.
+
+Hopper uses exact provider identity `hopper`, with `5h` and `weekly` gating
+windows. Missing windows stay unknown. Numeric summary metrics, including its
+USD account balance, remain informational and never count as paid-credit
+headroom. Typed absolute `used`, `limit`, `remaining`, `unit`, duration, cadence
+and scope are kept separately from percentages; missing values are null. Codex
+credits retain their balance and original observation time in native-shaped
+overage fields, without inventing availability from an enabled switch.
+
+Meta's exact raw words `meta` and `meta-muse` retain separate configured provider
+identities but use the Meta parser and bounded direct-read fallback. Normalized
+`5h` maps to canonical `window`, tier takes precedence over generic plan, and
+missing expected windows are retained. Normalized Meta quotas remain
+informational until provider normalization preserves malformed-source and cache
+observation evidence; a successful plugin GET alone cannot retire the fallback.
+The Meta family switch and `metaQuota.enabled` still disable the direct read;
+`apiCallEnabled[rawProvider]` can additionally disable the exact raw identity.
+
+## Read-only diagnostics
+
+After Security acceptance and Operator enablement, the `quota-diagnostics`
+agent tool explains one configured connection using only the authenticated
+company's cache. `GET /diagnostics` exposes the same bounded result through the
+plugin API with host board-or-agent authorization. Inputs are `connectionId`
+and optional `poolId`, `thresholdPercent` (integer 1–100), and `model`; the GET
+route additionally requires `companyId` for host company resolution. The tool
+never accepts a caller-supplied company, URL, secret ref, header or action.
+
+The assessment uses the same reserve precedence and aggregation as routing.
+Pool inputs are supplied by the caller, **not live pool readback**; the result
+explicitly says `nativePoolReadback: false`. This is not a resync, a pool editor,
+a credential read or a native billing API. It returns aggregate state/reason,
+freshness, headroom counts, retry time and effective reserve, not raw account
+metadata. Calls are audited; audit failure prevents a successful response.
+See [THREAT-MODEL.md](THREAT-MODEL.md) and [ACCEPTANCE.md](ACCEPTANCE.md) for
+bounds, refusal tests and the uncompleted installation/governance gates.
 
 ## Security properties (all tested)
 
