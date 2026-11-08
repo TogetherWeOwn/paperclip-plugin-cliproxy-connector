@@ -125,6 +125,24 @@ reuse the same open page across the real boundary and fresh-telemetry recovery;
 they do not reload to simulate automatic UI transitions. The bounded 70-second
 agreement deadline covers native 30-second UI ticks/minute refresh throttling.
 Screenshots, per-case traces and `browser.json` preserve success/failure details.
+Agreement deadlines record the expected values and last rendered card, then continue
+remaining controls in the same bounded job. Failed transitions retain their existing
+page through recovery, without reload or a forced refresh. Attempts and successful
+observations are counted separately; all 28 must succeed, load the exact candidate,
+and leave no failures before `/finish` can pass. Collecting later evidence never
+changes a failed assertion into a successful qualification.
+
+The run at workflow head `15d064fa3d01899cf100a3327b1a4ce29e80d33c` passed all
+18 static scenarios, safe-name refresh and the pre-expiry browser control, but failed
+credit-freshness expiry. At `2026-11-08T01:47:55.000Z` the installed worker returned
+`unknown` with zero headroom without a telemetry read; the persistent page still
+showed `allowed` and one credit-headroom account at the 70-second deadline. Its
+network/console errors were empty and its UI bytes matched the frozen candidate.
+The frozen UI refreshes for passed retry/reset dates, not credit freshness expiry.
+This is retained negative candidate evidence, not a harness error to suppress or
+permission to silently qualify a repaired candidate. Other live browser transition
+results were not reached in that fail-fast run.
+
 A browser failure is evidence to diagnose, never permission to patch the candidate,
 weaken the assertion or claim that worker data was browser proof. Native router
 qualification and specialist verdicts remain separate even if all browser checks

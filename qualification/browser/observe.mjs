@@ -4,6 +4,7 @@ import { readFileSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { chromium } from './node_modules/playwright-core/index.mjs';
 import { permittedRequest } from './policy.mjs';
+import { assertBrowserComplete } from './receipt.mjs';
 
 const base = 'http://127.0.0.1:3100';
 const evidence = '/qualification/evidence';
@@ -11,7 +12,7 @@ const identity = JSON.parse(readFileSync(`${evidence}/identity.json`, 'utf8'));
 const uiDigest = identity.artifacts['dist/ui/index.js'];
 const browser = await chromium.launch({ headless: true });
 const sessions = new Map();
-const receipt = { qualificationStatus: 'partial-browser-only', observations: [], failures: [] };
+const receipt = { qualificationStatus: 'partial-browser-only', attempts: [], observations: [], failures: [] };
 const save = () => writeFileSync(`${evidence}/browser.json`, JSON.stringify(receipt, null, 2));
 
 async function sessionFor(key, path, phase) {
@@ -77,6 +78,7 @@ async function observe(input) {
   const deadline = Date.now() + 70_000;
   let observation;
   let last;
+  let lastText = null;
   do {
     for (const frame of session.page.frames()) {
       try {
@@ -85,6 +87,7 @@ async function observe(input) {
         const card = line.locator('..');
         await card.locator('details').evaluateAll(nodes => nodes.forEach(node => { node.open = true; }));
         const text = await card.innerText({ timeout: 1000 });
+        lastText = text;
         assert.equal(await card.getByText(expected.state, { exact: true }).count(), 1, `Browser verdict is not ${expected.state}`);
         assert.equal(await card.getByText(expected.freshness, { exact: true }).count(), 1);
         assert.equal(text.includes('paid credits count as headroom'), expected.creditsCountAsHeadroom);
@@ -115,11 +118,21 @@ async function observe(input) {
     await new Promise(resolve => setTimeout(resolve, 250));
   } while (Date.now() < deadline);
   await session.page.screenshot({ path: `${evidence}/browser-${key}-${phase}.png`, fullPage: true });
-  assert(observation, `Browser agreement deadline exceeded: ${last?.message ?? 'No installed provider card rendered'}`);
-  receipt.observations.push(observation);
+  await Promise.all(session.pending);
+  const result = { key, phase, observedAt: new Date().toISOString(),
+    exactCandidateUiLoaded: session.loadedUi.some(file => file.sha256 === uiDigest), agreement: Boolean(observation) };
+  receipt.attempts.push(result);
+  if (observation) receipt.observations.push(observation);
+  else {
+    // Preserve candidate failures while collecting the remaining independent
+    // controls. /finish still fails the job if any observation disagrees.
+    receipt.failures.push({ key, phase, at: result.observedAt, expected, text: lastText,
+      message: `Browser agreement deadline exceeded: ${last?.message ?? 'No installed provider card rendered'}`,
+      errors: [...session.errors], loadedUi: [...session.loadedUi], requests: [...session.requests] });
+  }
   save();
   if (phase === 'single' || phase === 'recovered') await closeSession(key);
-  return { key, phase, observedAt: observation.observedAt, exactCandidateUiLoaded: true, agreement: true };
+  return result;
 }
 
 const server = createServer(async (req, res) => {
@@ -131,8 +144,7 @@ const server = createServer(async (req, res) => {
     }
     if (req.method === 'POST' && req.url === '/finish') {
       assert.equal(sessions.size, 0);
-      assert.equal(receipt.observations.length, 28);
-      assert.deepEqual(receipt.failures, []);
+      assertBrowserComplete(receipt);
       receipt.conclusion = 'success';
       receipt.browserVersion = browser.version();
       receipt.finishedAt = new Date().toISOString();

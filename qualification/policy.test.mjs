@@ -6,6 +6,7 @@ import { join } from 'node:path';
 import { CANDIDATE, HOST_SOURCE, HOST_IMAGE, assertHostRelease, digest, filesUnder } from './identity.mjs';
 import { SCENARIOS, TRANSITIONS, scenarioEntries, timedEntries, startFixture, SYNTHETIC_KEY } from './installed.mjs';
 import { permittedRequest } from './browser/policy.mjs';
+import { assertBrowserComplete } from './browser/receipt.mjs';
 
 const workflow = readFileSync(new URL('../.github/workflows/qualify-stock.yml', import.meta.url), 'utf8');
 const driver = readFileSync(new URL('./preflight.mjs', import.meta.url), 'utf8');
@@ -71,6 +72,24 @@ test('browser request policy refuses external origins, fixture ports and mutatio
   for (const url of ['/api/plugins/test/config', '/api/plugins/test/bridge/action', '/api/companies']) {
     assert(!permittedRequest(`${origin}${url}`, 'POST', path));
   }
+});
+
+test('collecting later browser controls cannot turn a disagreement into success', () => {
+  const receipt = {
+    attempts: Array.from({ length: 28 }, () => ({ agreement: true, exactCandidateUiLoaded: true })),
+    observations: Array.from({ length: 28 }, () => ({})), failures: [],
+  };
+  assertBrowserComplete(receipt);
+  receipt.failures.push({ key: 'credits-age-past-freshness-bound', phase: 'after', text: 'allowed' });
+  assert.throws(() => assertBrowserComplete(receipt), /Candidate browser agreement failures retained/);
+  receipt.failures = [];
+  receipt.attempts[20].agreement = false;
+  assert.throws(() => assertBrowserComplete(receipt), /Browser attempt did not agree/);
+  receipt.attempts[20].agreement = true;
+  receipt.attempts[20].exactCandidateUiLoaded = false;
+  assert.throws(() => assertBrowserComplete(receipt), /Browser attempt did not agree/);
+  receipt.attempts.pop();
+  assert.throws(() => assertBrowserComplete(receipt), /Incomplete browser coverage/);
 });
 
 test('preflight never represents incomplete qualification as a pass', () => {
