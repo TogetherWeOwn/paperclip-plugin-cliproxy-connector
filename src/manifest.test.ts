@@ -10,7 +10,8 @@ describe("declarative connector settings", () => {
     expect(manifest.instanceConfigSchema).toEqual(CONNECTOR_CONFIG_SCHEMA);
     expect(CONNECTOR_CONFIG_SCHEMA.properties.managementSecretRef.type).toBe("object");
     expect(CONNECTOR_CONFIG_SCHEMA.properties.providers.items.anyOf).toEqual([
-      { required: ["connectionId"] }, { required: ["connectionIds"] },
+      { required: ["connectionId"] },
+      { required: ["connectionIds"], properties: { connectionIds: { minItems: 1 } } },
     ]);
     expect(CONNECTOR_CONFIG_SCHEMA.properties.reservePercent).toMatchObject({ minimum: 0, exclusiveMaximum: 50 });
     expect(CONNECTOR_CONFIG_SCHEMA.properties.perPoolReservePercent.additionalProperties.minimum).toBe(0);
