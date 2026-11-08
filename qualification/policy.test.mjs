@@ -9,6 +9,7 @@ import { createHash } from 'node:crypto';
 import { SCENARIOS, TRANSITIONS, scenarioEntries, timedEntries, startFixture, SYNTHETIC_KEY } from './installed.mjs';
 import { permittedRequest } from './browser/policy.mjs';
 import { assertBrowserComplete } from './browser/receipt.mjs';
+import { assertNativeOutcome, REFUSAL_COMMAND, ROUTER_MODEL } from './native-router.mjs';
 
 const workflow = readFileSync(new URL('../.github/workflows/qualify-stock.yml', import.meta.url), 'utf8');
 const driver = readFileSync(new URL('./preflight.mjs', import.meta.url), 'utf8');
@@ -103,6 +104,32 @@ test('preflight never represents incomplete qualification as a pass', () => {
   assert(!driver.includes('globalThis.fetch ='));
   assert(!driver.includes('/v0/management'));
   assert(!driver.includes('/v8/management'));
+});
+
+test('native allocation receipts require exact selection or pre-provider exhausted deferral', () => {
+  assert.equal(REFUSAL_COMMAND, '/usr/bin/false');
+  const expected = { memberId: 'member', connectionId: 'connection', model: ROUTER_MODEL, state: 'allowed' };
+  const selected = { status: 'failed', contextSnapshot: { aiRouterTaskKey: 'run', aiRouterSelection: {
+    memberId: 'member', binding: { connectionId: 'connection' }, runtimeConfig: { model: ROUTER_MODEL },
+  } } };
+  assertNativeOutcome(selected, expected);
+  assert.throws(() => assertNativeOutcome({ ...selected, status: 'succeeded' }, expected));
+  assert.throws(() => assertNativeOutcome(selected, { ...expected, memberId: 'unauthorized' }));
+  assert.throws(() => assertNativeOutcome(selected, { ...expected, model: 'different-model' }));
+  assert.throws(() => assertNativeOutcome({ status: 'failed', contextSnapshot: {} }, expected));
+  const exhausted = { status: 'cancelled', errorCode: 'ai_connection_pool_exhausted',
+    contextSnapshot: { aiRouterTaskKey: 'run' }, resultJson: { executionRecovery: { providerWorkStarted: false } } };
+  assertNativeOutcome(exhausted, { ...expected, state: 'exhausted' });
+  assert.throws(() => assertNativeOutcome({ ...exhausted, errorCode: 'configuration_incomplete' }, { ...expected, state: 'exhausted' }));
+  assert.throws(() => assertNativeOutcome({ ...exhausted, resultJson: {} }, { ...expected, state: 'exhausted' }));
+  const native = readFileSync(new URL('./native-router.mjs', import.meta.url), 'utf8');
+  assert(native.includes("protocol: 'responses'"));
+  assert(native.includes("auth: 'none'"));
+  assert(native.includes("mode: 'round_robin'"));
+  assert(native.includes('/heartbeat/invoke'));
+  assert(native.includes('/pause'));
+  assert(!native.includes('apiKey:'));
+  assert(!native.includes('globalThis.fetch ='));
 });
 
 test('installed matrix retains all opt-in, credit freshness and non-coverable gate controls', () => {

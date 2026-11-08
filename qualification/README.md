@@ -215,6 +215,41 @@ Evidence upload has seven-day native artifact retention. A hard cancellation may
 prevent final logs/upload; it must be reported as cancelled with incomplete evidence,
 never qualified. The Actions job record remains the native disposal/run boundary.
 
+## Native allocation extension (requires its own Actions result)
+
+`native-router.mjs` uses stock APIs, not a direct import or mock of the router.
+Each synthetic company gets distinct retained-primary, alias and unrelated local
+Responses connection IDs with `auth: none`; there is no provider login, API key,
+validation probe or real credential. The disposable instance enables its native
+router feature, and only synthetic companies permit direct synthetic agent creation.
+These test settings never affect the installed production host or its governance.
+
+Single-member round-robin pools avoid native usage probes. Stock on-demand legacy
+Codex runs enter `aiConnectionRouterService.resolve` and the installed worker hook.
+The supported adapter `command` is fixed to `/usr/bin/false`, never a model CLI.
+A selected run must retain the exact member/connection/model and native task key;
+a failed adapter is intentional, not successful inference. Exhausted cases must
+instead report `ai_connection_pool_exhausted`, no selection and
+`providerWorkStarted: false`. Other failures, missing selections and successful
+adapter execution fail qualification. Every allocation must make zero fixture
+requests; the telemetry-only fixture continues refusing all inference/forwarding.
+
+The extension requires 30 actual allocations: all 18 static scenarios, retained
+primary and requested-model isolation controls, account/provider isolation, and
+before/after/recovered phases of the three real expiry controls. The alternate
+requested model must not borrow Sol-only credits. Each result joins exact native
+IDs to the installed provider projection, explicitly distinguishing provider-wide
+projection from requested-model eligibility. These are on-demand run-key task
+allocations, not issue execution or model output. Agents are paused after each
+observation to cancel native exhausted-pool retries; hosted VM disposal remains the
+hard failure/cancellation boundary. No new runtime, timer service or adapter is added.
+
+The selected replacement at workflow head `63c8018` passed its 18 installed rows,
+28 browser agreements and all three live transitions in Actions run `42456292582`.
+That run did not contain this extension, so native evidence remains unverified.
+A later native failure must retain that earlier subset without transferring its
+passing result to a changed workflow head. Specialist/merge/install gates remain.
+
 ## Dependency execution policy
 
 No manifest or candidate lockfile update is made. Actions uses npm `11.19.0`, verifies

@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
 import { writeFileSync } from 'node:fs';
+import { prepareNativeConnections, observeNativeAllocation } from './native-router.mjs';
 
 // Only the disposable network-none namespace runs this fixture. It implements
 // telemetry reads, never inference, credential downloads or provider forwarding.
@@ -129,7 +130,16 @@ export async function installedMatrix({ api, pluginPath, companyId, evidence, re
   try {
     let secretRef;
     let companyPrefix;
+    let nativeBindings;
     receipt.browser = [];
+    receipt.nativeAllocations = [];
+    const allocate = async (name, provider, options = {}) => {
+      const result = await observeNativeAllocation({
+        api, companyId, bindings: nativeBindings, fixture, name, state: provider.state, ...options,
+      });
+      receipt.nativeAllocations.push({ ...result, providerProjection: provider,
+        projectionScope: 'Provider-wide installed data; requested-model eligibility is established by the native outcome, not this projection.' });
+    };
     const observe = async (key, expected, phase = 'single', boundary = null) => {
       const response = await fetch('http://127.0.0.1:4310/observe', {
         method: 'POST', headers: { 'content-type': 'application/json' },
@@ -146,6 +156,7 @@ export async function installedMatrix({ api, pluginPath, companyId, evidence, re
       const company = await api('/api/companies', { name: `Fixture ${name}` });
       companyId = company.id;
       companyPrefix = company.issuePrefix;
+      nativeBindings = await prepareNativeConnections({ api, companyId, baseUrl: fixture.baseUrl });
       secretRef = {};
       for (const key of ['managementSecretRef', 'clientApiKeySecretRef']) {
         const secret = await api(`/api/companies/${companyId}/secrets`, {
@@ -159,7 +170,8 @@ export async function installedMatrix({ api, pluginPath, companyId, evidence, re
       cliproxyBaseUrl: fixture.baseUrl, managementKeyHeader: 'X-Qualification-Key',
       ...secretRef,
       audienceConfirmed: true, apiCallEnabled: { codex: false, claude: false, meta: false },
-      providers: [{ provider: 'codex', connectionId: 'synthetic-codex-connection', completeInventory: true,
+      providers: [{ provider: 'codex', connectionId: nativeBindings.primary.connectionId,
+        connectionIds: [nativeBindings.alias.connectionId], completeInventory: true,
         ...(optIn === undefined ? {} : { creditsCountAsHeadroom: optIn }) }],
     });
     const usage = async () => (await api(`${pluginPath}/bridge/data`, {
@@ -210,6 +222,11 @@ export async function installedMatrix({ api, pluginPath, companyId, evidence, re
       }
       receipt.scenarios.push({ name: scenario.name, expected: { state: scenario.state, headroom: scenario.headroom, creditHeadroom: scenario.creditHeadroom }, actual: codex });
       await observe(scenario.name, codex);
+      await allocate(scenario.name, codex);
+      if (scenario.name === 'positive') {
+        await allocate('positive-retained-primary', codex, { bindingName: 'primary' });
+        await allocate('other-model-cannot-borrow-sol-credits', codex, { model: 'qualification-other-model', state: 'exhausted' });
+      }
     }
     // Worker restart must read the persisted data, without any telemetry request.
     const persisted = await usage();
@@ -239,24 +256,26 @@ export async function installedMatrix({ api, pluginPath, companyId, evidence, re
     })).data;
     assert.equal(otherUsage.providers.length, 0);
     receipt.isolation = { disabledAccountAndOtherProviderCannotDonateCredits: true, unconfiguredCompanyHasNoProviders: true };
+    await allocate('account-provider-isolation', isolatedCodex);
 
     // Preserve the primary binding and unrelated providers while adding the
     // selected candidate's supported same-inventory connection alias.
     const retainedConfig = config(true);
-    retainedConfig.providers.push({ provider: 'claude', connectionId: 'synthetic-retained-other-connection', completeInventory: false });
+    delete retainedConfig.providers[0].connectionIds;
+    retainedConfig.providers.push({ provider: 'claude', connectionId: nativeBindings.unrelated.connectionId, completeInventory: false });
     const validate = configJson => api(`${pluginPath}/config/test`, { companyId, configJson });
     const retained = await validate(retainedConfig);
     assert.equal(retained.valid, true, JSON.stringify(retained));
     const duplicateConfig = { ...retainedConfig, providers: [...retainedConfig.providers,
-      { provider: 'codex', connectionId: 'synthetic-sol-connection', completeInventory: true, creditsCountAsHeadroom: true }] };
+      { provider: 'codex', connectionId: nativeBindings.alias.connectionId, completeInventory: true, creditsCountAsHeadroom: true }] };
     const duplicate = await validate(duplicateConfig);
     assert.equal(duplicate.valid, false, 'Duplicate provider rows must still be rejected');
     const aliasConfig = { ...retainedConfig, providers: retainedConfig.providers.map(row =>
-      row.provider === 'codex' ? { ...row, connectionIds: ['synthetic-sol-connection'] } : row) };
+      row.provider === 'codex' ? { ...row, connectionIds: [nativeBindings.alias.connectionId] } : row) };
     const alias = await validate(aliasConfig);
     assert.equal(alias.valid, true, JSON.stringify(alias));
     const ambiguousConfig = { ...aliasConfig, providers: aliasConfig.providers.map(row =>
-      row.provider === 'claude' ? { ...row, connectionIds: ['synthetic-sol-connection'] } : row) };
+      row.provider === 'claude' ? { ...row, connectionIds: [nativeBindings.alias.connectionId] } : row) };
     const ambiguous = await validate(ambiguousConfig);
     assert.equal(ambiguous.valid, false, 'Cross-provider alias ambiguity must be rejected');
     assert.deepEqual(stableProviders(await usage()), stableProviders(isolated), 'Non-mutating config tests changed installed usage');
@@ -264,12 +283,12 @@ export async function installedMatrix({ api, pluginPath, companyId, evidence, re
     await api(`${pluginPath}/config`, { companyId, configJson: aliasConfig });
     const aliased = await usage();
     const aliasCodex = aliased.providers.find(p => p.provider === 'codex');
-    assert.equal(aliasCodex.connectionId, 'synthetic-codex-connection');
-    assert.deepEqual(aliasCodex.connectionIds, ['synthetic-codex-connection', 'synthetic-sol-connection']);
+    assert.equal(aliasCodex.connectionId, nativeBindings.primary.connectionId);
+    assert.deepEqual(aliasCodex.connectionIds, [nativeBindings.primary.connectionId, nativeBindings.alias.connectionId]);
     assert.equal(aliasCodex.state, isolatedCodex.state);
     assert.equal(aliasCodex.enabledAccounts, isolatedCodex.enabledAccounts);
     assert.equal(aliasCodex.creditHeadroomAccounts, 0);
-    assert.equal(aliased.providers.find(p => p.provider === 'claude').connectionId, 'synthetic-retained-other-connection');
+    assert.equal(aliased.providers.find(p => p.provider === 'claude').connectionId, nativeBindings.unrelated.connectionId);
     assert.equal(fixture.state.requests.length, readsBeforeAliases, 'Alias projection unexpectedly refreshed telemetry');
     receipt.mappingContract = {
       conclusion: 'installed-alias-representation-preserves-primary-and-other-provider',
@@ -292,6 +311,7 @@ export async function installedMatrix({ api, pluginPath, companyId, evidence, re
       assert.equal(before.state, transition.before, transition.name);
       assert.equal(before.headroomAccounts, transition.headroom, transition.name);
       const syncFinishedAt = receipt.lastSyncFinishedAt;
+      await allocate(`${transition.name}-before`, before);
       await observe(transition.name, before, 'before', boundary);
       assert(Date.now() < boundary, 'Browser pre-boundary observation arrived too late');
       const requestsBeforeExpiry = fixture.state.requests.length;
@@ -311,6 +331,7 @@ export async function installedMatrix({ api, pluginPath, companyId, evidence, re
       receipt.transitions.push(result);
       await observe(transition.name, after, 'after', boundary);
       assert.equal(fixture.state.requests.length, requestsBeforeExpiry, 'Browser expiry observation refreshed telemetry');
+      await allocate(`${transition.name}-after`, after);
       // Recovery needs genuinely fresh telemetry, not the passing of a clock.
       // Respect the real same-company minimum-sync interval before requesting it.
       await waitUntil(Date.parse(syncFinishedAt) + 60_100, 60_100);
@@ -322,11 +343,14 @@ export async function installedMatrix({ api, pluginPath, companyId, evidence, re
       result.recoveredObservedAt = new Date().toISOString();
       result.recovered = recovered;
       await observe(transition.name, recovered, 'recovered', boundary);
+      await allocate(`${transition.name}-recovered`, recovered);
     }
+    assert.equal(receipt.nativeAllocations.length, 30, 'Incomplete native allocation coverage');
     const browserFinished = await fetch('http://127.0.0.1:4310/finish', { method: 'POST', signal: AbortSignal.timeout(15_000) });
     assert(browserFinished.ok, JSON.stringify(await browserFinished.json()));
-    receipt.missing = receipt.missing.filter(item => item !== 'browser assertions and traces');
-    report.missing = report.missing.filter(item => !['installed scenario matrix', 'browser assertions and traces'].includes(item));
+    receipt.missing = receipt.missing.filter(item => !['browser assertions and traces', 'native router eligibility'].includes(item));
+    report.missing = report.missing.filter(item => !['installed scenario matrix', 'browser assertions and traces', 'native router eligibility'].includes(item));
+    report.checks.push('30 native run-key task allocations agreed with installed quota gates, alias and requested-model isolation without fixture requests or model inference');
     report.checks.push('actual stock-host browser loaded exact candidate UI and agreed with installed scenarios and wall-clock transitions');
     report.checks.push('installed wall-clock credit freshness, window reset and unavailable retry transitions recovered only after fresh telemetry');
     receipt.currentScenario = null;
@@ -335,7 +359,7 @@ export async function installedMatrix({ api, pluginPath, companyId, evidence, re
     report.checks.push('installed synthetic credit/gate matrix, deterministic metadata refresh and persisted-worker restart succeeded');
   } catch (error) {
     receipt.conclusion = 'failure';
-    receipt.failure = { name: error.name, message: error.message };
+    receipt.failure = { name: error.name, message: error.message, ...(error.nativeObservation ? { nativeObservation: error.nativeObservation } : {}) };
     throw error;
   } finally {
     receipt.fixtureRequests = fixture.state.requests;

@@ -13,10 +13,10 @@ const report = {
   missing: ['installed scenario matrix', 'native router eligibility', 'browser assertions and traces', 'specialist verdicts'],
 };
 
-async function api(path, body) {
+async function api(path, body, method = body === undefined ? 'GET' : 'POST') {
   assert(path.startsWith('/api/'));
   const response = await fetch(`${base}${path}`, {
-    method: body === undefined ? 'GET' : 'POST',
+    method,
     redirect: 'error',
     headers: body === undefined ? {} : { 'content-type': 'application/json' },
     body: body === undefined ? undefined : JSON.stringify(body),
