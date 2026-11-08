@@ -159,6 +159,12 @@ The plugin ships two pages over the same sync cache:
   redacted) before it reaches the page. Both pages are
   read-only over already synced state; the connector never calls the destructive
   `/v0/management/usage-queue` endpoint (asserted in tests).
+  Both pages and the dashboard widget re-read the cached worker projection every
+  30 seconds while mounted with company context. This updates credit freshness,
+  reset/retry expiry and fresh-telemetry recovery without a reload or manual
+  refresh. It does not trigger a sync, provider request or credential read, and
+  stops on unmount. Browser timer throttling or a failed bridge read can delay
+  the next update; the worker, not a client-side estimate, owns routing verdicts.
 
   The Usage & Quota page adds four read-model sections over the same cache
   (every section shows its own fetch timestamp; a failed fetch keeps the

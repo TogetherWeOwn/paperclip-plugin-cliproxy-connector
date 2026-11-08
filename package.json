@@ -48,8 +48,10 @@
     "@paperclipai/plugin-sdk": "2026.1023.0",
     "@types/node": "24.19.2",
     "@types/react": "19.2.7",
+    "@types/react-test-renderer": "19.1.0",
     "esbuild": "0.27.1",
     "react": "19.2.0",
+    "react-test-renderer": "19.2.0",
     "typescript": "5.9.3",
     "vitest": "4.1.12"
   },

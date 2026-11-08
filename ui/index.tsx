@@ -49,26 +49,18 @@ function formatCountdown(iso: string | null, nowMs: number): string | null {
 }
 
 /**
- * Re-fetch cached plugin data (never resync, never api-call) at most once
- * per minute when a shown reset passes, so a passed countdown refreshes.
+ * Read the worker's cached projection every 30 seconds, even without a reset.
+ * The worker owns credit/window expiry and aggregate counts; background sync
+ * recovery can arrive at any time. This never invokes resync or api-call.
  */
-function useRefreshOnPassedReset(
-  resets: Array<string | null>,
-  refresh: () => void,
-  nowMs: number,
-) {
-  const lastRefetch = useRef(0);
+function useRefreshCachedData(companyId: string | null, refresh: () => void) {
+  const refreshRef = useRef(refresh);
+  useEffect(() => { refreshRef.current = refresh; }, [refresh]);
   useEffect(() => {
-    const passed = resets.some((r) => {
-      if (!r) return false;
-      const t = Date.parse(r);
-      return !Number.isNaN(t) && t <= nowMs;
-    });
-    if (passed && Date.now() - lastRefetch.current > 60_000) {
-      lastRefetch.current = Date.now();
-      refresh();
-    }
-  });
+    if (!companyId) return;
+    const timer = setInterval(() => refreshRef.current(), 30_000);
+    return () => clearInterval(timer);
+  }, [companyId]);
 }
 
 function useCompanyId(context: PluginPageProps["context"]): string | null {
@@ -124,11 +116,7 @@ export function CliProxyPage({ context }: PluginPageProps) {
   const resync = usePluginAction("cliproxy-resync");
   const reenable = usePluginAction("cliproxy-reenable");
   const nowMs = useWorkerNow(data?.generatedAt ?? null);
-  useRefreshOnPassedReset(
-    data?.providers.flatMap((p) => [p.retryAt, p.nextReset]) ?? [],
-    refresh,
-    nowMs,
-  );
+  useRefreshCachedData(companyId, refresh);
 
   if (!companyId) return <div>No company context.</div>;
   if (loading) return <div>Loading CLIProxy provider state…</div>;
@@ -372,11 +360,7 @@ export function CliProxyUsagePage({ context }: PluginPageProps) {
   const [sortKey, setSortKey] = useState<UsageSortKey>("remaining");
   const [sortDir, setSortDir] = useState<"asc" | "desc">("asc");
   const nowMs = useWorkerNow(data?.generatedAt ?? null);
-  useRefreshOnPassedReset(
-    data?.providers.flatMap((p) => [p.retryAt, p.nextReset, ...p.accounts.map((a) => a.nextReset)]) ?? [],
-    refresh,
-    nowMs,
-  );
+  useRefreshCachedData(companyId, refresh);
 
   if (!companyId) return <div>No company context.</div>;
   if (loading) return <div>Loading usage &amp; quota…</div>;
@@ -626,9 +610,10 @@ export function CliProxyUsagePage({ context }: PluginPageProps) {
 }
 
 export function CliProxyWidget({ context }: PluginWidgetProps) {
-  const { data, loading, error } = usePluginData<WidgetData>("cliproxy-widget", {
+  const { data, loading, error, refresh } = usePluginData<WidgetData>("cliproxy-widget", {
     companyId: context.companyId,
   });
+  useRefreshCachedData(context.companyId, refresh);
   if (loading) return <div>Loading…</div>;
   if (error) return <div>Error: {error.message}</div>;
   if (!data) return <div>No data.</div>;
