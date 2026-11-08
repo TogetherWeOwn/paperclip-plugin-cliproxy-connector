@@ -71,6 +71,27 @@ metadata, then asserts the old/rejected names are absent after refresh. Worker
 restart compares persisted provider/account values while excluding derived countdown
 strings, and verifies no fixture read occurred. Expired fixture snapshots are not
 claimed as a live time-driven expiry transition or native router execution.
+The unavailable fixture uses the canonical `unavailable: true` lifecycle flag;
+a display `status` string alone does not exercise that contract.
+
+## Frozen mapping limitation
+
+The installed worker's supported `/config/test` RPC checks three synthetic cases:
+retaining a Codex connection plus another provider validates; adding a second
+`codex` row for a distinct Sol connection is rejected as a duplicate; replacing the
+singleton Codex connection validates but violates the retained-binding requirement.
+The tests save neither the duplicate nor the replacement. `installed-matrix.json`
+retains these validation responses separately from routing results.
+
+At the frozen candidate, `src/config.ts` accepts exactly one row per raw provider
+and one `connectionId` per row. `src/router.ts` resolves that exact connection ID;
+an unmatched connection remains selectable `unknown`, never measured headroom.
+Changing the provider word to invent an alias would not match the raw telemetry
+provider. Therefore this candidate cannot represent two distinct Codex connection
+bindings simultaneously without changing one of those requirements. Configuration
+validation is not a native member assessment and does not remove the blind spot.
+No production configuration change, protocol switch or candidate repair is implied.
+A separately selected candidate needs its own exact-candidate qualification.
 
 Preparation downloads the public stock image and locked candidate dependencies before
 entering this network boundary. Browser execution must use the same network namespace,

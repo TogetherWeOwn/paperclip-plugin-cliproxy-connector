@@ -66,7 +66,7 @@ export function scenarioEntries({ credit = 'positive', healthy = false, gate = n
   if (gate === 'spend-control') quota.signals = [{ window: 'secondary', spend_control_blocked: true, reset_at: iso(3_600_000) }];
   if (gate === 'cooldown') entry.cooldowns = [{ scope: 'credential', reason: 'credential_quota', retry_at: iso(120_000) }];
   if (gate === 'expired-cooldown') entry.cooldowns = [{ scope: 'credential', reason: 'credential_quota', retry_at: iso(-60_000) }];
-  if (gate === 'unavailable') { entry.status = 'unavailable'; entry.next_retry_after = iso(120_000); }
+  if (gate === 'unavailable') { entry.unavailable = true; entry.next_retry_after = iso(120_000); }
   if (gate === 'rejected-reason') entry.cooldowns = [{ scope: 'credential', reason: REJECTED_DISPLAY, retry_at: iso(120_000) }];
   if (gate === 'reset-passed') quota.signals['x-codex-secondary-reset-at'] = String(Math.floor((now - 60_000) / 1000));
   return [entry, ...extra];
@@ -193,6 +193,34 @@ export async function installedMatrix({ api, pluginPath, companyId, evidence, re
     })).data;
     assert.equal(otherUsage.providers.length, 0);
     receipt.isolation = { disabledAccountAndOtherProviderCannotDonateCredits: true, unconfiguredCompanyHasNoProviders: true };
+
+    // The frozen candidate maps one raw provider to one connection. Test the
+    // preservation constraint through the installed worker, without saving a
+    // duplicate, replacing a binding, or inventing a provider alias.
+    const retainedConfig = config(true);
+    retainedConfig.providers.push({ provider: 'claude', connectionId: 'synthetic-retained-other-connection', completeInventory: false });
+    const validate = configJson => api(`${pluginPath}/config/test`, { companyId, configJson });
+    const retained = await validate(retainedConfig);
+    assert.equal(retained.valid, true, JSON.stringify(retained));
+    const additiveConfig = { ...retainedConfig, providers: [...retainedConfig.providers,
+      { provider: 'codex', connectionId: 'synthetic-sol-connection', completeInventory: true, creditsCountAsHeadroom: true }] };
+    const additive = await validate(additiveConfig);
+    assert.equal(additive.valid, false, 'Frozen candidate unexpectedly accepts two codex connection rows');
+    assert.match(additive.message, /duplicate provider row.*codex.*keep one row per provider/);
+    const replacementConfig = { ...retainedConfig, providers: retainedConfig.providers.map(row =>
+      row.provider === 'codex' ? { ...row, connectionId: 'synthetic-sol-connection' } : row) };
+    const replacement = await validate(replacementConfig);
+    assert.equal(replacement.valid, true, JSON.stringify(replacement));
+    assert.deepEqual(stableProviders(await usage()), stableProviders(isolated), 'Non-mutating config tests changed installed usage');
+    receipt.mappingContract = {
+      conclusion: 'unsupported-preserving-distinct-codex-bindings',
+      installedWorkerValidation: { retained, additive, replacement },
+      retainedProviderRows: retainedConfig.providers,
+      attemptedAdditiveProviderRows: additiveConfig.providers,
+      configTestIsNonMutating: true,
+      limitation: 'One raw provider row has one connectionId. Adding codex twice is rejected; a singleton replacement validates but fails the retained-binding requirement. No replacement was saved.',
+      missing: 'Native Sol member assessment with both distinct codex bindings retained; no router execution is inferred from config validation.',
+    };
     assert.deepEqual(fixture.state.unexpected, [], 'Unexpected fixture request or synthetic credential resolution failure');
     receipt.conclusion = 'success';
     report.checks.push('installed synthetic credit/gate matrix, deterministic metadata refresh and persisted-worker restart succeeded');

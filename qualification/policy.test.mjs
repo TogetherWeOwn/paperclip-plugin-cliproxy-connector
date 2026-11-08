@@ -66,6 +66,9 @@ test('installed matrix retains all opt-in, credit freshness and non-coverable ga
   assert(!('observed_at' in undated.model_quotas['gpt-6.1-sol']));
   const [dated] = scenarioEntries();
   assert(Number.isFinite(Number(dated.quota.signals['x-codex-secondary-reset-at'])));
+  const [unavailable] = scenarioEntries({ gate: 'unavailable' });
+  assert.equal(unavailable.unavailable, true, 'Unavailable lifecycle uses the canonical boolean, not display status');
+  assert(Date.parse(unavailable.next_retry_after) > Date.now());
 });
 
 test('fixture accepts only authenticated telemetry reads and refuses inference or forwarding', async () => {
