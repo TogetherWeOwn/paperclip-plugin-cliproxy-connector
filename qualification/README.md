@@ -2,12 +2,20 @@
 
 ## Current state: preflight only, not qualified
 
-This draft lane currently measures supported stock-host startup, exact local-path
-candidate installation, disable/enable, a real worker data RPC and artifact identity.
-A successful `stock-host` preflight job **does not qualify the candidate**. The
-installed credit/cooldown/isolation scenario matrix, persistence/refresh transitions,
-native router eligibility, actual browser assertions/screenshots/traces and specialist
-acceptance are still required. Do not use this lane as installation authority.
+This draft lane measures supported stock-host startup, exact local-path candidate
+installation, disable/enable, real worker data/action RPCs and artifact identity.
+It also runs synthetic telemetry through the installed worker and host persistence:
+opt-in omitted/false/true, positive/unlimited/zero/absent/stale/undated credits,
+healthy windows with stale credits, cooldown/retry-after/spend-control/unavailable,
+expired reset/cooldown, account/provider/company isolation and deterministic hardened
+metadata refresh. Actual Actions results, not the presence of this code, establish
+which assertions passed.
+
+A successful `stock-host` preflight job **does not qualify the candidate**. Native
+router eligibility (including model isolation and selectable unknown), actual browser
+assertions/screenshots/traces, time-driven expiry transitions and specialist acceptance
+remain required. UI data assertions are not browser assertions. Do not use this lane
+as installation authority.
 
 ## Identity
 
@@ -47,13 +55,27 @@ no published ports, no Docker socket, no production mount, no forwarded job toke
 and no external database. Embedded PostgreSQL and instance state live in its writable
 container layer. Candidate and driver mounts are read-only; the only writable host
 mount is the job-local evidence directory. A documentation-address negative control
-checks that non-loopback egress cannot succeed. No provider or management call occurs
-in the current preflight.
+checks that non-loopback egress cannot succeed. No real CLIProxy management call,
+provider request or inference occurs. `installed.mjs` starts a loopback fixture in
+that same namespace, authenticates with a fixed non-credential synthetic value, and
+serves only allow-listed telemetry GETs. It refuses credential downloads, `api-call`
+forwarding, inference and unexpected destinations/methods. Reports retain paths and
+counts, not authorization headers. Synthetic host secret references exercise the
+stock secret-resolution path; no real credential is created or accessed.
+
+Independent scenarios use separate disposable companies rather than bypassing the
+worker's 60-second same-company resync minimum. The deterministic cache-refresh case
+uses the same company and waits only until that actual minimum-sync deadline. It
+asserts a safe model name is cached before replacing the fixture with rejected
+metadata, then asserts the old/rejected names are absent after refresh. Worker
+restart compares persisted provider/account values while excluding derived countdown
+strings, and verifies no fixture read occurred. Expired fixture snapshots are not
+claimed as a live time-driven expiry transition or native router execution.
 
 Preparation downloads the public stock image and locked candidate dependencies before
-entering this network boundary. Future fixtures/browser execution must use the same
-network namespace, synthetic credentials/data only and an explicit request allow-list.
-They must not replace global fetch or expose a provider egress route.
+entering this network boundary. Browser execution must use the same network namespace,
+synthetic credentials/data only and an explicit request allow-list. Neither the
+fixture nor driver replaces global fetch or exposes a provider egress route.
 
 Explicit container removal and absence verification run on normal/failure paths. The
 `always()` step is **not** the cancellation guarantee: GitHub disposes the dedicated

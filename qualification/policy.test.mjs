@@ -4,6 +4,7 @@ import { readFileSync, mkdtempSync, writeFileSync, symlinkSync, rmSync } from 'n
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { CANDIDATE, HOST_SOURCE, HOST_IMAGE, assertHostRelease, digest, filesUnder } from './identity.mjs';
+import { SCENARIOS, scenarioEntries, startFixture, SYNTHETIC_KEY } from './installed.mjs';
 
 const workflow = readFileSync(new URL('../.github/workflows/qualify-stock.yml', import.meta.url), 'utf8');
 const driver = readFileSync(new URL('./preflight.mjs', import.meta.url), 'utf8');
@@ -51,6 +52,41 @@ test('preflight never represents incomplete qualification as a pass', () => {
   assert(!driver.includes('globalThis.fetch ='));
   assert(!driver.includes('/v0/management'));
   assert(!driver.includes('/v8/management'));
+});
+
+test('installed matrix retains all opt-in, credit freshness and non-coverable gate controls', () => {
+  assert.deepEqual(SCENARIOS.slice(0, 3).map(s => s.optIn), [undefined, false, true]);
+  for (const credit of ['unlimited', 'no-balance', 'false-unlimited', 'zero', 'absent', 'stale', 'undated']) {
+    assert(SCENARIOS.some(s => s.credit === credit), `Missing ${credit}`);
+  }
+  for (const gate of ['cooldown', 'retry-after', 'spend-control', 'unavailable', 'expired-cooldown', 'reset-passed', 'rejected-reason']) {
+    assert(SCENARIOS.some(s => s.gate === gate), `Missing ${gate}`);
+  }
+  const [undated] = scenarioEntries({ credit: 'undated' });
+  assert(!('observed_at' in undated.model_quotas['gpt-6.1-sol']));
+  const [dated] = scenarioEntries();
+  assert(Number.isFinite(Number(dated.quota.signals['x-codex-secondary-reset-at'])));
+});
+
+test('fixture accepts only authenticated telemetry reads and refuses inference or forwarding', async () => {
+  const fixture = await startFixture();
+  try {
+    fixture.state.entries = scenarioEntries();
+    const allowed = await fetch(`${fixture.baseUrl}/v8/management/credentials`, { headers: { 'X-Qualification-Key': SYNTHETIC_KEY } });
+    assert.equal(allowed.status, 200);
+    assert.equal((await allowed.json()).length, 1);
+    for (const [path, options] of [
+      ['/v8/management/credentials', {}],
+      ['/v1/chat/completions', { method: 'POST', headers: { authorization: `Bearer ${SYNTHETIC_KEY}` } }],
+      ['/v0/management/api-call', { method: 'POST', headers: { 'X-Qualification-Key': SYNTHETIC_KEY } }],
+      ['/v0/management/auth-files/download', { headers: { 'X-Qualification-Key': SYNTHETIC_KEY } }],
+    ]) {
+      const denied = await fetch(`${fixture.baseUrl}${path}`, options);
+      assert.equal(denied.status, 400);
+      await denied.text();
+    }
+    assert.equal(fixture.state.unexpected.length, 4);
+  } finally { await fixture.close(); }
 });
 
 test('artifact hashes change with bytes and artifact enumeration rejects symlinks', () => {

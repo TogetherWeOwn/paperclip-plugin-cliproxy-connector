@@ -47,6 +47,7 @@ if (process.argv[1] && resolve(process.argv[1]) === resolve(import.meta.filename
     candidateTree: execFileSync('git', ['-C', candidate, 'rev-parse', 'HEAD^{tree}'], { encoding: 'utf8' }).trim(),
     workflowCheckoutSha: execFileSync('git', ['-C', resolve('workflow'), 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim(),
     workflowEventSha: process.env.GITHUB_SHA,
+    workflowPrHeadSha: process.env.WORKFLOW_PR_HEAD_SHA,
     workflowRef: process.env.GITHUB_WORKFLOW_REF,
     runId: process.env.GITHUB_RUN_ID,
     attempt: process.env.GITHUB_RUN_ATTEMPT,

@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { readFileSync, writeFileSync } from 'node:fs';
 import { assertHostRelease, digest, filesUnder, HOST_SOURCE } from './identity.mjs';
+import { installedMatrix } from './installed.mjs';
 
 const base = 'http://127.0.0.1:3100';
 const evidence = '/qualification/evidence';
@@ -108,6 +109,7 @@ try {
   } catch { denied = true; }
   assert(denied, 'Unexpected non-loopback egress');
   report.checks.push('non-loopback egress negative control denied');
+  await installedMatrix({ api, pluginPath, companyId: company.id, evidence, report });
   report.preflightConclusion = 'success';
 } catch (error) {
   report.preflightConclusion = 'failure';
