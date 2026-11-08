@@ -44,6 +44,48 @@ export function parseDiagnosticsParams(value: unknown): DiagnosticsParams | null
   };
 }
 
+/** Bound the trusted configuration too before its general parser traverses it. */
+export function diagnosticsConfigWithinBounds(value: unknown): boolean {
+  let nodes = 0;
+  const visit = (item: unknown, depth: number): boolean => {
+    nodes += 1;
+    if (nodes > 20_000 || depth > 8) return false;
+    if (typeof item === "string") return item.length <= 2000;
+    if (item === null || typeof item !== "object") return true;
+    if (Array.isArray(item)) return item.length <= 2000 && item.every((child) => visit(child, depth + 1));
+    let keys = 0;
+    for (const key in item) {
+      if (!Object.hasOwn(item, key)) continue;
+      keys += 1;
+      if (keys > 2000 || key.length > 256 || !visit((item as Record<string, unknown>)[key], depth + 1)) return false;
+    }
+    return true;
+  };
+  return visit(value, 0);
+}
+
+/** Bound nested work before invoking aggregation on host-owned cached JSON. */
+export function diagnosticsCacheWithinBounds(rows: AccountUsageRow[]): boolean {
+  if (rows.length > 2000) return false;
+  let limits = 0;
+  let models = 0;
+  const short = (v: unknown, max: number) => v == null || (typeof v === "string" && v.length <= max);
+  for (const row of rows) {
+    if (!row || !short(row.provider, 128) || !short(row.checkedAt, 40) || !Array.isArray(row.limits) || row.limits.length > 256) return false;
+    limits += row.limits.length;
+    if (limits > 10_000) return false;
+    for (const limit of row.limits) {
+      if (!limit || !short(limit.id, 256) || !short(limit.observedAt, 40) || !short(limit.resetsAt, 40)) return false;
+      if (limit.models != null) {
+        if (!Array.isArray(limit.models) || limit.models.length > 100) return false;
+        models += limit.models.length;
+        if (models > 20_000 || limit.models.some((model) => typeof model !== "string" || model.length > 200)) return false;
+      }
+    }
+  }
+  return true;
+}
+
 /** Same aggregate and reserve precedence as routing; no secrets or raw cache projection. */
 export function buildDiagnostics(config: ConnectorConfig, rows: AccountUsageRow[], params: DiagnosticsParams, now: string) {
   const provider = config.providers.find((p) => providerConnectionIds(p).includes(params.connectionId));

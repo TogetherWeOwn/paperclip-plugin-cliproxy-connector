@@ -21,7 +21,9 @@ All rows below name authored fixtures; their execution must be established by ex
 | Authenticated scope, no caller tenant override, missing identity, unconfigured/foreign connection | registered-handler scope/refusal cases in `src/diagnostics.test.ts` |
 | Exact pool override and threshold-100 agreement with router; no asserted native pool inventory | router-semantics case in `src/diagnostics.test.ts` |
 | No credential resolution, outbound fetch or cache mutation; raw config/account/error canaries absent | registered-handler canary and reflected-error cases in `src/diagnostics.test.ts` |
-| Per-principal rate boundary; audit failure refuses success | rate/audit case in `src/diagnostics.test.ts` |
+| Per-principal rate boundary including malformed calls; audit failure refuses success; stalled reads/audits retain permits across timeout waves; nested work and elapsed deadline bounds | rate/audit/timeout/concurrency/nested-cache cases in `src/diagnostics.test.ts` |
+| Optional catalog warnings do not count as quota failure; healthy siblings cannot mask stale/unknown observations; invalid persisted alias config refuses routing | health and `routeWithCache` cases in `src/plugin.test.ts` |
+| Feature/malformed scopes do not satisfy account-wide Hopper completeness; credential-shaped metric keys are refused | typed normalized observation cases in `src/parsers.test.ts` |
 | API method, query scope, extra keys, canonical integer conversion | GET API case in `src/diagnostics.test.ts` |
 | v8 account-level discovery, explicit fallback precedence, disabled/unsupported/malformed entries | `src/sync.test.ts` discovery cases |
 | Native numeric fields, unknown-is-not-zero, Codex balance age, Hopper completeness, Meta parity guard | `src/parsers.test.ts` typed normalized observations |
@@ -35,10 +37,10 @@ multiplexer. Native governance and durable host audit coverage are still require
 
 - No local suite, typecheck or build is authorized or claimed. CI commands are `npm run typecheck`, `npm test`, `npm run build` on GitHub Actions.
 - Exact-head Actions evidence for these additions: pending.
-- One fresh-context complete-diff review, native Security and QA decisions: pending.
+- One fresh-context complete-diff review completed on the initial feature head. It found native-field loss (already corrected), unsafe metric keys, timeout/audit permit leaks, synchronous deadline gaps, health coverage errors and routing through invalid persisted mappings. This repair batch adds targeted regressions; exact-head Actions and reviewer acceptance of the fixes remain pending. Native Security and QA decisions remain pending.
 - Exact artifact digest/configuration/permission-envelope Security acceptance: pending. This candidate is not a release artifact.
 - Verify on the exact installation host that native registered tools traverse access governance and immutable call-event auditing. Narrow access to intended agents/projects, classify the tool read-only, and prove denied access cannot dispatch. No claim of this coverage is made from SDK declarations or offline fixtures.
-- Verify activity and missing-identity worker logs are durable and subject to the intended retention/access controls. Local in-memory rate buckets are not a distributed quota.
+- Verify activity and **all** identity/rate/capacity/deadline refusal worker records are durably captured with native call-event audit and intended retention/access controls. Saturation refusals deliberately do not enqueue activity RPCs. Missing durable refusal coverage is an open install gate, not a passed audit control. Local in-memory rate buckets are not a distributed quota; permanently hung host RPCs retain permits until actual settlement or Operator worker recovery.
 - Verify deadline, concurrency, cache/output boundaries and negative controls in Actions; uncompleted evidence remains a gate, not an assumed pass.
 - Meta fallback retirement remains gated on provider-contract parity: preserve malformed/missing-source semantics, canonical windows, tier identity and original observation/cache age, followed by accepted exact-version parity evidence. Do not remove the fallback based on these adapter changes.
 

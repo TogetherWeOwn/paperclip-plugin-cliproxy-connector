@@ -601,7 +601,7 @@ function parseQuotaMetrics(value: unknown): QuotaMetric[] | null {
     const key = getStr(metric, "key");
     const label = sanitizeStatusMessage(getStr(metric, "label"));
     const amount = nonnegativeNumber(metric.value);
-    if (!key || !/^[a-z][a-z0-9_]{0,63}$/.test(key) || !label || amount === null) continue;
+    if (!key || !/^[a-z][a-z0-9_]{0,63}$/.test(key) || isCredentialToken(key) || !label || amount === null) continue;
     metrics.push({
       key, label, value: amount,
       unit: sanitizeStatusMessage(getStr(metric, "unit")),
@@ -971,7 +971,7 @@ export function parsePluginQuota(
       const rawWindow = getStr(bucket, "Window", "window", "Name", "name", "id", "Id") ?? "window";
       const windowName = provider === "meta" && rawWindow.toLowerCase() === "5h" ? "window" : rawWindow;
       const nativeFields = {
-        scope: sanitizeStatusMessage(getStr(bucket, "scope", "Scope")),
+        scope: bucket.scope == null && bucket.Scope == null ? null : sanitizeStatusMessage(getStr(bucket, "scope", "Scope")) ?? "unknown-scope",
         windowDurationSeconds: nonnegativeNumber(bucket.windowDurationSeconds ?? bucket.window_duration_seconds),
         resetInterval: sanitizeStatusMessage(getStr(bucket, "resetInterval", "reset_interval")),
         used: nonnegativeNumber(bucket.used), limit: nonnegativeNumber(bucket.limit),

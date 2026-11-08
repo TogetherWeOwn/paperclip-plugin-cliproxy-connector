@@ -365,6 +365,8 @@ export interface SyncSummary {
    */
   acceptedDrift?: DriftFinding[];
   errors: string[];
+  /** Quota discovery/parser failures only; optional catalog/display warnings stay in errors. */
+  quotaErrors?: string[];
   skipped: boolean;
   skipReason: string | null;
   /**

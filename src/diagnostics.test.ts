@@ -116,12 +116,72 @@ describe("quota diagnostics", () => {
     expect(JSON.stringify(harness.activity)).not.toContain(CANARY);
   });
 
-  it("bounds stalled host reads by its deadline and never returns late data", async () => {
+  it("retains all slots until timed-out host reads actually settle", async () => {
     const { harness } = await setup();
-    vi.spyOn(harness.ctx.config, "get").mockImplementation(() => new Promise(() => {}));
-    const pending = harness.executeTool<ToolResult>(DIAGNOSTICS_TOOL, { connectionId: "conn-a" }, { ...caller, agentId: "timeout-agent" });
+    const original = harness.ctx.config.get.bind(harness.ctx.config);
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const reads = vi.spyOn(harness.ctx.config, "get").mockImplementation(async (companyId) => { await gate; return original(companyId); });
+    const audits = vi.spyOn(harness.ctx.activity, "log");
+    const calls = Array.from({ length: 4 }, (_, i) => harness.executeTool<ToolResult>(DIAGNOSTICS_TOOL, { connectionId: "conn-a" }, { ...caller, agentId: `timeout-${i}` }));
     await vi.advanceTimersByTimeAsync(5001);
-    const result = await pending;
+    expect((await Promise.all(calls)).every((result) => result.error === "diagnostics_unavailable")).toBe(true);
+    for (let i = 0; i < 8; i += 1) {
+      expect((await harness.executeTool<ToolResult>(DIAGNOSTICS_TOOL, { connectionId: "conn-a" }, { ...caller, agentId: `late-${i}` })).error).toBe("diagnostics_rate_limited");
+    }
+    expect(reads).toHaveBeenCalledTimes(4);
+    expect(audits).not.toHaveBeenCalled();
+    release();
+    await vi.advanceTimersByTimeAsync(0);
+    reads.mockRestore();
+    expect((await harness.executeTool<ToolResult>(DIAGNOSTICS_TOOL, { connectionId: "conn-a" }, { ...caller, agentId: "after-timeout" })).error).toBeUndefined();
+  });
+
+  it("caps stalled audits including malformed calls and does not launch RPCs on capacity refusals", async () => {
+    const { harness } = await setup();
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const audits = vi.spyOn(harness.ctx.activity, "log").mockImplementation(() => gate);
+    const reads = vi.spyOn(harness.ctx.config, "get");
+    const calls = Array.from({ length: 4 }, (_, i) => harness.executeTool<ToolResult>(DIAGNOSTICS_TOOL, { unknown: true }, { ...caller, agentId: `audit-stall-${i}` }));
+    await vi.advanceTimersByTimeAsync(5001);
+    expect((await Promise.all(calls)).every((result) => result.error === "diagnostics_unavailable")).toBe(true);
+    for (let i = 0; i < 8; i += 1) {
+      expect((await harness.executeTool<ToolResult>(DIAGNOSTICS_TOOL, { unknown: true }, { ...caller, agentId: `refusal-${i}` })).error).toBe("diagnostics_rate_limited");
+    }
+    expect(audits).toHaveBeenCalledTimes(4);
+    expect(reads).not.toHaveBeenCalled();
+    release();
+    await vi.advanceTimersByTimeAsync(0);
+  });
+
+  it("counts malformed calls against the same principal budget", async () => {
+    const { harness } = await setup();
+    const identity = { ...caller, agentId: "malformed-budget" };
+    for (let i = 0; i < 30; i += 1) {
+      expect((await harness.executeTool<ToolResult>(DIAGNOSTICS_TOOL, {}, identity)).error).toBe("invalid_parameters");
+    }
+    const audits = vi.spyOn(harness.ctx.activity, "log");
+    expect((await harness.executeTool<ToolResult>(DIAGNOSTICS_TOOL, {}, identity)).error).toBe("diagnostics_rate_limited");
+    expect(audits).not.toHaveBeenCalled();
+  });
+
+  it.each(["limits", "models", "id"])("bounds nested cache %s before aggregation", async (dimension) => {
+    const { harness } = await setup();
+    const cached = row();
+    if (dimension === "limits") cached.limits = Array.from({ length: 257 }, () => ({ ...cached.limits[0]! }));
+    if (dimension === "models") cached.limits[0]!.models = Array.from({ length: 101 }, () => "model");
+    if (dimension === "id") cached.limits[0]!.id = "x".repeat(257);
+    vi.spyOn(harness.ctx.state, "get").mockResolvedValue({ one: cached } as never);
+    expect((await harness.executeTool<ToolResult>(DIAGNOSTICS_TOOL, { connectionId: "conn-a" }, { ...caller, agentId: `nested-${dimension}` })).error).toBe("diagnostics_cache_limit");
+  });
+
+  it("refuses success if synchronous cache processing crosses the deadline", async () => {
+    const { harness } = await setup();
+    const cached = row();
+    Object.defineProperty(cached.limits[0], "models", { get() { vi.setSystemTime(Date.parse(NOW) + 5001); return null; } });
+    vi.spyOn(harness.ctx.state, "get").mockResolvedValue({ one: cached } as never);
+    const result = await harness.executeTool<ToolResult>(DIAGNOSTICS_TOOL, { connectionId: "conn-a" }, { ...caller, agentId: "sync-deadline" });
     expect(result.error).toBe("diagnostics_unavailable");
     expect(result.data).toBeUndefined();
   });

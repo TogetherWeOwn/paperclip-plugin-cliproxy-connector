@@ -133,6 +133,21 @@ describe("typed normalized quota observations", () => {
     expect(parsed.overage).toMatchObject({ enabled: true, available: null, balance: null, remaining: null });
   });
 
+  it.each(["feature", {}, 42, ""])("does not accept feature or malformed scope as account-wide Hopper coverage: %j", (scope) => {
+    const parsed = parsePluginQuota("hopper", {
+      groups: [{ buckets: [{ window: "5h", scope, remainingFraction: 1 }, { window: "weekly", remainingFraction: 1 }] }],
+    }, DEFAULT_PROVIDER_WINDOWS.hopper, { observedAt: NOW });
+    expect(parsed.limits.find((l) => l.id === "hopper:5h" && l.gating)).toMatchObject({ remainingPercent: null, allowed: null });
+    expect(parsed.limits.filter((l) => l.id === "hopper:5h")).toHaveLength(2);
+  });
+
+  it("refuses credential-shaped metric keys rather than persisting them", () => {
+    const key = "sk_live_a1b2c3d4";
+    const parsed = parsePluginQuota("hopper", { summary: [{ key, label: "Balance", value: 12.5 }] }, DEFAULT_PROVIDER_WINDOWS.hopper);
+    expect(parsed.quotaMetrics).toBeNull();
+    expect(JSON.stringify(parsed)).not.toContain(key);
+  });
+
   it("canonicalizes Meta windows and prefers tier while retaining incomplete coverage as unknown", () => {
     const parsed = parsePluginQuota("meta", {
       subscription: { plan: "subscription", tierName: "Pro" },

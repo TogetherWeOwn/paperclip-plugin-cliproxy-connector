@@ -274,6 +274,32 @@ describe("config validation and health", () => {
     expect(await plugin.definition.onHealth!()).toMatchObject({ status: "degraded" });
   });
 
+  it("does not mistake optional catalog or display warnings for failed quota coverage", async () => {
+    const { harness } = await healthyCache();
+    const summary = harness.getState(stateKey(LAST_SYNC_STATE_KEY)) as Record<string, unknown>;
+    await harness.ctx.state.set(stateKey(LAST_SYNC_STATE_KEY), {
+      ...summary, errors: ["clientApiKeySecretRef is not set: skipping /v1/models", "served-set metadata unavailable"], quotaErrors: [],
+    } as never);
+    expect(await plugin.definition.onHealth!()).toMatchObject({ status: "ok" });
+  });
+
+  it.each(["stale", "missing", "future", "blind", "unknown-window"])("does not let a healthy sibling mask %s observation coverage", async (condition) => {
+    const { harness, rows } = await healthyCache();
+    const sibling = structuredClone(Object.values(rows)[0]!);
+    sibling.key = "acct-sibling";
+    if (condition === "stale") sibling.limits[0]!.observedAt = new Date(Date.now() - 60 * 60_000).toISOString();
+    if (condition === "missing") sibling.limits[0]!.observedAt = "not-a-time";
+    if (condition === "future") sibling.limits[0]!.observedAt = new Date(Date.now() + 60 * 60_000).toISOString();
+    if (condition === "blind") sibling.quotaBlind = true;
+    if (condition === "unknown-window") { sibling.limits[0]!.remainingPercent = null; sibling.limits[0]!.usedPercent = null; }
+    rows[sibling.key] = sibling;
+    await harness.ctx.state.set(stateKey(ROWS_STATE_KEY), rows as never);
+    expect(await plugin.definition.onHealth!()).toMatchObject({ status: "degraded" });
+    sibling.status = "disabled";
+    await harness.ctx.state.set(stateKey(ROWS_STATE_KEY), rows as never);
+    expect(await plugin.definition.onHealth!()).toMatchObject({ status: "ok" });
+  });
+
   it("reports ok only with fresh non-blind coverage, without probing or resolving secrets", async () => {
     const { harness, fetchMock } = await healthyCache();
     const secretSpy = vi.spyOn(harness.ctx.secrets, "resolve");
@@ -302,7 +328,7 @@ describe("config validation and health", () => {
         const summary = harness.getState(stateKey(LAST_SYNC_STATE_KEY)) as Record<string, unknown>;
         await harness.ctx.state.set(stateKey(LAST_SYNC_STATE_KEY), {
           ...summary,
-          ...(condition === "stale-sync" ? { finishedAt: old } : { errors: ["quota fetch failed"] }),
+          ...(condition === "stale-sync" ? { finishedAt: old } : { errors: ["quota fetch failed"], quotaErrors: ["quota fetch failed"] }),
         } as never);
       }
       await harness.ctx.state.set(stateKey(ROWS_STATE_KEY), rows as never);
@@ -488,5 +514,24 @@ describe("router glue", () => {
       ],
     } as never);
     expect(result).toEqual({ kind: "selected", memberId: "m-a", skipped: {} });
+  });
+
+  it("routeWithCache refuses ambiguous persisted alias configuration before reading quota", async () => {
+    const ctx = {
+      config: { get: vi.fn(async () => ({
+        ...COMPANY_CONFIG,
+        providers: [
+          { provider: "claude", connectionIds: ["shared"], completeInventory: true },
+          { provider: "codex", connectionIds: ["shared"], completeInventory: true },
+        ],
+      })) },
+      state: { get: vi.fn(async () => { throw new Error("must not read invalid inventory"); }) },
+    };
+    const result = await routeWithCache(ctx as never, {
+      companyId: COMPANY, now: "2026-11-01T12:00:00.000Z",
+      pool: { id: "pool-1", mode: "usage_aware" }, candidates: [],
+    } as never);
+    expect(result.kind).toBe("unavailable");
+    expect(ctx.state.get).not.toHaveBeenCalled();
   });
 });

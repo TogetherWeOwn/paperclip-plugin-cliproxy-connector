@@ -1018,6 +1018,7 @@ export async function runSync(deps: SyncDeps, inFlight: { running: boolean }): P
         drift,
         acceptedDrift,
         errors,
+        quotaErrors: [...pluginErrors, ...warnings],
         providerModels,
         providerModelNames,
         modelOverlaps,
