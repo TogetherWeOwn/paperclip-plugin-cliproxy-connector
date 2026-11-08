@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { readFileSync, writeFileSync } from 'node:fs';
-import { assertHostRelease, digest, filesUnder, HOST_SOURCE } from './identity.mjs';
+import { assertHostRelease, CANDIDATE_VERSION, digest, filesUnder, HOST_SOURCE } from './identity.mjs';
 import { installedMatrix } from './installed.mjs';
 
 const base = 'http://127.0.0.1:3100';
@@ -80,7 +80,7 @@ try {
   let plugin = await api('/api/plugins/install', { packageName: candidate, isLocalPath: true });
   if (plugin.plugin) plugin = plugin.plugin;
   assert.equal(plugin.pluginKey, 'togetherweown.cliproxy-connector');
-  assert.equal(plugin.version, '0.2.7');
+  assert.equal(plugin.version, CANDIDATE_VERSION);
   assert.equal(plugin.status, 'ready');
   assert.equal(plugin.packagePath, candidate);
   report.installedPlugin = { id: plugin.id, pluginKey: plugin.pluginKey, version: plugin.version, status: plugin.status, packagePath: plugin.packagePath };

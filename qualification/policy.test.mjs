@@ -1,9 +1,11 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { readFileSync, mkdtempSync, writeFileSync, symlinkSync, rmSync } from 'node:fs';
+import { readFileSync, mkdtempSync, mkdirSync, writeFileSync, symlinkSync, rmSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
-import { CANDIDATE, HOST_SOURCE, HOST_IMAGE, assertHostRelease, digest, filesUnder } from './identity.mjs';
+import { join, relative } from 'node:path';
+import { CANDIDATE, CANDIDATE_VERSION, HOST_SOURCE, HOST_IMAGE, assertHostRelease, digest, filesUnder, verifyPackedArtifacts } from './identity.mjs';
+import { createHash } from 'node:crypto';
 import { SCENARIOS, TRANSITIONS, scenarioEntries, timedEntries, startFixture, SYNTHETIC_KEY } from './installed.mjs';
 import { permittedRequest } from './browser/policy.mjs';
 import { assertBrowserComplete } from './browser/receipt.mjs';
@@ -154,6 +156,33 @@ test('fixture accepts only authenticated telemetry reads and refuses inference o
     }
     assert.equal(fixture.state.unexpected.length, 4);
   } finally { await fixture.close(); }
+});
+
+test('retained package integrity and every packed artifact must match the selected build', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'connector-pack-policy-'));
+  try {
+    mkdirSync(join(dir, 'package/dist/ui'), { recursive: true });
+    writeFileSync(join(dir, 'package/dist/worker.js'), 'synthetic worker');
+    writeFileSync(join(dir, 'package/dist/ui/index.js'), 'synthetic UI');
+    const filename = 'synthetic.tgz';
+    const tarball = join(dir, filename);
+    execFileSync('tar', ['-czf', tarball, '-C', dir, 'package']);
+    const bytes = readFileSync(tarball);
+    const packed = { name: '@togetherweown/paperclip-plugin-cliproxy-connector',
+      version: CANDIDATE_VERSION, filename, size: bytes.length,
+      integrity: `sha512-${createHash('sha512').update(bytes).digest('base64')}` };
+    const save = () => writeFileSync(join(dir, 'pack.json'), JSON.stringify([packed]));
+    save();
+    const artifacts = Object.fromEntries(filesUnder(join(dir, 'package/dist')).map(file => [relative(join(dir, 'package'), file), digest(file)]));
+    assert.equal(verifyPackedArtifacts(dir, artifacts).sha256, digest(tarball));
+    assert.throws(() => verifyPackedArtifacts(dir, { ...artifacts, 'dist/worker.js': 'wrong' }), /Packed artifact differs/);
+    packed.version = '0.2.7'; save();
+    assert.throws(() => verifyPackedArtifacts(dir, artifacts));
+    packed.version = CANDIDATE_VERSION; packed.integrity = 'sha512-wrong'; save();
+    assert.throws(() => verifyPackedArtifacts(dir, artifacts));
+    assert(workflow.includes('npm pack --ignore-scripts --json --pack-destination'));
+    assert(driver.includes('assert.equal(plugin.version, CANDIDATE_VERSION)'));
+  } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
 test('artifact hashes change with bytes and artifact enumeration rejects symlinks', () => {

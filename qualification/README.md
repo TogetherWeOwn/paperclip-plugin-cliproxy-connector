@@ -19,8 +19,12 @@ as installation authority.
 
 ## Identity
 
-- Candidate: `c129014d765b400d8e547ff469499cd3c34429ff`, independently checked out,
-  built with its unchanged lockfile and SDK `2026.1023.0`.
+- Explicitly selected replacement: `1fd7aaa1848c47a56ea0d7154aab16c5f82a548f`
+  (PR #24 squash, version `0.3.0`), independently checked out and built with its
+  unchanged lockfile and SDK `2026.1023.0`. Reviewed source head
+  `41ece7dd83d778822c247c045f78a411fb0199a0` is provenance, not an interchangeable
+  build target. Earlier `c129014d765b400d8e547ff469499cd3c34429ff` remains failed;
+  its negative browser evidence does not qualify or fail this replacement.
 - Stock host source: `d69631b01b9c658f80bf8bed389863dce82643e1`, the source baseline
   associated with the stock `2026.1106.0` host.
 - Stock Linux AMD64 image manifest:
@@ -38,6 +42,12 @@ as installation authority.
 - `identity.json` records workflow checkout SHA separately from event SHA (a PR event
   can name a synthetic merge), candidate tree/package/lock hashes, SDK version,
   built worker/UI hashes, run/attempt/job and image manifest/config identity.
+- Actions creates the selected version's npm tarball with pack hooks disabled,
+  retains it in the evidence archive and records SHA256, npm SHA512 integrity and
+  byte size. Each packaged `dist` file must hash identically to the independent
+  build and installed-path files. This binds retained package bytes to the tested
+  local-path installation; it does not claim that the tarball install path itself
+  was tested or that reviewed-head artifacts are equivalent.
 - `preflight.json` records installed package path and its artifact hashes, the actual
   stock runtime identity and successful/failed checks. Hashing a UI bundle is not
   browser-load proof. Registry health is not worker RPC proof; the data bridge is
@@ -149,14 +159,21 @@ qualification and specialist verdicts remain separate even if all browser checks
 pass. The current extension tests the native first page slot (Accounts); it does
 not claim coverage of a separately rendered Usage page or dashboard widget.
 
-## Frozen mapping limitation
+## Selected replacement mapping controls and historical limitation
 
-The installed worker's supported `/config/test` RPC checks three synthetic cases:
-retaining a Codex connection plus another provider validates; adding a second
-`codex` row for a distinct Sol connection is rejected as a duplicate; replacing the
-singleton Codex connection validates but violates the retained-binding requirement.
-The tests save neither the duplicate nor the replacement. `installed-matrix.json`
-retains these validation responses separately from routing results.
+The selected replacement supports `connectionIds` on one raw-provider row. The
+installed worker's `/config/test` RPC must accept a retained primary Codex binding,
+its additive Sol alias and an unrelated provider; duplicate provider rows and
+cross-provider alias ambiguity must still fail. Config validation must not mutate
+usage. The lane then saves only that synthetic supported alias configuration and
+requires the installed UI-data projection to retain the primary ID, include both
+IDs, preserve unrelated bindings and avoid duplicating account/headroom counts or
+refreshing telemetry. `installed-matrix.json` retains validation and actual values.
+This is representation/projection evidence, not native routing evidence. Production
+bindings are never read or changed.
+
+Historical `c129014` installed `/config/test` receipts established the limitation
+below; they remain negative evidence for that candidate only:
 
 At the frozen candidate, `src/config.ts` accepts exactly one row per raw provider
 and one `connectionId` per row. `src/router.ts` resolves that exact connection ID;

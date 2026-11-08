@@ -240,32 +240,45 @@ export async function installedMatrix({ api, pluginPath, companyId, evidence, re
     assert.equal(otherUsage.providers.length, 0);
     receipt.isolation = { disabledAccountAndOtherProviderCannotDonateCredits: true, unconfiguredCompanyHasNoProviders: true };
 
-    // The frozen candidate maps one raw provider to one connection. Test the
-    // preservation constraint through the installed worker, without saving a
-    // duplicate, replacing a binding, or inventing a provider alias.
+    // Preserve the primary binding and unrelated providers while adding the
+    // selected candidate's supported same-inventory connection alias.
     const retainedConfig = config(true);
     retainedConfig.providers.push({ provider: 'claude', connectionId: 'synthetic-retained-other-connection', completeInventory: false });
     const validate = configJson => api(`${pluginPath}/config/test`, { companyId, configJson });
     const retained = await validate(retainedConfig);
     assert.equal(retained.valid, true, JSON.stringify(retained));
-    const additiveConfig = { ...retainedConfig, providers: [...retainedConfig.providers,
+    const duplicateConfig = { ...retainedConfig, providers: [...retainedConfig.providers,
       { provider: 'codex', connectionId: 'synthetic-sol-connection', completeInventory: true, creditsCountAsHeadroom: true }] };
-    const additive = await validate(additiveConfig);
-    assert.equal(additive.valid, false, 'Frozen candidate unexpectedly accepts two codex connection rows');
-    assert.match(additive.message, /duplicate provider row.*codex.*keep one row per provider/);
-    const replacementConfig = { ...retainedConfig, providers: retainedConfig.providers.map(row =>
-      row.provider === 'codex' ? { ...row, connectionId: 'synthetic-sol-connection' } : row) };
-    const replacement = await validate(replacementConfig);
-    assert.equal(replacement.valid, true, JSON.stringify(replacement));
+    const duplicate = await validate(duplicateConfig);
+    assert.equal(duplicate.valid, false, 'Duplicate provider rows must still be rejected');
+    const aliasConfig = { ...retainedConfig, providers: retainedConfig.providers.map(row =>
+      row.provider === 'codex' ? { ...row, connectionIds: ['synthetic-sol-connection'] } : row) };
+    const alias = await validate(aliasConfig);
+    assert.equal(alias.valid, true, JSON.stringify(alias));
+    const ambiguousConfig = { ...aliasConfig, providers: aliasConfig.providers.map(row =>
+      row.provider === 'claude' ? { ...row, connectionIds: ['synthetic-sol-connection'] } : row) };
+    const ambiguous = await validate(ambiguousConfig);
+    assert.equal(ambiguous.valid, false, 'Cross-provider alias ambiguity must be rejected');
     assert.deepEqual(stableProviders(await usage()), stableProviders(isolated), 'Non-mutating config tests changed installed usage');
+    const readsBeforeAliases = fixture.state.requests.length;
+    await api(`${pluginPath}/config`, { companyId, configJson: aliasConfig });
+    const aliased = await usage();
+    const aliasCodex = aliased.providers.find(p => p.provider === 'codex');
+    assert.equal(aliasCodex.connectionId, 'synthetic-codex-connection');
+    assert.deepEqual(aliasCodex.connectionIds, ['synthetic-codex-connection', 'synthetic-sol-connection']);
+    assert.equal(aliasCodex.state, isolatedCodex.state);
+    assert.equal(aliasCodex.enabledAccounts, isolatedCodex.enabledAccounts);
+    assert.equal(aliasCodex.creditHeadroomAccounts, 0);
+    assert.equal(aliased.providers.find(p => p.provider === 'claude').connectionId, 'synthetic-retained-other-connection');
+    assert.equal(fixture.state.requests.length, readsBeforeAliases, 'Alias projection unexpectedly refreshed telemetry');
     receipt.mappingContract = {
-      conclusion: 'unsupported-preserving-distinct-codex-bindings',
-      installedWorkerValidation: { retained, additive, replacement },
-      retainedProviderRows: retainedConfig.providers,
-      attemptedAdditiveProviderRows: additiveConfig.providers,
+      conclusion: 'installed-alias-representation-preserves-primary-and-other-provider',
+      installedWorkerValidation: { retained, duplicate, alias, ambiguous },
+      savedSyntheticProviderRows: aliasConfig.providers,
+      actualProviders: aliased.providers,
       configTestIsNonMutating: true,
-      limitation: 'One raw provider row has one connectionId. Adding codex twice is rejected; a singleton replacement validates but fails the retained-binding requirement. No replacement was saved.',
-      missing: 'Native Sol member assessment with both distinct codex bindings retained; no router execution is inferred from config validation.',
+      noTelemetryReadsForAliasProjection: true,
+      missing: 'Native member/model assessment for primary and alias connections; no router execution is inferred from config validation or UI projection.',
     };
     receipt.transitions = [];
     for (const transition of TRANSITIONS) {

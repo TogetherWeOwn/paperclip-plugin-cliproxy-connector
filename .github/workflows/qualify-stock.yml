@@ -18,7 +18,7 @@ jobs:
     timeout-minutes: 25
     env:
       WORKFLOW_PR_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
-      CANDIDATE_SHA: c129014d765b400d8e547ff469499cd3c34429ff
+      CANDIDATE_SHA: 1fd7aaa1848c47a56ea0d7154aab16c5f82a548f
       HOST_SOURCE_SHA: d69631b01b9c658f80bf8bed389863dce82643e1
       STOCK_IMAGE: ghcr.io/paperclipai/paperclip@sha256:12ae7579165cbf11d8db71ef69cf01ff48660383e78541b6b2eba38939fa30c9
       QUALIFICATION_CONTAINER: connector-qualification-${{ github.run_id }}-${{ github.run_attempt }}
@@ -32,7 +32,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           repository: TogetherWeOwn/paperclip-plugin-cliproxy-connector
-          ref: c129014d765b400d8e547ff469499cd3c34429ff
+          ref: 1fd7aaa1848c47a56ea0d7154aab16c5f82a548f
           path: candidate
           persist-credentials: false
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
@@ -55,6 +55,8 @@ jobs:
           test "$(npm config get min-release-age)" = 3
           npm ci
           npm run build
+          mkdir -p "$RUNNER_TEMP/connector-evidence"
+          npm pack --ignore-scripts --json --pack-destination "$RUNNER_TEMP/connector-evidence" > "$RUNNER_TEMP/connector-evidence/pack.json"
           test "$(node -p "require('./node_modules/@paperclipai/plugin-sdk/package.json').version")" = 2026.1023.0
           test -z "$(git status --porcelain)"
       - name: Install locked browser driver without hooks

@@ -2,9 +2,10 @@ import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { readFileSync, readdirSync, writeFileSync } from 'node:fs';
-import { resolve, relative, join } from 'node:path';
+import { basename, resolve, relative, join } from 'node:path';
 
-export const CANDIDATE = 'c129014d765b400d8e547ff469499cd3c34429ff';
+export const CANDIDATE = '1fd7aaa1848c47a56ea0d7154aab16c5f82a548f';
+export const CANDIDATE_VERSION = '0.3.0';
 export const HOST_SOURCE = 'd69631b01b9c658f80bf8bed389863dce82643e1';
 export const HOST_RELEASE = '2026.1106.0';
 export const HOST_IMAGE = 'sha256:12ae7579165cbf11d8db71ef69cf01ff48660383e78541b6b2eba38939fa30c9';
@@ -24,6 +25,24 @@ export function filesUnder(root) {
     assert(!entry.isSymbolicLink(), `Unexpected artifact symlink: ${entry.name}`);
     return entry.isDirectory() ? filesUnder(file) : [file];
   }).sort();
+}
+
+export function verifyPackedArtifacts(evidence, artifacts) {
+  const [packed] = JSON.parse(readFileSync(join(evidence, 'pack.json'), 'utf8'));
+  assert.equal(packed.name, '@togetherweown/paperclip-plugin-cliproxy-connector');
+  assert.equal(packed.version, CANDIDATE_VERSION);
+  assert.equal(packed.filename, basename(packed.filename));
+  assert(packed.filename.endsWith('.tgz'));
+  const tarball = join(evidence, packed.filename);
+  const bytes = readFileSync(tarball);
+  assert.equal(bytes.length, packed.size);
+  assert.equal(`sha512-${createHash('sha512').update(bytes).digest('base64')}`, packed.integrity);
+  for (const [file, expected] of Object.entries(artifacts)) {
+    const included = execFileSync('tar', ['-xOzf', tarball, `package/${file}`], { maxBuffer: 16 * 1024 * 1024 });
+    assert.equal(createHash('sha256').update(included).digest('hex'), expected, `Packed artifact differs: ${file}`);
+  }
+  return { filename: packed.filename, version: packed.version, size: packed.size,
+    sha256: digest(tarball), integrity: packed.integrity, builtArtifactsMatch: true };
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === resolve(import.meta.filename)) {
@@ -62,6 +81,7 @@ if (process.argv[1] && resolve(process.argv[1]) === resolve(import.meta.filename
     candidateLockSha256: digest(join(candidate, 'package-lock.json')),
     candidatePackageSha256: digest(join(candidate, 'package.json')),
     artifacts,
+    packageTarball: verifyPackedArtifacts(evidence, artifacts),
     artifactRetentionDays: 7,
     missing: ['installed scenario matrix', 'native router eligibility', 'browser assertions and traces', 'exact-candidate Security and final QA acceptance'],
   }, null, 2));
