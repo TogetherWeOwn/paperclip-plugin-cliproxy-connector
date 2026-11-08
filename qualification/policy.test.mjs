@@ -8,8 +8,8 @@ import { CANDIDATE, CANDIDATE_VERSION, HOST_SOURCE, HOST_IMAGE, assertHostReleas
 import { createHash } from 'node:crypto';
 import { SCENARIOS, TRANSITIONS, scenarioEntries, timedEntries, startFixture, SYNTHETIC_KEY } from './installed.mjs';
 import { permittedRequest } from './browser/policy.mjs';
-import { assertBrowserComplete } from './browser/receipt.mjs';
-import { assertNativeOutcome, REFUSAL_COMMAND, ROUTER_MODEL } from './native-router.mjs';
+import { assertBrowserComplete, providerBindingText } from './browser/receipt.mjs';
+import { assertNativeOutcome, assertNativeComplete, REFUSAL_COMMAND, ROUTER_MODEL } from './native-router.mjs';
 
 const workflow = readFileSync(new URL('../.github/workflows/qualify-stock.yml', import.meta.url), 'utf8');
 const driver = readFileSync(new URL('./preflight.mjs', import.meta.url), 'utf8');
@@ -77,6 +77,17 @@ test('browser request policy refuses external origins, fixture ports and mutatio
   }
 });
 
+test('browser binding selector follows exact installed primary and alias IDs', () => {
+  const primary = '8d17a4f9-c854-45bb-8337-e7c99c99f9e7';
+  const alias = 'dc32eea3-704e-49ae-8455-1b4400a37440';
+  assert.equal(providerBindingText({ connectionIds: [primary, alias] }), `connections ${primary}, ${alias} · completeInventory`);
+  assert.equal(providerBindingText({ connectionIds: [primary] }), `connection ${primary} · completeInventory`);
+  assert.throws(() => providerBindingText({ connectionIds: [] }));
+  const observer = readFileSync(new URL('./browser/observe.mjs', import.meta.url), 'utf8');
+  assert(observer.includes('frame.getByText(providerBindingText(expected))'));
+  assert(!observer.includes('connection synthetic-codex-connection'));
+});
+
 test('collecting later browser controls cannot turn a disagreement into success', () => {
   const receipt = {
     attempts: Array.from({ length: 28 }, () => ({ agreement: true, exactCandidateUiLoaded: true })),
@@ -130,6 +141,19 @@ test('native allocation receipts require exact selection or pre-provider exhaust
   assert(native.includes('/pause'));
   assert(!native.includes('apiKey:'));
   assert(!native.includes('globalThis.fetch ='));
+});
+
+test('independent browser collection cannot clear missing or failed native allocations', () => {
+  const receipt = { nativeAllocations: Array.from({ length: 30 }, () => ({})), nativeFailures: [], nativeSkipped: [] };
+  assertNativeComplete(receipt);
+  receipt.nativeFailures.push({ message: 'Native run did not terminate' });
+  assert.throws(() => assertNativeComplete(receipt), /Native allocation failures retained/);
+  receipt.nativeFailures = [];
+  receipt.nativeSkipped.push({ name: 'not-exercised' });
+  assert.throws(() => assertNativeComplete(receipt), /Native allocations were not exercised/);
+  receipt.nativeSkipped = [];
+  receipt.nativeAllocations.pop();
+  assert.throws(() => assertNativeComplete(receipt), /Incomplete native allocation coverage/);
 });
 
 test('installed matrix retains all opt-in, credit freshness and non-coverable gate controls', () => {

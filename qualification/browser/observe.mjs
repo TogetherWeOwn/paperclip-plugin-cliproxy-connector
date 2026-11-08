@@ -4,7 +4,7 @@ import { readFileSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { chromium } from './node_modules/playwright-core/index.mjs';
 import { permittedRequest } from './policy.mjs';
-import { assertBrowserComplete } from './receipt.mjs';
+import { assertBrowserComplete, providerBindingText } from './receipt.mjs';
 
 const base = 'http://127.0.0.1:3100';
 const evidence = '/qualification/evidence';
@@ -82,7 +82,7 @@ async function observe(input) {
   do {
     for (const frame of session.page.frames()) {
       try {
-        const line = frame.getByText(/connection synthetic-codex-connection · completeInventory/);
+        const line = frame.getByText(providerBindingText(expected));
         if (await line.count() !== 1) continue;
         const card = line.locator('..');
         await card.locator('details').evaluateAll(nodes => nodes.forEach(node => { node.open = true; }));

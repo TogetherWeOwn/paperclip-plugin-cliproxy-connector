@@ -224,8 +224,9 @@ validation probe or real credential. The disposable instance enables its native
 router feature, and only synthetic companies permit direct synthetic agent creation.
 These test settings never affect the installed production host or its governance.
 
-Single-member round-robin pools avoid native usage probes. Stock on-demand legacy
-Codex runs enter `aiConnectionRouterService.resolve` and the installed worker hook.
+Single-member round-robin pools avoid native usage probes. The extension attempts
+stock on-demand legacy Codex runs, whose task-allocation path invokes
+`aiConnectionRouterService.resolve` and the installed worker hook after readiness.
 The supported adapter `command` is fixed to `/usr/bin/false`, never a model CLI.
 A selected run must retain the exact member/connection/model and native task key;
 a failed adapter is intentional, not successful inference. Exhausted cases must
@@ -249,6 +250,26 @@ The selected replacement at workflow head `63c8018` passed its 18 installed rows
 That run did not contain this extension, so native evidence remains unverified.
 A later native failure must retain that earlier subset without transferring its
 passing result to a changed workflow head. Specialist/merge/install gates remain.
+
+The first native-extension run at `04bb2fe` failed before task allocation: its
+first synthetic run remained queued while the agent failed stock host lifecycle
+verification. Native allocations completed: zero. Pinned stock verification first
+resolves a router member under a lifecycle key, then requires a verified harness
+probe. An exhausted member blocks setup; a skipped custom-command probe is not a
+verified harness. The refusal-command plan therefore does not establish readiness.
+No lifecycle bypass, fake successful inference, real credential or core edit is
+permitted to clear this barrier. A supported no-inference readiness/task procedure
+remains an explicit technical prerequisite; this is not proof every native route
+is impossible or a candidate implementation defect.
+
+That head also exposed an observer bug: the rendered card correctly showed its
+UUID primary/alias bindings, but the selector still searched for a fixed synthetic
+name. The observer now derives the exact singular/plural binding text from installed
+expected IDs. Its first native failure retains agent lifecycle and run details;
+subsequent native controls are explicitly not exercised while independent installed
+and browser controls continue. All 28 browser agreements remain required. Native
+failures, skipped controls or fewer than 30 actual outcomes still fail the final
+job; subset evidence never becomes qualification.
 
 ## Dependency execution policy
 

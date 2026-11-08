@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
 import { writeFileSync } from 'node:fs';
-import { prepareNativeConnections, observeNativeAllocation } from './native-router.mjs';
+import { prepareNativeConnections, observeNativeAllocation, assertNativeComplete } from './native-router.mjs';
 
 // Only the disposable network-none namespace runs this fixture. It implements
 // telemetry reads, never inference, credential downloads or provider forwarding.
@@ -133,12 +133,24 @@ export async function installedMatrix({ api, pluginPath, companyId, evidence, re
     let nativeBindings;
     receipt.browser = [];
     receipt.nativeAllocations = [];
+    receipt.nativeFailures = [];
+    receipt.nativeSkipped = [];
     const allocate = async (name, provider, options = {}) => {
-      const result = await observeNativeAllocation({
-        api, companyId, bindings: nativeBindings, fixture, name, state: provider.state, ...options,
-      });
-      receipt.nativeAllocations.push({ ...result, providerProjection: provider,
-        projectionScope: 'Provider-wide installed data; requested-model eligibility is established by the native outcome, not this projection.' });
+      if (receipt.nativeFailures.length > 0) {
+        receipt.nativeSkipped.push({ name, reason: 'Earlier native allocation failed; not exercised' });
+        return;
+      }
+      try {
+        const result = await observeNativeAllocation({
+          api, companyId, bindings: nativeBindings, fixture, name, state: provider.state, ...options,
+        });
+        receipt.nativeAllocations.push({ ...result, providerProjection: provider,
+          projectionScope: 'Provider-wide installed data; requested-model eligibility is established by the native outcome, not this projection.' });
+      } catch (error) {
+        // Keep independent installed/browser coverage without repeatedly creating
+        // agents behind the same setup barrier. Final native coverage still fails.
+        receipt.nativeFailures.push({ name, message: error.message, observation: error.nativeObservation ?? null });
+      }
     };
     const observe = async (key, expected, phase = 'single', boundary = null) => {
       const response = await fetch('http://127.0.0.1:4310/observe', {
@@ -345,10 +357,11 @@ export async function installedMatrix({ api, pluginPath, companyId, evidence, re
       await observe(transition.name, recovered, 'recovered', boundary);
       await allocate(`${transition.name}-recovered`, recovered);
     }
-    assert.equal(receipt.nativeAllocations.length, 30, 'Incomplete native allocation coverage');
     const browserFinished = await fetch('http://127.0.0.1:4310/finish', { method: 'POST', signal: AbortSignal.timeout(15_000) });
     assert(browserFinished.ok, JSON.stringify(await browserFinished.json()));
-    receipt.missing = receipt.missing.filter(item => !['browser assertions and traces', 'native router eligibility'].includes(item));
+    receipt.missing = receipt.missing.filter(item => item !== 'browser assertions and traces');
+    assertNativeComplete(receipt);
+    receipt.missing = receipt.missing.filter(item => item !== 'native router eligibility');
     report.missing = report.missing.filter(item => !['installed scenario matrix', 'browser assertions and traces', 'native router eligibility'].includes(item));
     report.checks.push('30 native run-key task allocations agreed with installed quota gates, alias and requested-model isolation without fixture requests or model inference');
     report.checks.push('actual stock-host browser loaded exact candidate UI and agreed with installed scenarios and wall-clock transitions');

@@ -25,6 +25,12 @@ export async function prepareNativeConnections({ api, companyId, baseUrl }) {
   return bindings;
 }
 
+export function assertNativeComplete(receipt) {
+  assert.deepEqual(receipt.nativeFailures, [], 'Native allocation failures retained; not qualified');
+  assert.equal(receipt.nativeSkipped.length, 0, 'Native allocations were not exercised');
+  assert.equal(receipt.nativeAllocations.length, 30, 'Incomplete native allocation coverage');
+}
+
 export function assertNativeOutcome(run, { memberId, connectionId, model, state }) {
   assert(['failed', 'cancelled', 'succeeded', 'timed_out'].includes(run.status), 'Native run did not terminate');
   assert.equal(typeof run.contextSnapshot?.aiRouterTaskKey, 'string', 'Missing native task allocation key');
@@ -88,11 +94,17 @@ export async function observeNativeAllocation({ api, companyId, bindings, fixtur
       scope: 'stock on-demand run-key task allocation; no issue work or model inference',
     };
   } catch (error) {
+    const failedAgent = await api(`/api/agents/${agent.id}`).catch(readError => ({ readbackFailure: readError.message }));
     error.nativeObservation = {
       name, companyId, poolId: pool.id, memberId, connectionId: binding.connectionId, model,
       expectedState: state, runId: run?.id, runStatus: run?.status, errorCode: run?.errorCode,
       taskKey: run?.contextSnapshot?.aiRouterTaskKey, selection: run?.contextSnapshot?.aiRouterSelection,
       configuredCommand: REFUSAL_COMMAND, fixtureRequestsDuringAllocation: fixture.state.requests.slice(readsBefore),
+      agent: { id: failedAgent.id, status: failedAgent.status, lifecycleState: failedAgent.lifecycleState,
+        lifecycleOperation: failedAgent.lifecycleOperation, pauseReason: failedAgent.pauseReason,
+        readbackFailure: failedAgent.readbackFailure },
+      run: run ? { id: run.id, status: run.status, errorCode: run.errorCode,
+        error: run.error, contextSnapshot: run.contextSnapshot, resultJson: run.resultJson } : null,
     };
     throw error;
   } finally {
