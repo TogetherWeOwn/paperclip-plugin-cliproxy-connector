@@ -72,6 +72,36 @@ export function scenarioEntries({ credit = 'positive', healthy = false, gate = n
   return [entry, ...extra];
 }
 
+export const TRANSITIONS = [
+  { name: 'credits-age-past-freshness-bound', before: 'allowed', headroom: 1 },
+  { name: 'exhausted-window-reset-passes', before: 'exhausted', headroom: 0 },
+  { name: 'unavailable-retry-passes-then-refresh-recovers', before: 'exhausted', headroom: 0 },
+];
+
+export function timedEntries(name, now = Date.now()) {
+  // Leave enough time to prove the pre-boundary state via real installed RPCs.
+  // The boundary is fixture telemetry, never a fake host/worker clock.
+  const boundary = now + 15_000;
+  const entries = scenarioEntries({ credit: name === 'exhausted-window-reset-passes' ? 'absent' : 'positive' });
+  const entry = entries[0];
+  if (name === 'credits-age-past-freshness-bound') {
+    // Frozen config defaults: 5-minute sync × maxAgeMultiplier 2.
+    entry.model_quotas[MODEL].observed_at = new Date(boundary - 600_000).toISOString();
+  } else if (name === 'exhausted-window-reset-passes') {
+    entry.quota.signals['x-codex-secondary-reset-at'] = String(Math.floor(boundary / 1000));
+  } else if (name === 'unavailable-retry-passes-then-refresh-recovers') {
+    entry.unavailable = true;
+    entry.next_retry_after = new Date(boundary).toISOString();
+  } else throw new Error(`Unknown installed transition: ${name}`);
+  return { entries, boundary };
+}
+
+async function waitUntil(deadline, maximumMs) {
+  const waitMs = Math.max(0, deadline - Date.now());
+  assert(waitMs <= maximumMs, 'Unexpected telemetry or minimum-sync deadline');
+  await new Promise(resolve => setTimeout(resolve, waitMs));
+}
+
 export const SCENARIOS = [
   { name: 'opt-in-omitted', optIn: undefined, state: 'exhausted', headroom: 0, creditHeadroom: 0 },
   { name: 'opt-in-false', optIn: false, state: 'exhausted', headroom: 0, creditHeadroom: 0 },
@@ -221,6 +251,46 @@ export async function installedMatrix({ api, pluginPath, companyId, evidence, re
       limitation: 'One raw provider row has one connectionId. Adding codex twice is rejected; a singleton replacement validates but fails the retained-binding requirement. No replacement was saved.',
       missing: 'Native Sol member assessment with both distinct codex bindings retained; no router execution is inferred from config validation.',
     };
+    receipt.transitions = [];
+    for (const transition of TRANSITIONS) {
+      receipt.currentScenario = transition.name;
+      await configure(true, transition.name);
+      const { entries, boundary } = timedEntries(transition.name);
+      fixture.state.entries = entries;
+      const before = (await refresh()).providers.find(p => p.provider === 'codex');
+      const beforeObservedAt = new Date().toISOString();
+      assert(Date.now() < boundary - 1000, 'Pre-boundary installed observation arrived too late');
+      assert.equal(before.state, transition.before, transition.name);
+      assert.equal(before.headroomAccounts, transition.headroom, transition.name);
+      const syncFinishedAt = receipt.lastSyncFinishedAt;
+      const requestsBeforeExpiry = fixture.state.requests.length;
+      // Read the same persisted rows after the advertised deadline, without
+      // resync, cache writes, time injection or a newly expired fixture.
+      await waitUntil(boundary + 100, 15_100);
+      const after = (await usage()).providers.find(p => p.provider === 'codex');
+      assert.equal(after.state, 'unknown', transition.name);
+      assert.equal(after.headroomAccounts, 0, transition.name);
+      assert.equal(after.creditHeadroomAccounts, 0, transition.name);
+      assert.equal(fixture.state.requests.length, requestsBeforeExpiry, 'Expiry read unexpectedly refreshed telemetry');
+      const result = {
+        name: transition.name, boundary: new Date(boundary).toISOString(),
+        beforeObservedAt, before, afterObservedAt: new Date().toISOString(), after,
+        noTelemetryReadsAcrossExpiry: true,
+      };
+      receipt.transitions.push(result);
+      // Recovery needs genuinely fresh telemetry, not the passing of a clock.
+      // Respect the real same-company minimum-sync interval before requesting it.
+      await waitUntil(Date.parse(syncFinishedAt) + 60_100, 60_100);
+      fixture.state.entries = scenarioEntries();
+      const recovered = (await refresh()).providers.find(p => p.provider === 'codex');
+      assert.equal(recovered.state, 'allowed', transition.name);
+      assert.equal(recovered.headroomAccounts, 1, transition.name);
+      assert.equal(recovered.creditHeadroomAccounts, 1, transition.name);
+      result.recoveredObservedAt = new Date().toISOString();
+      result.recovered = recovered;
+    }
+    report.checks.push('installed wall-clock credit freshness, window reset and unavailable retry transitions recovered only after fresh telemetry');
+    receipt.currentScenario = null;
     assert.deepEqual(fixture.state.unexpected, [], 'Unexpected fixture request or synthetic credential resolution failure');
     receipt.conclusion = 'success';
     report.checks.push('installed synthetic credit/gate matrix, deterministic metadata refresh and persisted-worker restart succeeded');

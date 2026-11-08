@@ -69,8 +69,15 @@ uses the same company and waits only until that actual minimum-sync deadline. It
 asserts a safe model name is cached before replacing the fixture with rejected
 metadata, then asserts the old/rejected names are absent after refresh. Worker
 restart compares persisted provider/account values while excluding derived countdown
-strings, and verifies no fixture read occurred. Expired fixture snapshots are not
-claimed as a live time-driven expiry transition or native router execution.
+strings, and verifies no fixture read occurred. Separate timed controls persist an
+active unavailable/retry bound, an exhausted window with a future reset, and positive
+credits near the unchanged default freshness boundary. They assert the pre-boundary
+verdict, wait for the actual telemetry deadline, and reread the same persisted rows
+without a telemetry request or clock injection. Each must become unknown, never
+measured headroom, then recover only after a real minimum-interval-respecting sync
+with fresh positive credits. `installed-matrix.json` retains before/after/recovered
+values and boundaries. These are installed aggregate transitions, not native router
+or browser execution; only Actions results establish whether they passed.
 The unavailable fixture uses the canonical `unavailable: true` lifecycle flag;
 a display `status` string alone does not exercise that contract.
 

@@ -4,7 +4,7 @@ import { readFileSync, mkdtempSync, writeFileSync, symlinkSync, rmSync } from 'n
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { CANDIDATE, HOST_SOURCE, HOST_IMAGE, assertHostRelease, digest, filesUnder } from './identity.mjs';
-import { SCENARIOS, scenarioEntries, startFixture, SYNTHETIC_KEY } from './installed.mjs';
+import { SCENARIOS, TRANSITIONS, scenarioEntries, timedEntries, startFixture, SYNTHETIC_KEY } from './installed.mjs';
 
 const workflow = readFileSync(new URL('../.github/workflows/qualify-stock.yml', import.meta.url), 'utf8');
 const driver = readFileSync(new URL('./preflight.mjs', import.meta.url), 'utf8');
@@ -69,6 +69,21 @@ test('installed matrix retains all opt-in, credit freshness and non-coverable ga
   const [unavailable] = scenarioEntries({ gate: 'unavailable' });
   assert.equal(unavailable.unavailable, true, 'Unavailable lifecycle uses the canonical boolean, not display status');
   assert(Date.parse(unavailable.next_retry_after) > Date.now());
+});
+
+test('timed fixtures start before real expiry and do not weaken frozen freshness defaults', () => {
+  const now = Date.now();
+  assert.equal(TRANSITIONS.length, 3);
+  const credit = timedEntries(TRANSITIONS[0].name, now);
+  assert.equal(credit.boundary, now + 15_000);
+  assert.equal(Date.parse(credit.entries[0].model_quotas['gpt-6.1-sol'].observed_at) + 600_000, credit.boundary);
+  const reset = timedEntries(TRANSITIONS[1].name, now);
+  assert.equal(Number(reset.entries[0].quota.signals['x-codex-secondary-reset-at']), Math.floor(reset.boundary / 1000));
+  assert.deepEqual(reset.entries[0].model_quotas['gpt-6.1-sol'].signals, {});
+  const retry = timedEntries(TRANSITIONS[2].name, now);
+  assert.equal(retry.entries[0].unavailable, true);
+  assert.equal(Date.parse(retry.entries[0].next_retry_after), retry.boundary);
+  assert.throws(() => timedEntries('unrecognized'), /Unknown installed transition/);
 });
 
 test('fixture accepts only authenticated telemetry reads and refuses inference or forwarding', async () => {
