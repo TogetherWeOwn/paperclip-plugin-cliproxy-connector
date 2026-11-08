@@ -96,6 +96,8 @@ export interface ProviderAccountDetail {
 
 export interface AccountCardLimit {
   id: string;
+  /** Presentation identity only; `id` retains its routing/window meaning. */
+  renderKey: string;
   label: string;
   usedPercent: number | null;
   remainingPercent: number | null;
@@ -403,6 +405,15 @@ function toAccountDetail(
     .map((l) => (l.resetsAt ? Date.parse(l.resetsAt) : NaN))
     .filter((t) => !Number.isNaN(t) && t > nowMs);
   const nextReset = resetMs.length > 0 ? new Date(Math.min(...resetMs)).toISOString() : null;
+  const occurrences = new Map<string, number>();
+  const renderKeys = row.limits.map((l) => {
+    // Scope/model/source separate observations of the same semantic window.
+    // Exact twins have no upstream identity: retain distinct occurrence slots.
+    const identity = JSON.stringify([l.id, l.scope ?? null, [...(l.models ?? [])].sort(), l.viaProviderApi === true]);
+    const occurrence = occurrences.get(identity) ?? 0;
+    occurrences.set(identity, occurrence + 1);
+    return JSON.stringify([identity, occurrence]);
+  });
   return {
     key: row.key,
     maskedLabel: row.key.length > 14 ? `${row.key.slice(0, 13)}…` : row.key,
@@ -417,8 +428,9 @@ function toAccountDetail(
     quotaBlindReason: blindReason,
     freshness,
     checkedAt: row.checkedAt,
-    limits: row.limits.map((l) => ({
+    limits: row.limits.map((l, i) => ({
       id: l.id,
+      renderKey: renderKeys[i],
       label: l.label,
       usedPercent: l.usedPercent,
       remainingPercent: l.remainingPercent,

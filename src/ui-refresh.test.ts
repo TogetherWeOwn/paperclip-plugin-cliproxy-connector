@@ -3,7 +3,8 @@ import { act, create, type ReactTestRenderer } from "react-test-renderer";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { PluginPageProps, PluginWidgetProps } from "@paperclipai/plugin-sdk/ui";
 import { CliProxyPage, CliProxyUsagePage, CliProxyWidget } from "../ui/index.js";
-import { maxAgeMs, parseConfig } from "./config.js";
+import { DEFAULT_PROVIDER_WINDOWS, maxAgeMs, parseConfig } from "./config.js";
+import { parseAuthFiles } from "./parsers.js";
 import { aggregateProvider } from "./aggregate.js";
 import { buildPageData, buildUsageData, buildWidgetData } from "./ui-data.js";
 import { emptyStrikeBudget } from "./sync.js";
@@ -114,6 +115,68 @@ for (const Component of components) {
         expect(sdk.action).not.toHaveBeenCalled();
       });
     }
+
+    it("reconciles scoped Hopper rows and account-wide guards through automatic refresh", async () => {
+      const { config } = parseConfig({
+        cliproxyBaseUrl: "http://127.0.0.1:8317", managementKeyHeader: "X-Test-Key",
+        managementSecretRef: { uid: "secret-1" }, audienceConfirmed: true,
+        providers: [{ provider: "hopper", connectionId: "conn-hopper", completeInventory: true }],
+      });
+      const feature = { window: "5h", scope: "feature", description: "Feature quota", remainingFraction: 0.4 };
+      const weekly = { window: "weekly", description: "Weekly quota", remainingFraction: 0.8 };
+      let buckets: Record<string, unknown>[] = [feature, weekly];
+      sdk.read.mockImplementation((key: string) => {
+        const now = new Date(Date.now()).toISOString();
+        const row = parseAuthFiles({ files: [{ id: "hopper", provider: "hopper", auth_index: "h" }] }, {
+          now, allowLists: DEFAULT_PROVIDER_WINDOWS,
+          pluginPayloadByAuthIndex: new Map([["h", { groups: [{ buckets }] }]]),
+        }).accounts[0];
+        const args = { now, config, rows: { [row.key]: row }, lastSync: null, strike: emptyStrikeBudget() };
+        return key === "cliproxy-usage" ? buildUsageData(args) : buildPageData(args);
+      });
+      const errors = vi.spyOn(console, "error").mockImplementation(() => {});
+      try {
+        await act(async () => { view = create(createElement(Component, { context })); });
+        const projected = () => sdk.read.mock.results.at(-1)!.value.providers[0];
+        const quotaRows = () => view!.root.findAll((node) =>
+          node.type === (Component === CliProxyPage ? "li" : "div") &&
+          typeof node.props.title === "undefined" &&
+          (Component === CliProxyPage
+            ? typeof node.children[0] === "string" && ["Feature quota", "Weekly quota", "hopper 5h", "Account quota"].includes(node.children[0])
+            : typeof node.children[0] === "object" && node.children[0]?.props.label !== undefined));
+        expect(projected()).toMatchObject({ state: "unknown", headroomAccounts: 0 });
+        expect(projected().accounts[0].limits).toEqual(expect.arrayContaining([
+          expect.objectContaining({ id: "hopper:5h", gating: false, remainingPercent: 40 }),
+          expect.objectContaining({ id: "hopper:5h", gating: true, remainingPercent: null }),
+        ]));
+        expect(quotaRows()).toHaveLength(3);
+        const featureNode = quotaRows()[0];
+        const weeklyNode = quotaRows()[1];
+        const guardNode = quotaRows()[2];
+        // Reordering the source must retain the identities of unrelated scopes.
+        buckets = [weekly, feature];
+        await act(async () => { vi.advanceTimersByTime(30_000); });
+        expect(quotaRows()).toEqual([weeklyNode, featureNode, guardNode]);
+        // Real account-wide evidence replaces the guard, not the feature observation.
+        buckets = [weekly, { window: "5h", description: "Account quota", remainingFraction: 0.6 }, feature];
+        await act(async () => { vi.advanceTimersByTime(30_000); });
+        expect(projected()).toMatchObject({ state: "allowed", headroomAccounts: 1 });
+        expect(quotaRows()).toEqual([weeklyNode, guardNode, featureNode]);
+        expect(quotaRows()).toHaveLength(3);
+        expect(text()).not.toContain('"hopper 5h"');
+        expect(text()).toContain('"Account quota"');
+        // Removing scoped evidence leaves exactly the two account windows.
+        buckets = [weekly, { window: "5h", description: "Account quota", remainingFraction: 0.7 }];
+        await act(async () => { vi.advanceTimersByTime(30_000); });
+        expect(quotaRows()).toEqual([weeklyNode, guardNode]);
+        expect(text()).not.toContain('"Feature quota"');
+        expect(sdk.calls).toHaveBeenCalledTimes(3);
+        expect(sdk.action).not.toHaveBeenCalled();
+        expect(errors.mock.calls.filter((args) => /same key|unique.*key/i.test(args.join(" ")))).toEqual([]);
+      } finally {
+        errors.mockRestore();
+      }
+    });
 
     it("does not supersede a slow read or unmount existing content while refreshing", async () => {
       fixture("credit");

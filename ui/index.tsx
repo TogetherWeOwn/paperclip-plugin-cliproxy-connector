@@ -291,7 +291,7 @@ export function CliProxyPage({ context }: PluginPageProps) {
                     {a.limits.length > 0 && (
                       <ul>
                         {a.limits.map((l) => (
-                          <li key={l.id} title={l.resetsAt ?? undefined}>
+                          <li key={l.renderKey} title={l.resetsAt ?? undefined}>
                             {l.label}: {l.remainingPercent ?? "?"}% remaining
                             {l.resetsAt ? ` · resets ${l.resetsAt} (${formatCountdown(l.resetsAt, nowMs)})` : " · no reset known"}
                             {!l.gating && " (informational, not gating)"}
@@ -588,7 +588,7 @@ export function CliProxyUsagePage({ context }: PluginPageProps) {
             )}
             {a.limits.length === 0 && <div>No quota windows — unknown.</div>}
             {a.limits.map((l) => (
-              <div key={l.id} title={l.resetsAt ?? undefined}>
+              <div key={l.renderKey} title={l.resetsAt ?? undefined}>
                 <WindowBar label={l.label} remaining={l.remainingPercent} resetIn={formatCountdown(l.resetsAt, nowMs)} />
                 {!l.gating && <span style={{ fontSize: 12 }}>(informational, not gating)</span>}
                 {l.viaProviderApi && <span style={{ fontSize: 12 }}> · via provider API</span>}
