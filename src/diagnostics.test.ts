@@ -100,6 +100,46 @@ describe("quota diagnostics", () => {
     expect(refused).toEqual({ error: "audit_unavailable" });
   });
 
+  it("does not read another company's cached rows", async () => {
+    const { harness } = await setup();
+    const reads = vi.spyOn(harness.ctx.state, "get");
+    const result = await harness.executeTool<ToolResult>(DIAGNOSTICS_TOOL, { connectionId: "conn-a" }, { ...caller, companyId: "co-other", agentId: "other-agent" });
+    expect(result.data).toMatchObject({ assessment: { state: "unknown", enabledAccounts: 0 } });
+    expect(reads.mock.calls.every(([key]) => key.scopeId === "co-other")).toBe(true);
+  });
+
+  it("refuses an oversized cache without returning rows", async () => {
+    const { harness } = await setup();
+    vi.spyOn(harness.ctx.state, "get").mockResolvedValue(Object.fromEntries(Array.from({ length: 2001 }, (_, i) => [String(i), row()])) as never);
+    const result = await harness.executeTool<ToolResult>(DIAGNOSTICS_TOOL, { connectionId: "conn-a" }, { ...caller, agentId: "large-cache-agent" });
+    expect(result).toEqual({ error: "diagnostics_cache_limit" });
+    expect(JSON.stringify(harness.activity)).not.toContain(CANARY);
+  });
+
+  it("bounds stalled host reads by its deadline and never returns late data", async () => {
+    const { harness } = await setup();
+    vi.spyOn(harness.ctx.config, "get").mockImplementation(() => new Promise(() => {}));
+    const pending = harness.executeTool<ToolResult>(DIAGNOSTICS_TOOL, { connectionId: "conn-a" }, { ...caller, agentId: "timeout-agent" });
+    await vi.advanceTimersByTimeAsync(5001);
+    const result = await pending;
+    expect(result.error).toBe("diagnostics_unavailable");
+    expect(result.data).toBeUndefined();
+  });
+
+  it("caps concurrent host reads and releases capacity when they finish", async () => {
+    const { harness } = await setup();
+    const original = harness.ctx.config.get.bind(harness.ctx.config);
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    vi.spyOn(harness.ctx.config, "get").mockImplementation(async (companyId) => { await gate; return original(companyId); });
+    const calls = Array.from({ length: 4 }, (_, i) => harness.executeTool<ToolResult>(DIAGNOSTICS_TOOL, { connectionId: "conn-a" }, { ...caller, agentId: `concurrent-${i}` }));
+    const fifth = await harness.executeTool<ToolResult>(DIAGNOSTICS_TOOL, { connectionId: "conn-a" }, { ...caller, agentId: "concurrent-five" });
+    expect(fifth.error).toBe("diagnostics_rate_limited");
+    release();
+    expect((await Promise.all(calls)).every((result) => !result.error)).toBe(true);
+    expect((await harness.executeTool<ToolResult>(DIAGNOSTICS_TOOL, { connectionId: "conn-a" }, { ...caller, agentId: "concurrent-after" })).error).toBeUndefined();
+  });
+
   it("the GET API validates host scope, method, unknown query keys and strict numeric thresholds", async () => {
     await setup();
     const input: PluginApiRequestInput = {
