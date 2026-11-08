@@ -14,6 +14,7 @@ import type {
 } from "@paperclipai/plugin-sdk";
 import { maxAgeMs, parseConfig, stripTrailingSlashes, type ConnectorConfig } from "./config.js";
 import { createLoopbackFetch } from "./loopback-fetch.js";
+import { buildDiagnostics, DIAGNOSTICS_DECLARATION, DIAGNOSTICS_TOOL, parseDiagnosticsParams } from "./diagnostics.js";
 import {
   DRIFT_LEDGER_STATE_KEY,
   LAST_ERROR_STATE_KEY,
@@ -234,9 +235,96 @@ async function resolveCompany(
 
 let boundCtx: PluginContext | null = null;
 
+const diagnosticsCalls = new Map<string, { since: number; count: number }>();
+let diagnosticsInFlight = 0;
+const DIAGNOSTICS_TIMEOUT_MS = 5_000;
+
+async function diagnosticDeadline<T>(work: Promise<T>, deadline: number): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([work, new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new Error("diagnostics_timeout")), Math.max(0, deadline - Date.now()));
+    })]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
+async function readDiagnostics(
+  ctx: PluginContext,
+  raw: unknown,
+  caller: { companyId?: string; principalId?: string; runId?: string; via: "tool" | "api" },
+): Promise<{ status: number; body: Record<string, unknown> & { error?: string } }> {
+  const started = Date.now();
+  const deadline = started + DIAGNOSTICS_TIMEOUT_MS;
+  const safeId = (v: unknown): v is string => typeof v === "string" && v.length <= 128 && /^[A-Za-z0-9][A-Za-z0-9_-]*$/.test(v);
+  if (!safeId(caller.companyId) || !safeId(caller.principalId) ||
+      (caller.via === "tool" && !safeId(caller.runId))) {
+    // No trusted tenant to attach activity to: host-captured worker log only.
+    ctx.logger.warn("cliproxy_connector.diagnostics_refused", { code: "missing_identity" });
+    return { status: 403, body: { error: "missing_identity" } };
+  }
+  const companyId = caller.companyId;
+  let result: { status: number; body: Record<string, unknown> & { error?: string } };
+  const params = parseDiagnosticsParams(raw);
+  for (const [id, budget] of diagnosticsCalls) {
+    if (started - budget.since >= 60_000) diagnosticsCalls.delete(id);
+  }
+  const budgetKey = JSON.stringify([companyId, caller.via, caller.principalId]);
+  const budget = diagnosticsCalls.get(budgetKey) ?? { since: started, count: 0 };
+  if (!params) result = { status: 400, body: { error: "invalid_parameters" } };
+  else if (budget.count >= 30 || diagnosticsInFlight >= 4 || (!diagnosticsCalls.has(budgetKey) && diagnosticsCalls.size >= 1024)) {
+    result = { status: 429, body: { error: "diagnostics_rate_limited" } };
+  } else {
+    budget.count += 1;
+    diagnosticsCalls.set(budgetKey, budget);
+    diagnosticsInFlight += 1;
+    try {
+      const { config, ok } = await diagnosticDeadline(resolveCompany(ctx, companyId), deadline);
+      if (!ok) result = { status: 503, body: { error: "invalid_configuration" } };
+      else {
+        const rows = Object.values(await diagnosticDeadline(loadRows(ctx, companyId), deadline));
+        if (rows.length > 2000) result = { status: 503, body: { error: "diagnostics_cache_limit" } };
+        else {
+          const data = buildDiagnostics(config, rows, params, new Date(started).toISOString());
+          result = data ? { status: 200, body: data } : { status: 404, body: { error: "connection_not_configured" } };
+          if (Buffer.byteLength(JSON.stringify(result.body), "utf8") > 32_768) result = { status: 503, body: { error: "diagnostics_output_limit" } };
+        }
+      }
+    } catch {
+      result = { status: 503, body: { error: "diagnostics_unavailable" } };
+    } finally {
+      diagnosticsInFlight -= 1;
+    }
+  }
+  try {
+    await diagnosticDeadline(ctx.activity.log({
+      companyId, message: "cliproxy_connector.diagnostics_call",
+      metadata: {
+        tool: DIAGNOSTICS_TOOL, policyVersion: 1, via: caller.via,
+        principalId: caller.principalId,
+        runId: safeId(caller.runId) ? caller.runId : null,
+        at: new Date(started).toISOString(), durationMs: Date.now() - started,
+        outcome: result.body.error ?? "allowed", status: result.status,
+      },
+    }), deadline);
+  } catch {
+    ctx.logger.warn("cliproxy_connector.diagnostics_audit_failed", { code: "audit_unavailable" });
+    return { status: 503, body: { error: "audit_unavailable" } };
+  }
+  return result;
+}
+
 const plugin = definePlugin({
   async setup(ctx: PluginContext) {
     boundCtx = ctx;
+    ctx.tools.register(DIAGNOSTICS_TOOL, DIAGNOSTICS_DECLARATION, async (params, caller) => {
+      const result = await readDiagnostics(ctx, params, {
+        companyId: caller?.companyId, principalId: caller?.agentId,
+        runId: caller?.runId, via: "tool",
+      });
+      return result.status === 200 ? { data: result.body } : { error: result.body.error ?? "diagnostics_failed" };
+    });
     // The scheduler runs this job without a company scope, so the job
     // iterates every visible company itself (decision-notifier pattern).
     // Per-company failures never abort the loop.
@@ -354,6 +442,24 @@ const plugin = definePlugin({
   },
 
   async onApiRequest(input: PluginApiRequestInput): Promise<PluginApiResponse> {
+    if (input.routeKey === "diagnostics") {
+      if (!boundCtx) return { status: 503, body: { error: "worker_not_ready" } };
+      const query = input.query ?? {};
+      const { companyId, thresholdPercent, ...params } = query;
+      // Host-authorized company scope wins; duplicate/mismatched query scope,
+      // bodies and non-GET calls are never alternate authorization paths.
+      const invalid = input.method !== "GET" || (input.body != null && (typeof input.body !== "object" || Array.isArray(input.body) || Object.keys(input.body).length > 0)) ||
+        (companyId !== undefined && companyId !== input.companyId) ||
+        (thresholdPercent !== undefined && (typeof thresholdPercent !== "string" || !/^(?:[1-9]|[1-9][0-9]|100)$/.test(thresholdPercent)));
+      const actor = input.actor;
+      return readDiagnostics(boundCtx, invalid ? null : {
+        ...params, ...(thresholdPercent !== undefined ? { thresholdPercent: Number(thresholdPercent) } : {}),
+      }, {
+        companyId: input.companyId,
+        principalId: actor?.actorType === "user" ? actor.userId ?? actor.actorId : actor?.actorType === "agent" ? actor.agentId ?? actor.actorId : undefined,
+        runId: actor?.runId ?? undefined, via: "api",
+      });
+    }
     if (input.routeKey === "reenable") {
       const body = (input.body ?? {}) as Record<string, unknown>;
       const companyId = String(body.companyId ?? input.companyId ?? "");

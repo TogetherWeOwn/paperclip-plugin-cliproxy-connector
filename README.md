@@ -212,7 +212,8 @@ The plugin ships two pages over the same sync cache:
 
 ## Endpoint assumptions
 
-The management paths are pinned in code (`/v0/management/auth-files`,
+The management paths are pinned in code (`/v8/management/credentials`, with
+404-only fallback to `/v0/management/auth-files`,
 `/v0/management/auth-files/models?name=<file>` and
 `/v0/management/plugins/<segment>/quota` with exactly one `auth_index` query value,
 or no query on older builds) — there are deliberately no config knobs for
@@ -291,6 +292,51 @@ providers send is quiet (no "no quota signals" warning); a provider also sending
 `daily`/`weekly` windows. Parsers are defensive by design: unknown shapes become
 warnings + quota-blind rows, never headroom. The redacted `auth-files` fixture in
 tests mirrors the public CLIProxyAPI source shapes.
+
+### Discovery and typed observations
+
+An explicit `pluginQuotaIds[rawProvider]` wins over the account's own validated
+`quota_plugin_id`. Discovery never borrows a sibling's route; disabled accounts
+are skipped, and `supports_quota: false` or malformed capabilities do not enable
+a discovered route. A v8 account without `auth_index` is unknown rather than
+sent to a route requiring an index. The explicit v0 no-index compatibility path
+is retained; a v0 list alone is not proof of a historical server version.
+
+Hopper uses exact provider identity `hopper`, with `5h` and `weekly` gating
+windows. Missing windows stay unknown. Numeric summary metrics, including its
+USD account balance, remain informational and never count as paid-credit
+headroom. Typed absolute `used`, `limit`, `remaining`, `unit`, duration, cadence
+and scope are kept separately from percentages; missing values are null. Codex
+credits retain their balance and original observation time in native-shaped
+overage fields, without inventing availability from an enabled switch.
+
+Meta's exact raw words `meta` and `meta-muse` retain separate configured provider
+identities but use the Meta parser and bounded direct-read fallback. Normalized
+`5h` maps to canonical `window`, tier takes precedence over generic plan, and
+missing expected windows are retained. Normalized Meta quotas remain
+informational until provider normalization preserves malformed-source and cache
+observation evidence; a successful plugin GET alone cannot retire the fallback.
+The Meta family switch and `metaQuota.enabled` still disable the direct read;
+`apiCallEnabled[rawProvider]` can additionally disable the exact raw identity.
+
+## Read-only diagnostics
+
+After Security acceptance and Operator enablement, the `quota-diagnostics`
+agent tool explains one configured connection using only the authenticated
+company's cache. `GET /diagnostics` exposes the same bounded result through the
+plugin API with host board-or-agent authorization. Inputs are `connectionId`
+and optional `poolId`, `thresholdPercent` (integer 1–100), and `model`; the GET
+route additionally requires `companyId` for host company resolution. The tool
+never accepts a caller-supplied company, URL, secret ref, header or action.
+
+The assessment uses the same reserve precedence and aggregation as routing.
+Pool inputs are supplied by the caller, **not live pool readback**; the result
+explicitly says `nativePoolReadback: false`. This is not a resync, a pool editor,
+a credential read or a native billing API. It returns aggregate state/reason,
+freshness, headroom counts, retry time and effective reserve, not raw account
+metadata. Calls are audited; audit failure prevents a successful response.
+See [THREAT-MODEL.md](THREAT-MODEL.md) and [ACCEPTANCE.md](ACCEPTANCE.md) for
+bounds, refusal tests and the uncompleted installation/governance gates.
 
 ## Security properties (all tested)
 

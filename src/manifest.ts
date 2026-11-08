@@ -1,8 +1,9 @@
 import type { PaperclipPluginManifestV1 } from "@paperclipai/plugin-sdk";
 import { CONNECTOR_CONFIG_SCHEMA } from "./config.js";
+import { DIAGNOSTICS_DECLARATION } from "./diagnostics.js";
 
 export const PLUGIN_ID = "togetherweown.cliproxy-connector";
-export const PLUGIN_VERSION = "0.2.7";
+export const PLUGIN_VERSION = "0.3.0";
 export const SYNC_JOB_KEY = "cliproxy-sync";
 export const PAGE_DATA_KEY = "cliproxy-page";
 export const USAGE_DATA_KEY = "cliproxy-usage";
@@ -55,6 +56,7 @@ const manifest: PaperclipPluginManifestV1 = {
     "plugin.state.write",
     "activity.log.write",
     "api.routes.register",
+    "agent.tools.register",
     "ui.page.register",
     "ui.dashboardWidget.register",
   ],
@@ -77,7 +79,16 @@ const manifest: PaperclipPluginManifestV1 = {
       schedule: "*/5 * * * *",
     },
   ],
+  tools: [DIAGNOSTICS_DECLARATION],
   apiRoutes: [
+    {
+      routeKey: "diagnostics",
+      method: "GET",
+      path: "/diagnostics",
+      auth: "board-or-agent",
+      capability: "api.routes.register",
+      companyResolution: { from: "query", key: "companyId" },
+    },
     {
       routeKey: "reenable",
       method: "POST",

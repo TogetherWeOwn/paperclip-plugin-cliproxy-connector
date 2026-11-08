@@ -393,104 +393,50 @@ export async function runSync(deps: SyncDeps, inFlight: { running: boolean }): P
       // Prefer the v8 credential list (v8-only renewal fields feed the
       // read-only "needs sign-in" badge); older builds 404 and fall back to
       // the v0 `auth-files` list. The parse is shape-tolerant to both.
-      const { payload: authFiles } = await client.getAuthFilesWithV8Fallback().catch((err) => {
+      const { payload: authFiles, source: listSource } = await client.getAuthFilesWithV8Fallback().catch((err) => {
         throw err;
       });
 
-      // Per-file plugin quota fetch is best-effort: a failing plugin route
-      // leaves the account on its passive signals (or unknown), never
-      // headroom. CLIProxy v8.0.49 requires `?auth_index=<auth index>`
-      // (`GetPluginQuota` 400s without it), so one fetch runs per distinct
-      // credential index among the provider's enabled accounts; raw payloads
-      // ride along by `auth_index` and attach to their own account row at
-      // parse time. Entries without an index (older builds) keep the legacy
-      // provider-level fetch. Failed fetches warn per file or provider and
-      // never spend strikes; only a rejected key (401/403) stops the run.
-      const pluginPayloadByProvider = new Map<string, unknown>();
-      const pluginPayloadByAuthIndex = new Map<string, unknown>();
+      // Discovery is credential-scoped: no sibling route may supply missing
+      // capability evidence. Explicit operator mappings take precedence over
+      // each account's validated advertised ID. v8 requires an auth_index;
+      // retain only the explicitly configured v0 no-index compatibility path.
+      const pluginPayloadByAccountKey = new Map<string, unknown>();
       const pluginErrors: string[] = [];
-      const fetchedPluginIds = new Map<string, string>();
-      const fetchedPluginKeys = new Set<string>();
-      // Discovery parse (no payloads): find each enabled account's provider +
-      // credential index. The real parse below re-runs with payloads
-      // attached; this pass's warnings are discarded.
+      const pluginResults = new Map<string, unknown>();
+      const attemptedPluginKeys = new Set<string>();
       const discovered = parseAuthFiles(authFiles, {
         now: deps.now,
         allowLists: deps.config.providerWindows,
         showAccountEmails: deps.config.showAccountEmails === true,
       });
-      const enabledIndexesByProvider = new Map<string, Set<string>>();
-      // Same-provider accounts may advertise different quota plugins: keep
-      // each credential's own route so every index is fetched against the
-      // plugin that serves it (first wins per index; the provider hint below
-      // is only the fallback for rows that advertise nothing).
-      const pluginIdByAuthIndex = new Map<string, string>();
+      const configuredPluginProviders = new Set(deps.config.providers.map((p) => p.provider));
       for (const a of discovered.accounts) {
-        if (a.status === "disabled" || !a.authIndex) continue;
-        let set = enabledIndexesByProvider.get(a.provider);
-        if (!set) {
-          set = new Set<string>();
-          enabledIndexesByProvider.set(a.provider, set);
-        }
-        set.add(a.authIndex);
-        if (a.quotaPluginId && !pluginIdByAuthIndex.has(a.authIndex)) {
-          pluginIdByAuthIndex.set(a.authIndex, a.quotaPluginId);
-        }
-      }
-      for (const entry of deps.config.providers) {
-        // Explicit config wins for the whole provider; otherwise each
-        // credential fetches against its own advertised route
-        // (`quota_plugin_id`, unless `supports_quota: false`), so new quota
-        // plugins need no config change to start syncing.
-        const override = deps.config.pluginQuotaIds[entry.provider];
-        const providerHint = discovered.pluginQuotaHints.get(entry.provider);
-        // Every advertised id also sets the provider hint, so a missing
-        // provider id means no per-index id either: nothing to fetch.
-        if (!override && !providerHint) continue;
-        const indexes = [...(enabledIndexesByProvider.get(entry.provider) ?? [])].sort();
-        // Provider-level route for the legacy no-index fetch below.
-        const providerPluginId = (override ?? providerHint) as string;
-        if (indexes.length === 0) {
-          // No indexed credential for this provider: legacy provider-level
-          // fetch (older builds), shared across providers on one plugin id.
-          if (fetchedPluginIds.has(providerPluginId)) {
-            const first = fetchedPluginIds.get(providerPluginId) as string;
-            const prior = pluginPayloadByProvider.get(first);
-            if (prior !== undefined) pluginPayloadByProvider.set(entry.provider, prior);
-            continue;
-          }
-          try {
-            const payload = await client.getPluginQuota(providerPluginId);
-            fetchedPluginIds.set(providerPluginId, entry.provider);
-            pluginPayloadByProvider.set(entry.provider, payload);
-          } catch (err) {
-            if (err instanceof CliproxyAuthError) throw err; // stop after first rejected key
-            pluginErrors.push(`${entry.provider} (plugin ${providerPluginId}): ${err instanceof Error ? err.message : "fetch failed"}`);
-          }
+        if (a.status === "disabled" || !configuredPluginProviders.has(a.provider)) continue;
+        const override = deps.config.pluginQuotaIds[a.provider];
+        const pluginId = override ?? a.quotaPluginId;
+        if (!pluginId) continue;
+        if (!a.authIndex && (listSource === "v8" || !override)) {
+          pluginErrors.push(`${a.provider}: quota discovery has no credential index; plugin quota remains unknown.`);
           continue;
         }
-        for (const authIndex of indexes) {
-          // Same-provider accounts on different plugins each query their
-          // own route; rows that advertise nothing use the provider hint.
-          const pluginId = override ?? pluginIdByAuthIndex.get(authIndex) ?? providerHint;
-          if (!pluginId) continue;
-          const fetchKey = `${pluginId} ${authIndex}`;
-          if (fetchedPluginKeys.has(fetchKey)) continue;
+        const fetchKey = JSON.stringify([pluginId, a.authIndex]);
+        if (!attemptedPluginKeys.has(fetchKey)) {
+          // Failed routes are deduplicated too: one attempt per route/index
+          // per sync, never another management-auth probe after rejection.
+          attemptedPluginKeys.add(fetchKey);
           try {
-            const payload = await client.getPluginQuota(pluginId, authIndex);
-            fetchedPluginKeys.add(fetchKey);
-            pluginPayloadByAuthIndex.set(authIndex, payload);
+            pluginResults.set(fetchKey, await client.getPluginQuota(pluginId, a.authIndex));
           } catch (err) {
-            if (err instanceof CliproxyAuthError) throw err; // stop after first rejected key
-            // Auth indexes are opaque tokens, but never persist one raw in a
-            // warning: the short hash distinguishes files for debugging.
-            // Client messages are pathname-only and the path builder omits
-            // the value, so the scrub below is defense-in-depth.
-            const fileRef = `auth ${hashIdentity([authIndex])?.slice(0, 8) ?? "unknown"}`;
+            if (err instanceof CliproxyAuthError) throw err;
+            const fileRef = `auth ${hashIdentity([a.authIndex ?? a.key])?.slice(0, 8) ?? "unknown"}`;
             const rawMessage = err instanceof Error ? err.message : "fetch failed";
-            const safeMessage = rawMessage.split(authIndex).join(fileRef);
-            pluginErrors.push(`${entry.provider} (plugin ${pluginId}, ${fileRef}): ${safeMessage}`);
+            const safeMessage = a.authIndex ? rawMessage.split(a.authIndex).join(fileRef) : rawMessage;
+            pluginErrors.push(`${a.provider} (plugin ${pluginId}, ${fileRef}): ${safeMessage}`);
           }
+        }
+        if (pluginResults.has(fetchKey)) {
+          pluginPayloadByAccountKey.set(a.key, pluginResults.get(fetchKey));
         }
       }
 
@@ -556,10 +502,10 @@ export async function runSync(deps: SyncDeps, inFlight: { running: boolean }): P
         // at most every 45 minutes per account (plus manual refresh) with
         // the last 2xx answer cached between polls; an upstream 401/403
         // parks the account for an hour like every other family.
-        if (a.provider === "meta") {
+        if (a.provider === "meta" || a.provider === "meta-muse") {
           // Either switch off disables the download and the key call for
           // the whole Meta family; the account stays on passive signals.
-          if (!isMetaQuotaEnabled(deps.config)) {
+          if (!isMetaQuotaEnabled(deps.config) || !isLiveQuotaEnabled(deps.config, a.provider)) {
             metaQuotaDisabled += 1;
             continue;
           }
@@ -909,8 +855,7 @@ export async function runSync(deps: SyncDeps, inFlight: { running: boolean }): P
       const { accounts, unkeyed, warnings } = parseAuthFiles(authFiles, {
         now: deps.now,
         allowLists: deps.config.providerWindows,
-        pluginPayloadByProvider,
-        pluginPayloadByAuthIndex,
+        pluginPayloadByAccountKey,
         apiCallPayloadByAuthIndex,
         apiCallQuotaPayloadByAuthIndex,
         apiCallObservedAt: deps.now,
@@ -1513,6 +1458,9 @@ export function accountsToRows(
       coolingDown: a.coolingDown,
       cooldownUntil: a.cooldownUntil,
       credits: a.credits,
+      overage: a.overage,
+      overageObservedAt: a.overageObservedAt,
+      quotaMetrics: a.quotaMetrics,
     };
   }
   if (unkeyed > 0) {

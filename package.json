@@ -1,6 +1,6 @@
 {
   "name": "@togetherweown/paperclip-plugin-cliproxy-connector",
-  "version": "0.2.7",
+  "version": "0.3.0",
   "description": "Paperclip plugin that syncs CLIProxy per-account quota into a local cache and routes AI-connection pools quota-aware (usage_aware) with wait/resume.",
   "license": "MIT",
   "type": "module",

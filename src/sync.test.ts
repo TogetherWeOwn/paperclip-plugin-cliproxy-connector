@@ -454,12 +454,44 @@ describe("happy path", () => {
     assertNoKeyLeak(s);
   });
 
+  it.each([false, true])("does not inherit a sibling quota route (explicit override: %s)", async (override) => {
+    const quotaUrls: URL[] = [];
+    const fetchDiscovery = vi.fn(async (input: string | URL | Request): Promise<Response> => {
+      const url = new URL(String(input));
+      if (url.pathname === "/v8/management/credentials") {
+        return jsonResponse(200, { observed_at: NOW, files: [
+          { id: "advertised", provider: "claude", auth_index: "one", quota_plugin_id: "quota-a" },
+          { id: "absent", provider: "claude", auth_index: "two", supports_quota: true },
+          { id: "refused", provider: "claude", auth_index: "three", quota_plugin_id: "quota-a", supports_quota: false },
+          { id: "malformed", provider: "claude", auth_index: "four", quota_plugin_id: "../bad" },
+          { id: "unindexed", provider: "claude", quota_plugin_id: "quota-a" },
+          { id: "disabled", provider: "claude", auth_index: "five", quota_plugin_id: "quota-a", disabled: true },
+        ] });
+      }
+      if (url.pathname.includes("/plugins/")) {
+        quotaUrls.push(url);
+        return jsonResponse(200, pluginQuotaBody());
+      }
+      return new Response("not found", { status: 404 });
+    });
+    const s = store();
+    const d = deps(s, fetchDiscovery as unknown as typeof fetch);
+    d.config = parseConfig({ ...baseConfigRaw(), pluginQuotaIds: override ? { claude: "configured-quota" } : {} }).config;
+    await runSync(d, { running: false });
+    expect(quotaUrls.map((u) => u.searchParams.get("auth_index"))).toEqual(override ? ["one", "two", "three", "four"] : ["one"]);
+    expect(quotaUrls.every((u) => u.pathname.includes(override ? "/configured-quota/" : "/quota-a/"))).toBe(true);
+    const rows = Object.values(s.savedRows as Record<string, AccountUsageRow>);
+    expect(rows.filter((r) => r.limits.some((l) => l.id === "claude:weekly"))).toHaveLength(override ? 4 : 1);
+    expect(s.strike.failures).toHaveLength(0);
+    assertNoKeyLeak(s);
+  });
+
   it("discovers the plugin quota id from quota_plugin_id when config has none", async () => {
     const quotaUrls: string[] = [];
     const fetchHinted = vi.fn(async (input: string | URL | Request): Promise<Response> => {
       const url = new URL(String(input));
       if (url.pathname === "/v0/management/auth-files") {
-        return jsonResponse(200, [{ id: "claude-1", provider: "claude", quota_plugin_id: "claude-quota" }]);
+        return jsonResponse(200, [{ id: "claude-1", provider: "claude", auth_index: "discovered", quota_plugin_id: "claude-quota" }]);
       }
       if (url.pathname === "/v0/management/plugins/claude-quota/quota") {
         quotaUrls.push(url.toString());

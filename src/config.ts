@@ -211,6 +211,7 @@ export const DEFAULT_PROVIDER_WINDOWS: Record<string, string[]> = {
   // their time window (`parseAntigravityQuota`), and the Meta key answer
   // serves `window` + `weekly` (`parseMetaQuota`).
   meta: ["meta", "window", "weekly"],
+  hopper: ["5h", "weekly"],
   antigravity: ["antigravity", "5h", "weekly", "daily", "monthly"],
   devin: ["devin", "5h", "weekly", "daily"],
   synthetic: ["weekly", "rolling-5h", "5h", "subscription"],
@@ -565,6 +566,7 @@ export const DEFAULT_LIVE_QUOTA_PROVIDERS: Record<string, boolean> = {
   antigravity: true,
   devin: true,
   meta: true,
+  "meta-muse": true,
 };
 
 /** Whether the pinned live `api-call` rounds may run for a provider family. */
