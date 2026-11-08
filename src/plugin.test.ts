@@ -259,6 +259,12 @@ describe("config validation and health", () => {
       row.limits.forEach((limit) => { limit.observedAt = now; });
     }
     await harness.ctx.state.set(stateKey(ROWS_STATE_KEY), rows as never);
+    // The shared sync mock omits served-file metadata and intentionally emits
+    // warnings. Health unit cases start from an explicitly clean summary.
+    const summary = harness.getState(stateKey(LAST_SYNC_STATE_KEY)) as Record<string, unknown>;
+    await harness.ctx.state.set(stateKey(LAST_SYNC_STATE_KEY), {
+      ...summary, startedAt: now, finishedAt: now, errors: [], drift: [],
+    } as never);
     fetchMock.mockClear();
     return { harness, fetchMock, rows };
   }
@@ -278,7 +284,7 @@ describe("config validation and health", () => {
     expect(stateSpy).not.toHaveBeenCalled();
   });
 
-  it.each(["stale-cache", "stale-observation", "blind", "failed", "strikes", "stale-sync"])(
+  it.each(["stale-cache", "stale-observation", "blind", "failed", "strikes", "stale-sync", "partial-sync"])(
     "reports degraded for %s", async (condition) => {
       const { harness, rows } = await healthyCache();
       const row = Object.values(rows)[0]!;
@@ -292,9 +298,12 @@ describe("config validation and health", () => {
       if (condition === "strikes") await harness.ctx.state.set(instanceStrikeKey(), {
         failures: [], disabled: true, secretBad: true,
       } as never);
-      if (condition === "stale-sync") {
+      if (condition === "stale-sync" || condition === "partial-sync") {
         const summary = harness.getState(stateKey(LAST_SYNC_STATE_KEY)) as Record<string, unknown>;
-        await harness.ctx.state.set(stateKey(LAST_SYNC_STATE_KEY), { ...summary, finishedAt: old } as never);
+        await harness.ctx.state.set(stateKey(LAST_SYNC_STATE_KEY), {
+          ...summary,
+          ...(condition === "stale-sync" ? { finishedAt: old } : { errors: ["quota fetch failed"] }),
+        } as never);
       }
       await harness.ctx.state.set(stateKey(ROWS_STATE_KEY), rows as never);
       const health = await plugin.definition.onHealth!();
