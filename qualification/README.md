@@ -49,7 +49,15 @@ permission to substitute main, a different host, an SDK bump or a core patch.
 
 ## Resource and network boundary
 
-The only runtime is one GitHub-hosted `ubuntu-24.04` job with a 25-minute ceiling.
+The only runtime allocation is one GitHub-hosted `ubuntu-24.04` job with a 25-minute
+ceiling, containing the stock host and a bounded browser sidecar. The sidecar joins
+only the stock host's network-none namespace, runs as UID 1000 with all capabilities
+dropped and no-new-privileges, and has separate CPU/memory/PID/shared-memory bounds.
+It receives only its read-only driver/dependencies and writable job-local evidence;
+no candidate, production mount, Docker socket or credentials. Chromium's default
+Playwright sandbox setting is retained; this is an isolated synthetic browser, not
+a browser exposed to untrusted public sites. Both containers are removed explicitly
+and share the same native hosted-VM cancellation backstop.
 The stock container has no network interface other than loopback (`--network none`),
 no published ports, no Docker socket, no production mount, no forwarded job token
 and no external database. Embedded PostgreSQL and instance state live in its writable
@@ -80,6 +88,47 @@ values and boundaries. These are installed aggregate transitions, not native rou
 or browser execution; only Actions results establish whether they passed.
 The unavailable fixture uses the canonical `unavailable: true` lifecycle flag;
 a display `status` string alone does not exercise that contract.
+
+## Browser extension (requires its own Actions result)
+
+The browser sidecar pins the Linux AMD64 manifest resolved from the official
+Playwright `v1.56.1-noble` image:
+`mcr.microsoft.com/playwright@sha256:42f02d323c310069b4d54c94bd91a608966a486c3492c48ae0b1cea747ec5ca2`.
+`browser-image.json`, container inspection and actual Chromium version retain that
+identity independently of the stock host and candidate. The separate browser lock
+contains only `playwright-core@1.56.1` (registry publication 2025-10-17), integrity
+`sha512-hutraynyn31F+Bifme+Ps9Vq59hKuUCz7H1kDOcBs+2oGguKkWTU50bBWrtz34OUWmIwpBTWDxaRPXrIXkgvmQ==`.
+Neither its manifest nor the root browser package declares lifecycle hooks or
+transitive dependencies. Actions verifies npm 11.19.0's project-local three-day age
+and script-refusal settings, checks native lock resolution is unchanged, then runs
+`npm ci`. No hook exception, browser download hook or candidate dependency change
+is made. Clean install/execution acceptance remains pending Actions. The immutable
+browser image, like the stock image, has no native npm release-age control; this is
+an explicit Security supply-chain residual, not a claim that age proves safety.
+
+`browser/observe.mjs` loads the actual company-prefixed stock plugin page, not a
+custom render harness or substituted SDK bridge. It records candidate UI response
+SHA256 and requires equality with the independently built artifact. HTTP requests
+are restricted to the stock loopback origin: the tested navigation path, native
+API GETs, assets/plugin modules/favicon, and plugin data POSTs only. Mutating actions,
+configuration POSTs, other loopback ports and external origins are denied. Same-host
+native API websocket connections are allowed; others are rejected. There is no
+network mocking, clock injection, inference endpoint or global-fetch substitution.
+Network failures/HTTP errors/console errors/page errors fail the observation and
+are retained with screenshots/traces and request paths.
+
+Each installed scenario must agree with the rendered verdict, sync freshness,
+opt-in/headroom count, credits/balance/observed-at and account checked-at. A safe
+metadata snapshot precedes deterministic rejected-name refresh. Timed controls
+reuse the same open page across the real boundary and fresh-telemetry recovery;
+they do not reload to simulate automatic UI transitions. The bounded 70-second
+agreement deadline covers native 30-second UI ticks/minute refresh throttling.
+Screenshots, per-case traces and `browser.json` preserve success/failure details.
+A browser failure is evidence to diagnose, never permission to patch the candidate,
+weaken the assertion or claim that worker data was browser proof. Native router
+qualification and specialist verdicts remain separate even if all browser checks
+pass. The current extension tests the native first page slot (Accounts); it does
+not claim coverage of a separately rendered Usage page or dashboard widget.
 
 ## Frozen mapping limitation
 

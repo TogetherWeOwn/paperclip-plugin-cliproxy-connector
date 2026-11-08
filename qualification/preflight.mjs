@@ -39,7 +39,13 @@ async function ready() {
   do {
     try {
       const health = await api('/api/health');
-      if (health.status === 'ok') return health;
+      if (health.status === 'ok') {
+        const response = await fetch('http://127.0.0.1:4310/ready', { signal: AbortSignal.timeout(3000) });
+        const browser = await response.json();
+        assert(response.ok && browser.ready, 'Browser is not ready');
+        report.browserVersion = browser.version;
+        return health;
+      }
       last = new Error('Host health is not ok');
     } catch (error) { last = error; }
     await new Promise(resolve => setTimeout(resolve, 1000));

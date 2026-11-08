@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { CANDIDATE, HOST_SOURCE, HOST_IMAGE, assertHostRelease, digest, filesUnder } from './identity.mjs';
 import { SCENARIOS, TRANSITIONS, scenarioEntries, timedEntries, startFixture, SYNTHETIC_KEY } from './installed.mjs';
+import { permittedRequest } from './browser/policy.mjs';
 
 const workflow = readFileSync(new URL('../.github/workflows/qualify-stock.yml', import.meta.url), 'utf8');
 const driver = readFileSync(new URL('./preflight.mjs', import.meta.url), 'utf8');
@@ -41,6 +42,35 @@ test('runtime cannot reach provider or production services or retain a cloud res
   assert(workflow.includes('docker rm --force --volumes'));
   assert(workflow.includes('GitHub-hosted job VM disposal'));
   assert(workflow.includes('retention-days: 7'));
+});
+
+test('browser shares only the isolated namespace and has a separately pinned hook-free driver', () => {
+  assert(workflow.includes('BROWSER_IMAGE: mcr.microsoft.com/playwright@sha256:42f02d323c310069b4d54c94bd91a608966a486c3492c48ae0b1cea747ec5ca2'));
+  assert(workflow.includes('--network "container:$QUALIFICATION_CONTAINER"'));
+  assert(workflow.includes('--user 1000:1000 --cap-drop ALL --security-opt no-new-privileges'));
+  assert(workflow.includes('for container in "$BROWSER_CONTAINER" "$QUALIFICATION_CONTAINER"'));
+  const lock = JSON.parse(readFileSync(new URL('./browser/package-lock.json', import.meta.url), 'utf8'));
+  assert.equal(lock.packages['node_modules/playwright-core'].version, '1.56.1');
+  assert.equal(Object.keys(lock.packages).length, 2);
+  assert(!Object.values(lock.packages).some(pkg => pkg.hasInstallScript));
+  const policy = readFileSync(new URL('./browser/.npmrc', import.meta.url), 'utf8');
+  assert(policy.includes('min-release-age=3'));
+  assert(policy.includes('ignore-scripts=true'));
+});
+
+test('browser request policy refuses external origins, fixture ports and mutation', () => {
+  const path = '/FIX/plugins/00000000-0000-0000-0000-000000000000';
+  const origin = 'http://127.0.0.1:3100';
+  for (const allowed of [path, '/assets/index.js', '/_plugins/test/ui/index.js', '/api/companies']) {
+    assert(permittedRequest(`${origin}${allowed}`, 'GET', path));
+  }
+  assert(permittedRequest(`${origin}/api/plugins/test/bridge/data`, 'POST', path));
+  for (const url of ['https://example.invalid/v1', 'http://127.0.0.1:4310/observe', `${origin}/v1/models`]) {
+    assert(!permittedRequest(url, 'GET', path));
+  }
+  for (const url of ['/api/plugins/test/config', '/api/plugins/test/bridge/action', '/api/companies']) {
+    assert(!permittedRequest(`${origin}${url}`, 'POST', path));
+  }
 });
 
 test('preflight never represents incomplete qualification as a pass', () => {

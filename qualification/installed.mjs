@@ -128,10 +128,24 @@ export async function installedMatrix({ api, pluginPath, companyId, evidence, re
   const receipt = { qualificationStatus: 'partial-installed-matrix-only', scenarios: [], missing: ['native router eligibility', 'browser assertions and traces', 'specialist verdicts'] };
   try {
     let secretRef;
+    let companyPrefix;
+    receipt.browser = [];
+    const observe = async (key, expected, phase = 'single', boundary = null) => {
+      const response = await fetch('http://127.0.0.1:4310/observe', {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ key, path: `/${companyPrefix}/plugins/${pluginPath.split('/').at(-1)}`, phase, expected, boundary }),
+        signal: AbortSignal.timeout(100_000),
+      });
+      const result = await response.json();
+      assert(response.ok, JSON.stringify(result));
+      receipt.browser.push(result);
+    };
     const configure = async (optIn, name) => {
       // Independent companies avoid bypassing the worker's real 60s resync
       // throttle. The same-company refresh below observes that throttle.
-      companyId = (await api('/api/companies', { name: `Fixture ${name}` })).id;
+      const company = await api('/api/companies', { name: `Fixture ${name}` });
+      companyId = company.id;
+      companyPrefix = company.issuePrefix;
       secretRef = {};
       for (const key of ['managementSecretRef', 'clientApiKeySecretRef']) {
         const secret = await api(`/api/companies/${companyId}/secrets`, {
@@ -170,6 +184,7 @@ export async function installedMatrix({ api, pluginPath, companyId, evidence, re
       if (scenario.name === 'hardened-display-refresh') {
         const before = await refresh();
         assert(Object.values(before.providers[0].modelNames).includes('Qualification Model'), 'Safe display name was not cached');
+        await observe('safe-display-before-refresh', before.providers[0]);
         fixture.state.displayName = REJECTED_DISPLAY;
         // Wait only for the actual minimum-sync deadline, with a finite bound;
         // do not change the worker clock, cache, SDK or persisted host state.
@@ -194,6 +209,7 @@ export async function installedMatrix({ api, pluginPath, companyId, evidence, re
         assert(!Object.values(codex.modelNames).includes('Qualification Model'), 'Old model display cache survived refresh');
       }
       receipt.scenarios.push({ name: scenario.name, expected: { state: scenario.state, headroom: scenario.headroom, creditHeadroom: scenario.creditHeadroom }, actual: codex });
+      await observe(scenario.name, codex);
     }
     // Worker restart must read the persisted data, without any telemetry request.
     const persisted = await usage();
@@ -263,6 +279,8 @@ export async function installedMatrix({ api, pluginPath, companyId, evidence, re
       assert.equal(before.state, transition.before, transition.name);
       assert.equal(before.headroomAccounts, transition.headroom, transition.name);
       const syncFinishedAt = receipt.lastSyncFinishedAt;
+      await observe(transition.name, before, 'before', boundary);
+      assert(Date.now() < boundary, 'Browser pre-boundary observation arrived too late');
       const requestsBeforeExpiry = fixture.state.requests.length;
       // Read the same persisted rows after the advertised deadline, without
       // resync, cache writes, time injection or a newly expired fixture.
@@ -278,6 +296,8 @@ export async function installedMatrix({ api, pluginPath, companyId, evidence, re
         noTelemetryReadsAcrossExpiry: true,
       };
       receipt.transitions.push(result);
+      await observe(transition.name, after, 'after', boundary);
+      assert.equal(fixture.state.requests.length, requestsBeforeExpiry, 'Browser expiry observation refreshed telemetry');
       // Recovery needs genuinely fresh telemetry, not the passing of a clock.
       // Respect the real same-company minimum-sync interval before requesting it.
       await waitUntil(Date.parse(syncFinishedAt) + 60_100, 60_100);
@@ -288,7 +308,13 @@ export async function installedMatrix({ api, pluginPath, companyId, evidence, re
       assert.equal(recovered.creditHeadroomAccounts, 1, transition.name);
       result.recoveredObservedAt = new Date().toISOString();
       result.recovered = recovered;
+      await observe(transition.name, recovered, 'recovered', boundary);
     }
+    const browserFinished = await fetch('http://127.0.0.1:4310/finish', { method: 'POST', signal: AbortSignal.timeout(15_000) });
+    assert(browserFinished.ok, JSON.stringify(await browserFinished.json()));
+    receipt.missing = receipt.missing.filter(item => item !== 'browser assertions and traces');
+    report.missing = report.missing.filter(item => !['installed scenario matrix', 'browser assertions and traces'].includes(item));
+    report.checks.push('actual stock-host browser loaded exact candidate UI and agreed with installed scenarios and wall-clock transitions');
     report.checks.push('installed wall-clock credit freshness, window reset and unavailable retry transitions recovered only after fresh telemetry');
     receipt.currentScenario = null;
     assert.deepEqual(fixture.state.unexpected, [], 'Unexpected fixture request or synthetic credential resolution failure');
