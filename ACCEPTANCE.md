@@ -8,7 +8,7 @@ Maintainer: connector maintainers. Tool: `quota-diagnostics` (read); companion A
 
 - SDK dev dependency is lockfile-pinned to `2026.1023.0`; runtime tool/API context contracts were inspected from `2026.1106.0`.
 - CLIProxy normalized quota fixtures follow the v8 SDK `QuotaFetchResponse`; discovery follows the v8 credential-list wrapper and 404-only v0 fallback. No live management API was called.
-- Existing plugin remains in its own repository. No toolkit relocation, shared credential process, new credential, dependency or installed-runtime patch is introduced.
+- Existing plugin remains in its own repository. No toolkit relocation, shared credential process, new credential, production dependency or installed-runtime patch is introduced. Test-only rendering and schema-validation dependencies are lockfile-pinned.
 - Added permission request: `agent.tools.register`. Existing `api.routes.register`, `plugin.state.read` and `activity.log.write` support the diagnostic read path. Existing sync permissions remain, but diagnostics never invokes secret resolution or outbound fetch.
 
 ## Policy-to-test matrix
@@ -27,6 +27,8 @@ All rows below name authored fixtures; their execution must be established by ex
 | API method, query scope, extra keys, canonical integer conversion | GET API case in `src/diagnostics.test.ts` |
 | v8 account-level discovery, explicit fallback precedence, disabled/unsupported/malformed entries | `src/sync.test.ts` discovery cases |
 | Native numeric fields, unknown-is-not-zero, Codex balance age, Hopper completeness, Meta parity guard | `src/parsers.test.ts` typed normalized observations |
+| Persistent page credit/reset/retry expiry, fresh-cache recovery, company switches, cleanup and slow background reads | `src/ui-refresh.test.ts` mounted-component cases; not installed/browser qualification |
+| Empty aliases with a primary binding, nonempty alias-only binding, display-only errors versus unsafe routing configuration | `src/config-schema.test.ts` schema/parser and routing-safety cases |
 
 No provisioning, mutation approval, spend reservation, TTL extension or teardown
 cases apply: diagnostics makes zero provider requests and creates no resource.
@@ -36,8 +38,8 @@ multiplexer. Native governance and durable host audit coverage are still require
 ## Verification and open gates
 
 - No local suite, typecheck or build is authorized or claimed. CI commands are `npm run typecheck`, `npm test`, `npm run build` on GitHub Actions.
-- Exact-head Actions evidence for these additions: pending.
-- One fresh-context complete-diff review completed on the initial feature head. It found native-field loss (already corrected), unsafe metric keys, timeout/audit permit leaks, synchronous deadline gaps, health coverage errors and routing through invalid persisted mappings. This repair batch adds targeted regressions; exact-head Actions and reviewer acceptance of the fixes remain pending. Native Security and QA decisions remain pending.
+- Historical exact-head evidence: [`40d907e966be2c0ef7973e33bbc975bbc8018b70` Actions job](https://github.com/TogetherWeOwn/paperclip-plugin-cliproxy-connector/actions/runs/42437802875/job/128600320911) passed typecheck, 635 tests and build. That result does not validate later repair commits. Current-head run/job evidence is maintained in the [PR Verification section](https://github.com/TogetherWeOwn/paperclip-plugin-cliproxy-connector/pull/24); the freshness/bot repair head is pending verification at this document revision.
+- One fresh-context complete-diff review and an accepted bounded repair delta completed at the historical head above, as recorded in PR Verification. It covered native-field loss, unsafe metric keys, timeout/audit permit leaks, synchronous deadline gaps, health coverage and invalid persisted mappings. The subsequent mounted-page freshness delta review found in-flight supersession and content-unmount risks; the repair skips polls while loading and retains content during background loading, with deferred-read regressions. Native Security re-review and QA decisions remain pending, not granted by source CI or these records.
 - Exact artifact digest/configuration/permission-envelope Security acceptance: pending. This candidate is not a release artifact.
 - Verify on the exact installation host that native registered tools traverse access governance and immutable call-event auditing. Narrow access to intended agents/projects, classify the tool read-only, and prove denied access cannot dispatch. No claim of this coverage is made from SDK declarations or offline fixtures.
 - Verify activity and **all** identity/rate/capacity/deadline refusal worker records are durably captured with native call-event audit and intended retention/access controls. Saturation refusals deliberately do not enqueue activity RPCs. Missing durable refusal coverage is an open install gate, not a passed audit control. Local in-memory rate buckets are not a distributed quota; permanently hung host RPCs retain permits until actual settlement or Operator worker recovery.

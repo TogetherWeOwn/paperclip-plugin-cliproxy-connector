@@ -554,6 +554,7 @@ describe("happy path", () => {
     // neither fetch failed: fetch errors carry "(plugin …)" with the file ref.
     expect(summary.errors.some((e) => e.includes("conflicting quota plugin ids"))).toBe(true);
     expect(summary.errors.some((e) => e.includes("(plugin "))).toBe(false);
+    expect(summary.quotaErrors?.some((e) => e.includes("conflicting quota plugin ids"))).toBe(false);
     // Each payload attached to its own account's row.
     const rows = Object.values(s.savedRows as Record<string, AccountUsageRow>);
     expect(rows).toHaveLength(2);

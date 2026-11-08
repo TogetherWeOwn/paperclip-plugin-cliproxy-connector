@@ -53,12 +53,14 @@ function formatCountdown(iso: string | null, nowMs: number): string | null {
  * The worker owns credit/window expiry and aggregate counts; background sync
  * recovery can arrive at any time. This never invokes resync or api-call.
  */
-function useRefreshCachedData(companyId: string | null, refresh: () => void) {
-  const refreshRef = useRef(refresh);
-  useEffect(() => { refreshRef.current = refresh; }, [refresh]);
+function useRefreshCachedData(companyId: string | null, refresh: () => void, loading: boolean) {
+  const current = useRef({ refresh, loading });
+  useEffect(() => { current.current = { refresh, loading }; }, [refresh, loading]);
   useEffect(() => {
     if (!companyId) return;
-    const timer = setInterval(() => refreshRef.current(), 30_000);
+    const timer = setInterval(() => {
+      if (!current.current.loading) current.current.refresh();
+    }, 30_000);
     return () => clearInterval(timer);
   }, [companyId]);
 }
@@ -116,10 +118,10 @@ export function CliProxyPage({ context }: PluginPageProps) {
   const resync = usePluginAction("cliproxy-resync");
   const reenable = usePluginAction("cliproxy-reenable");
   const nowMs = useWorkerNow(data?.generatedAt ?? null);
-  useRefreshCachedData(companyId, refresh);
+  useRefreshCachedData(companyId, refresh, loading);
 
   if (!companyId) return <div>No company context.</div>;
-  if (loading) return <div>Loading CLIProxy provider state…</div>;
+  if (loading && !data) return <div>Loading CLIProxy provider state…</div>;
   if (error) return <div>Error: {error.message}</div>;
   if (!data) return <div>No data yet — run a sync.</div>;
 
@@ -360,10 +362,10 @@ export function CliProxyUsagePage({ context }: PluginPageProps) {
   const [sortKey, setSortKey] = useState<UsageSortKey>("remaining");
   const [sortDir, setSortDir] = useState<"asc" | "desc">("asc");
   const nowMs = useWorkerNow(data?.generatedAt ?? null);
-  useRefreshCachedData(companyId, refresh);
+  useRefreshCachedData(companyId, refresh, loading);
 
   if (!companyId) return <div>No company context.</div>;
-  if (loading) return <div>Loading usage &amp; quota…</div>;
+  if (loading && !data) return <div>Loading usage &amp; quota…</div>;
   if (error) return <div>Error: {error.message}</div>;
   if (!data) return <div>No data yet — run a sync.</div>;
 
@@ -613,8 +615,8 @@ export function CliProxyWidget({ context }: PluginWidgetProps) {
   const { data, loading, error, refresh } = usePluginData<WidgetData>("cliproxy-widget", {
     companyId: context.companyId,
   });
-  useRefreshCachedData(context.companyId, refresh);
-  if (loading) return <div>Loading…</div>;
+  useRefreshCachedData(context.companyId, refresh, loading);
+  if (loading && !data) return <div>Loading…</div>;
   if (error) return <div>Error: {error.message}</div>;
   if (!data) return <div>No data.</div>;
   return (

@@ -269,6 +269,44 @@ describe("config validation and health", () => {
     return { harness, fetchMock, rows };
   }
 
+  it("keeps successful mixed account quota routes informational to health", async () => {
+    const { harness, fetchMock } = await setup();
+    const original = fetchMock.getMockImplementation()!;
+    fetchMock.mockImplementation(async (input) => {
+      const path = new URL(String(input)).pathname;
+      if (path === "/v8/management/credentials") return jsonResponse(200, [
+        { id: "a", provider: "claude", auth_index: "a", quota_plugin_id: "quota-a" },
+        { id: "b", provider: "claude", auth_index: "b", quota_plugin_id: "quota-b" },
+      ]);
+      if (path.startsWith("/v0/management/plugins/")) return jsonResponse(200, {
+        groups: [{ buckets: [{ window: "5h", remainingFraction: 0.8 }, { window: "weekly", remainingFraction: 0.8 }] }],
+      });
+      return original(input);
+    });
+    await harness.runJob(SYNC_JOB_KEY);
+    const summary = harness.getState(stateKey(LAST_SYNC_STATE_KEY)) as { errors: string[]; quotaErrors: string[] };
+    expect(summary.errors.some((e) => e.includes("conflicting quota plugin ids"))).toBe(true);
+    expect(summary.quotaErrors).toEqual([]);
+    expect(await plugin.definition.onHealth!()).toMatchObject({ status: "ok" });
+  });
+
+  it.each([undefined, null, {}])("ignores an unconfigured company in health: %j", async (unconfigured) => {
+    const { harness } = await healthyCache();
+    vi.spyOn(harness.ctx.companies, "list").mockResolvedValue([{ id: COMPANY }, { id: "co-empty" }] as never);
+    vi.spyOn(harness.ctx.config, "get").mockImplementation(async (id) => id === COMPANY ? COMPANY_CONFIG : unconfigured as never);
+    expect(await plugin.definition.onHealth!()).toMatchObject({ status: "ok", details: { configuredCompanies: 1 } });
+  });
+
+  it("keeps partial configuration and all-unconfigured health degraded", async () => {
+    const { harness } = await healthyCache();
+    vi.spyOn(harness.ctx.companies, "list").mockResolvedValue([{ id: COMPANY }, { id: "co-partial" }] as never);
+    const get = vi.spyOn(harness.ctx.config, "get").mockImplementation(async (id) =>
+      id === COMPANY ? COMPANY_CONFIG : { providers: [] } as never);
+    expect(await plugin.definition.onHealth!()).toMatchObject({ status: "degraded", details: { degradedCompanies: 1 } });
+    get.mockResolvedValue({});
+    expect(await plugin.definition.onHealth!()).toMatchObject({ status: "degraded", details: { configuredCompanies: 0 } });
+  });
+
   it("reports degraded before the first sync, not an unconditional success", async () => {
     await setup();
     expect(await plugin.definition.onHealth!()).toMatchObject({ status: "degraded" });
@@ -514,6 +552,25 @@ describe("router glue", () => {
       ],
     } as never);
     expect(result).toEqual({ kind: "selected", memberId: "m-a", skipped: {} });
+  });
+
+  it.each([{ ignoredAuthFileRefs: ["bad-ref"] }, { ignoredProviders: 42 }])("preserves cached routing despite display-only drift errors: %j", async (extra) => {
+    const ctx = { config: { get: async () => ({ ...COMPANY_CONFIG, ...extra }) },
+      state: { get: vi.fn(async () => ({})) } };
+    const result = await routeWithCache(ctx as never, {
+      companyId: COMPANY, now: "2026-11-01T12:00:00Z",
+      pool: { id: "pool-1", mode: "usage_aware" },
+      candidates: [{ member: { id: "m-a", profile: { model: "model-a" }, binding: { connectionId: "conn-a1" } } }],
+    } as never);
+    expect(result).toMatchObject({ kind: "selected", memberId: "m-a" });
+    expect(ctx.state.get).toHaveBeenCalled();
+  });
+
+  it("keeps malformed window policy fail-closed before reading quota", async () => {
+    const ctx = { config: { get: async () => ({ ...COMPANY_CONFIG, providerWindows: { claude: 42 } }) },
+      state: { get: vi.fn(async () => ({})) } };
+    expect((await routeWithCache(ctx as never, { companyId: COMPANY } as never)).kind).toBe("unavailable");
+    expect(ctx.state.get).not.toHaveBeenCalled();
   });
 
   it("routeWithCache refuses ambiguous persisted alias configuration before reading quota", async () => {

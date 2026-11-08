@@ -9,14 +9,18 @@ import { buildPageData, buildUsageData, buildWidgetData } from "./ui-data.js";
 import { emptyStrikeBudget } from "./sync.js";
 import type { AccountUsageRow } from "./types.js";
 
-const sdk = vi.hoisted(() => ({ read: vi.fn(), action: vi.fn(), calls: vi.fn() }));
+const sdk = vi.hoisted(() => ({ read: vi.fn(), action: vi.fn(), calls: vi.fn(), delay: 0 }));
 vi.mock("@paperclipai/plugin-sdk/ui", () => ({
   usePluginData: (key: string, params: { companyId: string | null }) => {
     const [data, setData] = useState(() => sdk.read(key, params));
+    const [loading, setLoading] = useState(false);
     // Deliberately new identity on every render, as a host hook may return.
-    return { data, loading: false, error: null, refresh: () => {
+    return { data, loading, error: null, refresh: () => {
       sdk.calls(key, params);
-      setData(sdk.read(key, params));
+      setLoading(true);
+      const finish = () => { setData(sdk.read(key, params)); setLoading(false); };
+      if (sdk.delay) setTimeout(finish, sdk.delay);
+      else finish();
     } };
   },
   usePluginAction: () => useCallback(sdk.action, []),
@@ -61,6 +65,7 @@ beforeEach(() => {
   vi.useFakeTimers();
   vi.setSystemTime(NOW);
   vi.clearAllMocks();
+  sdk.delay = 0;
   (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 });
 afterEach(async () => {
@@ -109,6 +114,25 @@ for (const Component of components) {
         expect(sdk.action).not.toHaveBeenCalled();
       });
     }
+
+    it("does not supersede a slow read or unmount existing content while refreshing", async () => {
+      fixture("credit");
+      sdk.delay = 35_000;
+      await act(async () => { view = create(createElement(Component, { context })); });
+      const rendered = view!.root.findAllByType("div").find((node) => node.props.style?.display === "grid");
+      await act(async () => { vi.advanceTimersByTime(30_000); });
+      expect(sdk.calls).toHaveBeenCalledTimes(1);
+      expect(view!.root.findAllByType("div")).toContain(rendered);
+      await act(async () => { vi.advanceTimersByTime(30_000); });
+      expect(sdk.calls).toHaveBeenCalledTimes(1);
+      expect(view!.root.findAllByType("div")).toContain(rendered);
+      await act(async () => { vi.advanceTimersByTime(5_000); });
+      expect(text()).toContain('"unknown"');
+      await act(async () => { vi.advanceTimersByTime(25_000); });
+      expect(sdk.calls).toHaveBeenCalledTimes(2);
+      await act(async () => { vi.advanceTimersByTime(35_000); });
+      expect(sdk.action).not.toHaveBeenCalled();
+    });
 
     it("bounds reads and cleans up its timer on unmount", async () => {
       fixture("credit");

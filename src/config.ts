@@ -153,11 +153,13 @@ export const CONNECTOR_CONFIG_SCHEMA = {
       items: {
         type: "object",
         required: ["provider"],
-        anyOf: [{ required: ["connectionId"] }, { required: ["connectionIds"] }],
+        anyOf: [{ required: ["connectionId"] }, {
+          required: ["connectionIds"], properties: { connectionIds: { minItems: 1 } },
+        }],
         properties: {
           provider: { type: "string", minLength: 1 },
           connectionId: { type: "string", minLength: 1 },
-          connectionIds: { type: "array", minItems: 1, items: { type: "string", minLength: 1 } },
+          connectionIds: { type: "array", items: { type: "string", minLength: 1 } },
           completeInventory: { type: "boolean", default: false },
           creditsCountAsHeadroom: { type: "boolean", default: false },
         },
@@ -251,6 +253,8 @@ export function isLoopbackUrl(raw: string): boolean {
 
 export interface ConfigValidation {
   ok: boolean;
+  /** False on operational errors; display-only drift acceptance errors do not block cached routing. */
+  routingOk: boolean;
   warnings: string[];
   errors: string[];
 }
@@ -505,8 +509,9 @@ export function parseConfig(raw: unknown): { config: ConnectorConfig; validation
   // are additive to the provider rows above — an ignored provider still needs
   // no providers[] row, and an ignored auth-file ref stays out of the quota
   // fetch either way (refused names are never fetched).
-  const ignoredProviders = parseIgnoredProviderList(r.ignoredProviders, errors, warnings);
-  const ignoredAuthFileRefs = parseIgnoredAuthFileRefs(r.ignoredAuthFileRefs, errors, warnings);
+  const displayErrors: string[] = [];
+  const ignoredProviders = parseIgnoredProviderList(r.ignoredProviders, displayErrors, warnings);
+  const ignoredAuthFileRefs = parseIgnoredAuthFileRefs(r.ignoredAuthFileRefs, displayErrors, warnings);
   let showAccountEmails = false;
   if (r.showAccountEmails !== undefined && r.showAccountEmails !== null) {
     if (typeof r.showAccountEmails !== "boolean") {
@@ -551,7 +556,10 @@ export function parseConfig(raw: unknown): { config: ConnectorConfig; validation
     ignoredAuthFileRefs,
     showAccountEmails,
   };
-  return { config, validation: { ok: errors.length === 0, warnings, errors } };
+  return { config, validation: {
+    ok: errors.length === 0 && displayErrors.length === 0,
+    routingOk: errors.length === 0, warnings, errors: [...errors, ...displayErrors],
+  } };
 }
 
 /**

@@ -141,8 +141,12 @@ describe("typed normalized quota observations", () => {
     expect(parsed.limits.filter((l) => l.id === "hopper:5h")).toHaveLength(2);
   });
 
-  it("refuses credential-shaped metric keys rather than persisting them", () => {
-    const key = "sk_live_a1b2c3d4";
+  it.each(["monthly_spend_limit_usd", Array(13).fill("quota").join("_").slice(0, 64)])("preserves benign structured metric key %s", (key) => {
+    const parsed = parsePluginQuota("hopper", { summary: [{ key, label: "Balance", value: 12.5 }] }, DEFAULT_PROVIDER_WINDOWS.hopper);
+    expect(parsed.quotaMetrics?.[0]).toMatchObject({ key, value: 12.5 });
+  });
+
+  it.each(["sk_live_a1b2c3d4", "secret_private_balance", "abcdefghijklmnopqrstuvwxyz", "balance_a1b2c3d4", Array(14).fill("quota").join("_")])("refuses credential-shaped or oversized metric key %s", (key) => {
     const parsed = parsePluginQuota("hopper", { summary: [{ key, label: "Balance", value: 12.5 }] }, DEFAULT_PROVIDER_WINDOWS.hopper);
     expect(parsed.quotaMetrics).toBeNull();
     expect(JSON.stringify(parsed)).not.toContain(key);

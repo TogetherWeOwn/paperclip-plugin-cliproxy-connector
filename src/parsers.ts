@@ -601,7 +601,9 @@ function parseQuotaMetrics(value: unknown): QuotaMetric[] | null {
     const key = getStr(metric, "key");
     const label = sanitizeStatusMessage(getStr(metric, "label"));
     const amount = nonnegativeNumber(metric.value);
-    if (!key || !/^[a-z][a-z0-9_]{0,63}$/.test(key) || isCredentialToken(key) || !label || amount === null) continue;
+    if (!key || !/^[a-z][a-z0-9_]{0,63}$/.test(key) ||
+        SECRET_DOT_PREFIX.test(key.split("_")[0]) || isCredentialCore(key) ||
+        key.split("_").some(isCredentialToken) || !label || amount === null) continue;
     metrics.push({
       key, label, value: amount,
       unit: sanitizeStatusMessage(getStr(metric, "unit")),
@@ -2090,6 +2092,8 @@ export function parseAuthFiles(
   accounts: ParsedAccount[];
   unkeyed: number;
   warnings: string[];
+  /** Coverage failures only; successful mixed-route discovery stays informational. */
+  quotaWarnings: string[];
   /**
    * Per-provider plugin quota ids advertised by the entries themselves
    * (`quota_plugin_id`, unless `supports_quota: false`). First valid id wins
@@ -2099,6 +2103,7 @@ export function parseAuthFiles(
   pluginQuotaHints: Map<string, string>;
 } {
   const warnings: string[] = [];
+  const informationalWarnings = new Set<string>();
   const accounts: ParsedAccount[] = [];
   const pluginQuotaHints = new Map<string, string>();
   let unkeyed = 0;
@@ -2113,7 +2118,7 @@ export function parseAuthFiles(
       : [];
   if (entries.length === 0) {
     warnings.push("auth-files payload holds no entries; every configured provider will drift-warn as having no enabled accounts.");
-    return { accounts, unkeyed, warnings, pluginQuotaHints };
+    return { accounts, unkeyed, warnings, quotaWarnings: warnings.filter((w) => !informationalWarnings.has(w)), pluginQuotaHints };
   }
 
   const seenKeys = new Map<string, number>();
@@ -2185,9 +2190,9 @@ export function parseAuthFiles(
           const prior = pluginQuotaHints.get(provider);
           if (prior === undefined) pluginQuotaHints.set(provider, hintedId);
           else if (prior !== hintedId) {
-            warnings.push(
-              `${provider}: entries advertise conflicting quota plugin ids; preserving each account's own route.`,
-            );
+            const notice = `${provider}: entries advertise conflicting quota plugin ids; preserving each account's own route.`;
+            warnings.push(notice);
+            informationalWarnings.add(notice);
           }
         } else {
           warnings.push(
@@ -2586,7 +2591,7 @@ export function parseAuthFiles(
       parseWarnings: [...parseWarnings, ...(pluginQuota?.warnings ?? [])],
     });
   }
-  return { accounts, unkeyed, warnings, pluginQuotaHints };
+  return { accounts, unkeyed, warnings, quotaWarnings: warnings.filter((w) => !informationalWarnings.has(w)), pluginQuotaHints };
 }
 
 /**

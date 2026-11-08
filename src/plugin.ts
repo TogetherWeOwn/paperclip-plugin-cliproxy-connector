@@ -228,10 +228,11 @@ async function loadRequestCounts(
 async function resolveCompany(
   ctx: PluginContext,
   companyId: string,
-): Promise<{ config: ReturnType<typeof parseConfig>["config"]; ok: boolean }> {
+): Promise<{ config: ReturnType<typeof parseConfig>["config"]; ok: boolean; routingOk: boolean; configured: boolean }> {
   const raw = await ctx.config.get(companyId);
   const { config, validation } = parseConfig(raw);
-  return { config, ok: validation.ok };
+  const configured = raw != null && !(typeof raw === "object" && !Array.isArray(raw) && Object.keys(raw).length === 0);
+  return { config, ok: validation.ok, routingOk: validation.routingOk, configured };
 }
 
 let boundCtx: PluginContext | null = null;
@@ -548,10 +549,13 @@ const plugin = definePlugin({
     try {
       const companies = await boundCtx.companies.list();
       let degradedCompanies = 0;
+      let configuredCompanies = 0;
       const now = new Date().toISOString();
       for (const company of companies) {
         const ctx = boundCtx;
-        const { config, ok } = await resolveCompany(ctx, company.id);
+        const { config, ok, configured } = await resolveCompany(ctx, company.id);
+        if (!configured) continue;
+        configuredCompanies += 1;
         const [rows, lastSync, lastFailure, rawStrike] = await Promise.all([
           loadRows(ctx, company.id),
           loadLastSync(ctx, company.id),
@@ -585,11 +589,11 @@ const plugin = definePlugin({
           degradedCompanies += 1;
         }
       }
-      const degraded = companies.length === 0 || degradedCompanies > 0;
+      const degraded = configuredCompanies === 0 || degradedCompanies > 0;
       return {
         status: degraded ? "degraded" as const : "ok" as const,
         message: degraded ? "Quota coverage is missing, stale, blind or failed." : "Quota coverage is fresh.",
-        details: { companies: companies.length, degradedCompanies },
+        details: { companies: companies.length, configuredCompanies, degradedCompanies },
       };
     } catch {
       // Health must not echo host errors or configuration into diagnostics.
@@ -741,8 +745,8 @@ export async function routeWithCache(
   ctx: PluginContext,
   params: AiConnectionRouterRequest,
 ): Promise<AiConnectionRouterResult> {
-  const { config, ok } = await resolveCompany(ctx, params.companyId);
-  if (!ok) return { kind: "unavailable", skipped: { "pool:configuration": "connector configuration is invalid; refusing ambiguous quota routing." } };
+  const { config, routingOk } = await resolveCompany(ctx, params.companyId);
+  if (!routingOk) return { kind: "unavailable", skipped: { "pool:configuration": "connector configuration is invalid; refusing ambiguous quota routing." } };
   const rows = Object.values(await loadRows(ctx, params.companyId));
   const { candidates, poolId, poolMode, poolThresholdPercent } = toRouterCandidates(params);
   return route({

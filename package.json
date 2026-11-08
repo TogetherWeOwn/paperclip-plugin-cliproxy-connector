@@ -49,6 +49,7 @@
     "@types/node": "24.19.2",
     "@types/react": "19.2.7",
     "@types/react-test-renderer": "19.1.0",
+    "ajv": "8.20.0",
     "esbuild": "0.27.1",
     "react": "19.2.0",
     "react-test-renderer": "19.2.0",

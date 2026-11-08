@@ -852,7 +852,7 @@ export async function runSync(deps: SyncDeps, inFlight: { running: boolean }): P
         );
       }
 
-      const { accounts, unkeyed, warnings } = parseAuthFiles(authFiles, {
+      const { accounts, unkeyed, warnings, quotaWarnings } = parseAuthFiles(authFiles, {
         now: deps.now,
         allowLists: deps.config.providerWindows,
         pluginPayloadByAccountKey,
@@ -1018,7 +1018,7 @@ export async function runSync(deps: SyncDeps, inFlight: { running: boolean }): P
         drift,
         acceptedDrift,
         errors,
-        quotaErrors: [...pluginErrors, ...warnings],
+        quotaErrors: [...pluginErrors, ...quotaWarnings],
         providerModels,
         providerModelNames,
         modelOverlaps,

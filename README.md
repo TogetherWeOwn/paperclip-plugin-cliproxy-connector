@@ -163,7 +163,9 @@ The plugin ships two pages over the same sync cache:
   30 seconds while mounted with company context. This updates credit freshness,
   reset/retry expiry and fresh-telemetry recovery without a reload or manual
   refresh. It does not trigger a sync, provider request or credential read, and
-  stops on unmount. Browser timer throttling or a failed bridge read can delay
+  stops on unmount. In-flight reads are not superseded by another poll, and
+  existing content stays mounted during background loading. Browser timer
+  throttling or a failed bridge read can delay
   the next update; the worker, not a client-side estimate, owns routing verdicts.
 
   The Usage & Quota page adds four read-model sections over the same cache
