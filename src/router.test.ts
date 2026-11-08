@@ -1,5 +1,7 @@
 import { describe, expect, it } from "vitest";
+import { aggregateProvider } from "./aggregate.js";
 import { parseConfig, type ConnectorConfig } from "./config.js";
+import { parseHeaderSignals } from "./parsers.js";
 import { detectMissingConnections, resolveProviderRow, route, type RouteInput } from "./router.js";
 import type { AccountUsageRow, UsageLimitRow } from "./types.js";
 
@@ -116,6 +118,70 @@ describe("single-member pools", () => {
   it("members without a binding connection route unknown (fail open)", () => {
     const r = route(input({ candidates: [{ memberId: "m-a", model: "", connectionId: null }] }));
     expect(r.kind).toBe("selected");
+  });
+});
+
+describe.each([
+  { name: "100% pool threshold", config: {}, poolThresholdPercent: 100 },
+  { name: "zero default reserve", config: { reservePercent: 0 }, poolThresholdPercent: undefined },
+  { name: "zero per-pool override", config: { perPoolReservePercent: { "pool-1": 0 } }, poolThresholdPercent: 90 },
+])("use-until-exhausted: $name", (setting) => {
+  function zeroInput(rows: AccountUsageRow[]): RouteInput {
+    return input({ rows, config: testConfig(setting.config), poolThresholdPercent: setting.poolThresholdPercent });
+  }
+
+  it("admits fresh positive headroom below the former reserve, then waits at zero", () => {
+    const reset = iso(NOW_MS + 3_600_000);
+    for (const remainingPercent of [1, 0.01, 0]) {
+      const rows = [row({ limits: [limit({
+        remainingPercent, usedPercent: 100 - remainingPercent, resetsAt: reset,
+      })] })];
+      const args = zeroInput(rows);
+      const assessment = aggregateProvider({
+        provider: "claude", model: "model-a", rows, completeInventory: true,
+        config: args.config, now: NOW, poolId: args.poolId,
+        poolThresholdPercent: args.poolThresholdPercent,
+      });
+      expect(assessment).toMatchObject({
+        state: remainingPercent > 0 ? "allowed" : "exhausted",
+        headroomAccounts: remainingPercent > 0 ? 1 : 0,
+        retryAt: remainingPercent > 0 ? null : reset,
+      });
+      expect(route(args)).toMatchObject(remainingPercent > 0
+        ? { kind: "selected", memberId: "m-a" }
+        : { kind: "exhausted", retryAt: reset });
+    }
+  });
+
+  it.each([{ allowed: false }, { limitReached: true }])("still honors explicit denial %j", (denial) => {
+    const reset = iso(NOW_MS + 120_000);
+    expect(route(zeroInput([row({ limits: [limit({ remainingPercent: 1, resetsAt: reset, ...denial })] })])))
+      .toMatchObject({ kind: "exhausted", retryAt: reset });
+  });
+
+  it("keeps parsed retry-after and account cooldown backoff despite positive quota", () => {
+    const { limits } = parseHeaderSignals("claude", { "retry-after": "120" }, NOW, []);
+    expect(limits).toHaveLength(1);
+    expect(route(zeroInput([row({ limits: [limit({ remainingPercent: 1 }), ...limits] })])))
+      .toMatchObject({ kind: "exhausted", retryAt: iso(NOW_MS + 120_000) });
+    expect(route(zeroInput([row({ coolingDown: true, cooldownUntil: iso(NOW_MS + 180_000) })])))
+      .toMatchObject({ kind: "exhausted", retryAt: iso(NOW_MS + 180_000) });
+  });
+
+  it("preserves the bounded recheck when exhausted quota has no reset", () => {
+    expect(route(zeroInput([row({ limits: [limit({ remainingPercent: 0, resetsAt: null })] })])))
+      .toMatchObject({ kind: "exhausted", retryAt: iso(NOW_MS + 60_000) });
+  });
+});
+
+describe("reserve routing compatibility", () => {
+  it.each([undefined, 90, 99])("still withholds quota at the existing reserve for threshold %s", (poolThresholdPercent) => {
+    const reserve = poolThresholdPercent === 99 ? 1 : 10;
+    const reset = iso(NOW_MS + 3_600_000);
+    expect(route(input({
+      poolThresholdPercent,
+      rows: [row({ limits: [limit({ remainingPercent: reserve, resetsAt: reset })] })],
+    }))).toMatchObject({ kind: "exhausted", retryAt: reset });
   });
 });
 

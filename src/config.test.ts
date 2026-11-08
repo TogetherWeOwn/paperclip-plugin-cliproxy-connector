@@ -302,12 +302,70 @@ describe("stripTrailingSlashes (non-regex trailing-slash trim)", () => {
   });
 });
 
-describe("reserve math (kept from v1)", () => {
-  it("pool thresholdPercent derives 100 - t; per-pool override wins", () => {
-    const { config } = parseConfig(base({ reservePercent: 10, perPoolReservePercent: { "pool-x": 25 } }));
-    expect(effectiveReservePercent(config, { id: "pool-x", thresholdPercent: 90 })).toBe(25);
+describe("reserve math", () => {
+  it.each([0, 0.01, 10, 49.99])("accepts reserve %s globally and per pool", (reserve) => {
+    const { config, validation } = parseConfig(
+      base({ reservePercent: reserve, perPoolReservePercent: { "pool-x": reserve } }),
+    );
+    expect(validation.ok).toBe(true);
+    expect(config.reservePercent).toBe(reserve);
+    expect(config.perPoolReservePercent["pool-x"]).toBe(reserve);
+    expect(effectiveReservePercent(config, {})).toBe(reserve);
+    expect(effectiveReservePercent(config, { id: "pool-x", thresholdPercent: 90 })).toBe(reserve);
+  });
+
+  it.each([-1, 50, 100, 101])("still rejects finite out-of-range reserve %s", (reserve) => {
+    const { config, validation } = parseConfig(
+      base({ reservePercent: reserve, perPoolReservePercent: { "pool-x": reserve } }),
+    );
+    expect(validation.ok).toBe(false);
+    expect(validation.errors.some((e) => e.startsWith("reservePercent"))).toBe(true);
+    expect(validation.errors.some((e) => e.startsWith("perPoolReservePercent[pool-x]"))).toBe(true);
+    expect(config.perPoolReservePercent["pool-x"]).toBeUndefined();
+  });
+
+  it.each([undefined, null, NaN, Infinity, -Infinity, "0", false, {}, []])(
+    "preserves the global default and rejects a malformed override %s",
+    (reserve) => {
+      const global = parseConfig(base({ reservePercent: reserve }));
+      expect(global.validation.ok).toBe(true);
+      expect(global.config.reservePercent).toBe(10);
+      const override = parseConfig(base({ perPoolReservePercent: { "pool-x": reserve } }));
+      expect(override.validation.ok).toBe(false);
+      expect(override.validation.errors.some((e) => e.startsWith("perPoolReservePercent[pool-x]"))).toBe(true);
+      expect(override.config.perPoolReservePercent["pool-x"]).toBeUndefined();
+    },
+  );
+
+  it.each([50.01, 75, 90, 99, 100])("derives reserve from threshold %s", (thresholdPercent) => {
+    const { config } = parseConfig(base({ reservePercent: 20 }));
+    expect(effectiveReservePercent(config, { thresholdPercent })).toBe(100 - thresholdPercent);
+  });
+
+  it.each([undefined, null, NaN, Infinity, -Infinity, -1, 0, 50, 100.01, 101, "100", false, {}, []])(
+    "falls back for unusable threshold %s without widening the old range",
+    (thresholdPercent) => {
+      const { config } = parseConfig(base({ reservePercent: 20 }));
+      expect(effectiveReservePercent(config, { thresholdPercent })).toBe(20);
+      const zero = parseConfig(base({ reservePercent: 0 }));
+      expect(zero.validation.ok).toBe(true);
+      expect(effectiveReservePercent(zero.config, { thresholdPercent })).toBe(0);
+    },
+  );
+
+  it("keeps override, threshold, default precedence including zero", () => {
+    const { config, validation } = parseConfig(base({
+      reservePercent: 20,
+      perPoolReservePercent: { "pool-zero": 0, "pool-reserve": 25 },
+    }));
+    expect(validation.ok).toBe(true);
+    expect(effectiveReservePercent(config, { id: "pool-zero", thresholdPercent: 90 })).toBe(0);
+    expect(effectiveReservePercent(config, { id: "pool-reserve", thresholdPercent: 100 })).toBe(25);
+    expect(effectiveReservePercent(config, { id: "other", thresholdPercent: 100 })).toBe(0);
     expect(effectiveReservePercent(config, { id: "other", thresholdPercent: 90 })).toBe(10);
-    expect(effectiveReservePercent(config, {})).toBe(10);
+    expect(effectiveReservePercent(config, {})).toBe(20);
+    expect(parseConfig(base()).config.reservePercent).toBe(10);
+    expect(parseConfig(base()).config.perPoolReservePercent).toEqual({});
   });
 });
 
