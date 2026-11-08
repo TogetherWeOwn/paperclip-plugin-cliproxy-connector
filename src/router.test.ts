@@ -119,6 +119,52 @@ describe("single-member pools", () => {
   });
 });
 
+describe("provider aliases and native thresholds", () => {
+  const config = () => testConfig({ providers: [
+    { provider: "codex", connectionIds: ["conn-codex", "conn-sol"], completeInventory: true },
+  ] });
+
+  it("resolves both bindings to the very same provider row and inventory", () => {
+    const cfg = config();
+    expect(resolveProviderRow(cfg, "conn-sol")).toBe(resolveProviderRow(cfg, "conn-codex"));
+    expect(detectMissingConnections(cfg, ["conn-sol"])).toEqual([]);
+    expect(detectMissingConnections(cfg, ["conn-codex"])).toEqual([]);
+    expect(detectMissingConnections(cfg, ["conn-ghost"])).toHaveLength(1);
+    for (const connectionId of ["conn-codex", "conn-sol"]) {
+      const r = route(input({
+        config: cfg,
+        candidates: [{ memberId: "m-a", model: "", connectionId }],
+        rows: [row({ provider: "codex", limits: [limit({
+          id: "codex:primary", usedPercent: 100, remainingPercent: 0, allowed: false, limitReached: true,
+        })] })],
+      }));
+      expect(r.kind).toBe("exhausted");
+      expect(Object.values(r.skipped).join(" ")).not.toContain("missing-connection");
+    }
+  });
+
+  it.each([1, 50, 51, 90, 99, 100])("uses threshold %i in the actual router", (thresholdPercent) => {
+    const cfg = config();
+    const run = (usedPercent: number) => route(input({
+      config: cfg,
+      poolThresholdPercent: thresholdPercent,
+      candidates: [{ memberId: "m-a", model: "", connectionId: "conn-sol" }],
+      rows: [row({ provider: "codex", limits: [limit({
+        id: "codex:primary", usedPercent, remainingPercent: 100 - usedPercent,
+      })] })],
+    }));
+    expect(run(thresholdPercent - 0.5).kind).toBe("selected");
+    expect(run(thresholdPercent).kind).toBe("exhausted");
+  });
+
+  it("honors a zero per-pool reserve ahead of a lower native threshold", () => {
+    const cfg = testConfig({ perPoolReservePercent: { "pool-1": 0 } });
+    expect(route(input({ config: cfg, poolThresholdPercent: 50,
+      rows: [row({ limits: [limit({ usedPercent: 99, remainingPercent: 1 })] })],
+    })).kind).toBe("selected");
+  });
+});
+
 describe("two-member pools", () => {
   const twoMembers = () => [
     { memberId: "m-a", model: "model-a", connectionId: "conn-claude" },

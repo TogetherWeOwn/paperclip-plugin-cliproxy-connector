@@ -248,7 +248,7 @@ export function CliProxyPage({ context }: PluginPageProps) {
             {p.waitResumeOff && <span>wait/resume off: inventory not confirmed complete</span>}
           </div>
           <div>
-            connection {p.connectionId} · completeInventory {p.completeInventory ? "confirmed" : "not confirmed"} ·{" "}
+            connection{p.connectionIds.length === 1 ? "" : "s"} {p.connectionIds.join(", ")} · completeInventory {p.completeInventory ? "confirmed" : "not confirmed"} ·{" "}
             {p.enabledAccounts} enabled account{p.enabledAccounts === 1 ? "" : "s"}
             {p.headroomAccounts > 0 ? `, ${p.headroomAccounts} with headroom` : ""}
             {creditsPolicyText(p) ? ` · ${creditsPolicyText(p)}` : ""}

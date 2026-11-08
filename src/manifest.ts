@@ -1,4 +1,5 @@
 import type { PaperclipPluginManifestV1 } from "@paperclipai/plugin-sdk";
+import { CONNECTOR_CONFIG_SCHEMA } from "./config.js";
 
 export const PLUGIN_ID = "togetherweown.cliproxy-connector";
 export const PLUGIN_VERSION = "0.2.7";
@@ -66,12 +67,13 @@ const manifest: PaperclipPluginManifestV1 = {
     worker: "./dist/worker.js",
     ui: "./dist/ui",
   },
+  instanceConfigSchema: CONNECTOR_CONFIG_SCHEMA,
   jobs: [
     {
       jobKey: SYNC_JOB_KEY,
       displayName: "Sync CLIProxy quota",
       description:
-        "Discovers CLIProxy accounts per provider (auth-files) and per-provider quota (plugin quota routes, the pinned provider-API templates for Antigravity and Devin with one call per account per run, and the Meta download + literal-header key call at most every 45 minutes per account plus manual refresh) through the pinned safe path into the plugin cache. Runs every 5 minutes; syncIntervalMinutes above 5 widens the freshness math rather than slowing the cron.",
+        "Discovers CLIProxy accounts per provider (auth-files) and per-provider quota (plugin quota routes, the pinned provider-API templates for Antigravity and Devin with one call per account per run, and the Meta download + literal-header key call at most every 45 minutes per account plus manual refresh) through the pinned safe path into the plugin cache. Runs every 5 minutes with a one-minute minimum between syncs; syncIntervalMinutes controls freshness bounds only, not scheduler frequency.",
       schedule: "*/5 * * * *",
     },
   ],

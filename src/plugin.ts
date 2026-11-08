@@ -12,7 +12,7 @@ import type {
   PluginApiResponse,
   PluginContext,
 } from "@paperclipai/plugin-sdk";
-import { parseConfig, stripTrailingSlashes, type ConnectorConfig } from "./config.js";
+import { maxAgeMs, parseConfig, stripTrailingSlashes, type ConnectorConfig } from "./config.js";
 import { createLoopbackFetch } from "./loopback-fetch.js";
 import {
   DRIFT_LEDGER_STATE_KEY,
@@ -393,7 +393,42 @@ const plugin = definePlugin({
   },
 
   async onHealth() {
-    return { status: "ok" as const };
+    if (!boundCtx) return { status: "degraded" as const, message: "Worker is not ready." };
+    try {
+      const companies = await boundCtx.companies.list();
+      let degradedCompanies = 0;
+      const now = new Date().toISOString();
+      for (const company of companies) {
+        const ctx = boundCtx;
+        const { config, ok } = await resolveCompany(ctx, company.id);
+        const [rows, lastSync, lastFailure, rawStrike] = await Promise.all([
+          loadRows(ctx, company.id),
+          loadLastSync(ctx, company.id),
+          loadLastFailure(ctx, company.id),
+          ctx.state.get(strikeKey(strikeOriginFor(config))),
+        ]);
+        const strike = isStrikeBudget(rawStrike) ? rawStrike : emptyStrikeBudget();
+        const page = buildPageData({ now, config, rows, lastSync, lastFailure, strike });
+        const syncAge = lastSync ? Date.parse(now) - Date.parse(lastSync.finishedAt) : NaN;
+        if (!ok || !Number.isFinite(syncAge) || syncAge > maxAgeMs(config) ||
+            syncAge < -config.futureSkewSeconds * 1000 ||
+            !lastSync || lastSync.skipped || lastSync.errors.length > 0 ||
+            lastFailure || strike.disabled || strike.secretBad || page.drift.length > 0 ||
+            page.providers.length === 0 || page.providers.some((p) =>
+              p.freshness !== "fresh" || p.state === "unknown" || p.blindAccounts > 0)) {
+          degradedCompanies += 1;
+        }
+      }
+      const degraded = companies.length === 0 || degradedCompanies > 0;
+      return {
+        status: degraded ? "degraded" as const : "ok" as const,
+        message: degraded ? "Quota coverage is missing, stale, blind or failed." : "Quota coverage is fresh.",
+        details: { companies: companies.length, degradedCompanies },
+      };
+    } catch {
+      // Health must not echo host errors or configuration into diagnostics.
+      return { status: "degraded" as const, message: "Could not read connector health state." };
+    }
   },
 });
 

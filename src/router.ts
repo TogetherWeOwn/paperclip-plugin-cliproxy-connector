@@ -35,7 +35,7 @@
  */
 
 import { aggregateProvider, type ProviderAssessment } from "./aggregate.js";
-import type { ConnectorConfig, ProviderEntry } from "./config.js";
+import { providerConnectionIds, type ConnectorConfig, type ProviderEntry } from "./config.js";
 import type { AccountUsageRow } from "./types.js";
 
 export interface RouterCandidate {
@@ -75,7 +75,7 @@ export function resolveProviderRow(
   connectionId: string | null,
 ): ProviderEntry | null {
   if (!connectionId) return null;
-  return config.providers.find((p) => p.connectionId === connectionId) ?? null;
+  return config.providers.find((p) => providerConnectionIds(p).includes(connectionId)) ?? null;
 }
 
 /**
@@ -96,7 +96,7 @@ export function detectMissingConnections(
   pooledConnectionIds: Array<string | null>,
 ): ProviderEntry[] {
   const pooled = new Set(pooledConnectionIds.filter((c): c is string => !!c));
-  return config.providers.filter((p) => !pooled.has(p.connectionId));
+  return config.providers.filter((p) => !providerConnectionIds(p).some((id) => pooled.has(id)));
 }
 
 interface Assessment {

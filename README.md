@@ -92,6 +92,13 @@ the operator. You read redacted output only.
    `apiKeyUsageEnabled` defaults to `false`: the request-count read is opt-in (see the
    Usage & Quota section below).
    `managementKeyHeader` has no default on purpose; legacy string-UUID secrets fail closed.
+   Multiple gateway connections can share one provider row using
+   `connectionIds: ["<primary-connection-id>", "<alias-connection-id>"]` (for example,
+   different wire protocols over the same Codex account inventory). The legacy
+   `connectionId` remains supported; when both fields are supplied their union is
+   used. A connection cannot appear under two providers: ambiguous mappings fail
+   configuration validation, rather than selecting whichever row appears first.
+   Aliases share one aggregate and never duplicate the account inventory.
    `completeInventory: true` means you confirm this provider has no hidden config-key
    credentials (default `false`: the provider can only be `allowed`/`unknown`, never
    `exhausted`). `audienceConfirmed` acknowledges the page shows upstream account quota
@@ -189,9 +196,9 @@ The plugin ships two pages over the same sync cache:
 | `clientApiKeySecretRef` | — (warns when missing) | `secret_ref` object (same shape) for the client API key (`GET /v1/models`). Same never-persisted rule. Missing → derivation + overlap detection off. |
 | `openRouterSecretRef` | — (page shows "not configured") | Dedicated `secret_ref` object for the OpenRouter key (spend read only). Never a CLIProxy key; resolved per run, never persisted. |
 | `apiKeyUsageEnabled` | `false` | Opt-in request-count read (`GET /v0/management/api-key-usage`, aggregated by provider in the worker). Non-boolean fails closed. |
-| `syncIntervalMinutes` | `5` | The cron runs every 5 min; larger values make runs skip. Range 1–60. |
-| `reservePercent` | `10` | Default reserve; per-pool `thresholdPercent` derives `100 − t`. |
-| `perPoolReservePercent` | `{}` | Per-pool override, wins over everything. |
+| `syncIntervalMinutes` | `5` | Freshness baseline only, range 1–60. The cron always runs every 5 min, with a fixed 1-minute minimum between syncs; this setting does not change polling frequency. |
+| `reservePercent` | `10` | Default reserve within `[0, 50)`; `0` holds nothing back. A native integer `thresholdPercent` from 1 through 100 derives `100 − t`, including zero reserve at 100. Invalid or absent thresholds use the company default. |
+| `perPoolReservePercent` | `{}` | Per-pool reserve within `[0, 50)`, including `0`; wins over the native threshold and company default. |
 | `recheckSeconds` | `60` | Wait before re-probing unknown/stale telemetry. |
 | `maxAgeMultiplier` / `graceMultiplier` | `2` / `3` | Freshness = sync interval × 2; grace = freshness × 3. |
 | `providers` | `[]` | One `{ provider, connectionId, completeInventory }` row per CLIProxy provider family. The provider word is the raw auth-file string (e.g. `cloudflare-workers-ai`); any string is accepted, duplicates error, and a row that matches no accounts drift-warns as having zero enabled accounts. Empty warns. Optional `creditsCountAsHeadroom: true` (default off) lets a fresh positive Codex credits reading (`x-codex-credits-has-credits: true` with a positive or absent `x-codex-credits-balance`, or `x-codex-credits-unlimited: true`) count as headroom while quota windows are exhausted, for providers where the owner allows credit spend. `has-credits: false` or a non-positive balance blocks again; a 429 cooldown, `retry-after` or an unavailable account still gates; a stale reading is `unknown` (fail open). Only `codex` reports credits; other providers warn. |

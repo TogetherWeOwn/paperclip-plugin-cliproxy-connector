@@ -249,9 +249,66 @@ describe("config validation and health", () => {
     expect((bad.errors ?? []).length).toBeGreaterThan(0);
   });
 
-  it("reports ok health", async () => {
+  async function healthyCache() {
+    const { harness, fetchMock } = await setup();
+    await harness.runJob(SYNC_JOB_KEY);
+    const rows = harness.getState(stateKey(ROWS_STATE_KEY)) as Record<string, AccountUsageRow>;
+    const now = new Date().toISOString();
+    for (const row of Object.values(rows)) {
+      row.checkedAt = now;
+      row.limits.forEach((limit) => { limit.observedAt = now; });
+    }
+    await harness.ctx.state.set(stateKey(ROWS_STATE_KEY), rows as never);
+    fetchMock.mockClear();
+    return { harness, fetchMock, rows };
+  }
+
+  it("reports degraded before the first sync, not an unconditional success", async () => {
     await setup();
-    expect(await plugin.definition.onHealth!()).toEqual({ status: "ok" });
+    expect(await plugin.definition.onHealth!()).toMatchObject({ status: "degraded" });
+  });
+
+  it("reports ok only with fresh non-blind coverage, without probing or resolving secrets", async () => {
+    const { harness, fetchMock } = await healthyCache();
+    const secretSpy = vi.spyOn(harness.ctx.secrets, "resolve");
+    const stateSpy = vi.spyOn(harness.ctx.state, "set");
+    expect(await plugin.definition.onHealth!()).toMatchObject({ status: "ok" });
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(secretSpy).not.toHaveBeenCalled();
+    expect(stateSpy).not.toHaveBeenCalled();
+  });
+
+  it.each(["stale-cache", "stale-observation", "blind", "failed", "strikes", "stale-sync"])(
+    "reports degraded for %s", async (condition) => {
+      const { harness, rows } = await healthyCache();
+      const row = Object.values(rows)[0]!;
+      const old = new Date(Date.now() - 60 * 60_000).toISOString();
+      if (condition === "stale-cache") row.checkedAt = old;
+      if (condition === "stale-observation") row.limits.forEach((limit) => { limit.observedAt = old; });
+      if (condition === "blind") { row.quotaBlind = true; row.limits = []; }
+      if (condition === "failed") await harness.ctx.state.set(stateKey(LAST_ERROR_STATE_KEY), {
+        attemptedAt: new Date().toISOString(), message: KEY,
+      } as never);
+      if (condition === "strikes") await harness.ctx.state.set(instanceStrikeKey(), {
+        failures: [], disabled: true, secretBad: true,
+      } as never);
+      if (condition === "stale-sync") {
+        const summary = harness.getState(stateKey(LAST_SYNC_STATE_KEY)) as Record<string, unknown>;
+        await harness.ctx.state.set(stateKey(LAST_SYNC_STATE_KEY), { ...summary, finishedAt: old } as never);
+      }
+      await harness.ctx.state.set(stateKey(ROWS_STATE_KEY), rows as never);
+      const health = await plugin.definition.onHealth!();
+      expect(health.status).toBe("degraded");
+      expect(JSON.stringify(health)).not.toContain(KEY);
+    },
+  );
+
+  it("fails closed on unreadable health state without echoing host error details", async () => {
+    const { harness } = await healthyCache();
+    vi.spyOn(harness.ctx.state, "get").mockRejectedValue(new Error(KEY));
+    const health = await plugin.definition.onHealth!();
+    expect(health.status).toBe("degraded");
+    expect(JSON.stringify(health)).not.toContain(KEY);
   });
 });
 

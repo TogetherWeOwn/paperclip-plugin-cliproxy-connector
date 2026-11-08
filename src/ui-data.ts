@@ -19,7 +19,7 @@
  */
 
 import { aggregateProvider, creditsPositive } from "./aggregate.js";
-import { graceMs, maxAgeMs, type ConnectorConfig } from "./config.js";
+import { graceMs, maxAgeMs, providerConnectionIds, type ConnectorConfig } from "./config.js";
 import { providerDisplayName } from "./models.js";
 import { normalizeProvider, quotaBlindReason } from "./parsers.js";
 import { strikeWaitUntil } from "./sync.js";
@@ -120,6 +120,7 @@ export interface ProviderCard {
   /** Human provider label for the UI (raw word fallback, never routing). */
   displayName: string;
   connectionId: string;
+  connectionIds: string[];
   completeInventory: boolean;
   /** Provider row opt-in: positive paid credits count as headroom (TWO-2107). */
   creditsCountAsHeadroom: boolean;
@@ -481,6 +482,7 @@ function buildProviderCards(args: {
         provider: entry.provider,
         displayName: providerDisplayName(entry.provider),
         connectionId: entry.connectionId,
+        connectionIds: providerConnectionIds(entry),
         completeInventory: entry.completeInventory,
         creditsCountAsHeadroom: entry.creditsCountAsHeadroom === true,
         creditHeadroomAccounts: verdict.creditHeadroomAccounts,

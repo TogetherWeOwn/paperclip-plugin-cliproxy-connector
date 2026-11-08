@@ -87,6 +87,17 @@ const LAST_SYNC = {
 };
 
 describe("page data (per-provider)", () => {
+  it("shows every connection alias without duplicating the provider or its accounts", () => {
+    const config = testConfig();
+    config.providers = [{ provider: "codex", connectionId: "conn-codex", connectionIds: ["conn-sol"], completeInventory: true }];
+    const page = buildPageData({ now: NOW, config,
+      rows: { "acct-aaa": row({ provider: "codex" }) }, lastSync: LAST_SYNC, strike: emptyStrikeBudget(),
+    });
+    expect(page.providers).toHaveLength(1);
+    expect(page.providers[0]?.connectionIds).toEqual(["conn-codex", "conn-sol"]);
+    expect(page.providers[0]?.accounts).toHaveLength(1);
+    expect(page.providers[0]?.enabledAccounts).toBe(1);
+  });
   it("renders one card per providers[] row with aggregate state, connection, and inventory flag", () => {
     const page = buildPageData({
       now: NOW,
