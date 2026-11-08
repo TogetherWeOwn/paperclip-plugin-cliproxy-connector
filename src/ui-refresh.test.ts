@@ -127,10 +127,11 @@ for (const Component of components) {
       let buckets: Record<string, unknown>[] = [feature, weekly];
       sdk.read.mockImplementation((key: string) => {
         const now = new Date(Date.now()).toISOString();
-        const row = parseAuthFiles({ files: [{ id: "hopper", provider: "hopper", auth_index: "h" }] }, {
+        const parsed = parseAuthFiles({ files: [{ id: "hopper", provider: "hopper", auth_index: "h" }] }, {
           now, allowLists: DEFAULT_PROVIDER_WINDOWS,
           pluginPayloadByAuthIndex: new Map([["h", { groups: [{ buckets }] }]]),
         }).accounts[0];
+        const row: AccountUsageRow = { ...parsed, source: "plugin:cliproxy-connector", lastError: null };
         const args = { now, config, rows: { [row.key]: row }, lastSync: null, strike: emptyStrikeBudget() };
         return key === "cliproxy-usage" ? buildUsageData(args) : buildPageData(args);
       });
