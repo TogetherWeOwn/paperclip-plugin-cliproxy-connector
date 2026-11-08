@@ -190,8 +190,8 @@ The plugin ships two pages over the same sync cache:
 | `openRouterSecretRef` | — (page shows "not configured") | Dedicated `secret_ref` object for the OpenRouter key (spend read only). Never a CLIProxy key; resolved per run, never persisted. |
 | `apiKeyUsageEnabled` | `false` | Opt-in request-count read (`GET /v0/management/api-key-usage`, aggregated by provider in the worker). Non-boolean fails closed. |
 | `syncIntervalMinutes` | `5` | The cron runs every 5 min; larger values make runs skip. Range 1–60. |
-| `reservePercent` | `10` | Default reserve; per-pool `thresholdPercent` derives `100 − t`. |
-| `perPoolReservePercent` | `{}` | Per-pool override, wins over everything. |
+| `reservePercent` | `10` | Default reserve, numeric range `[0, 50)`. Zero uses quota until exhausted. Missing, non-numeric or non-finite values retain the default; finite out-of-range values fail validation. |
+| `perPoolReservePercent` | `{}` | Per-pool numeric reserve overrides in `[0, 50)`, including zero; wins over the pool threshold and default. Invalid override values fail validation. |
 | `recheckSeconds` | `60` | Wait before re-probing unknown/stale telemetry. |
 | `maxAgeMultiplier` / `graceMultiplier` | `2` / `3` | Freshness = sync interval × 2; grace = freshness × 3. |
 | `providers` | `[]` | One `{ provider, connectionId, completeInventory }` row per CLIProxy provider family. The provider word is the raw auth-file string (e.g. `cloudflare-workers-ai`); any string is accepted, duplicates error, and a row that matches no accounts drift-warns as having zero enabled accounts. Empty warns. Optional `creditsCountAsHeadroom: true` (default off) lets a fresh positive Codex credits reading (`x-codex-credits-has-credits: true` with a positive or absent `x-codex-credits-balance`, or `x-codex-credits-unlimited: true`) count as headroom while quota windows are exhausted, for providers where the owner allows credit spend. `has-credits: false` or a non-positive balance blocks again; a 429 cooldown, `retry-after` or an unavailable account still gates; a stale reading is `unknown` (fail open). Only `codex` reports credits; other providers warn. |
@@ -202,6 +202,24 @@ The plugin ships two pages over the same sync cache:
 | `audienceConfirmed` | `false` | Page shows upstream quota state; confirm the audience, then set `true`. |
 | `ignoredProviders` | `[]` | Provider words (lowercased, e.g. `openrouter`) whose `unconfigured-provider` drift is explicitly accepted: no finding, no activity row; shown on the page as accepted. |
 | `ignoredAuthFileRefs` | `[]` | Accepted `auth file <hash8>` refs (bare hash or full page ref, e.g. `auth file c246e171`) whose `untrusted-auth-file` drift is explicitly accepted. Same accepted-not-alerted rule; typos fail validation loudly. |
+
+### Reserve precedence and exhaustion
+
+The effective reserve is the matching `perPoolReservePercent` override, otherwise
+`100 − thresholdPercent` for a finite numeric pool threshold in `(50, 100]`,
+otherwise `reservePercent` (default `10`). A threshold of `100` therefore means
+zero reserve; `99` still means 1% and `90` still means 10%. Missing, non-numeric,
+non-finite or out-of-range thresholds fall back to the plugin default, not a new
+accepted threshold range. Reserve upper bound `50` and threshold lower bound `50`
+remain excluded. Zero overrides are values, not missing settings.
+
+With zero reserve, fresh positive remaining quota can provide headroom, but zero
+remaining quota is still exhausted. Explicit provider denials, limit-reached
+signals, `retry-after`, account cooldowns, freshness/inventory rules and Codex
+credits opt-in behavior are unchanged. Exhaustion still returns reset-aware
+`retryAt` (or the bounded recheck when no reset is known); core owns wait/resume.
+Native budgets and spend caps remain outside this connector. Selecting zero
+reserve does not authorize paid credits or change any pool membership.
 
 ## Endpoint assumptions
 

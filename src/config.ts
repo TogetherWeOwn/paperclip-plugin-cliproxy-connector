@@ -257,8 +257,8 @@ export function parseConfig(raw: unknown): { config: ConnectorConfig; validation
   }
 
   const reservePercent = num(r.reservePercent, DEFAULTS.reservePercent);
-  if (!(reservePercent > 0 && reservePercent < 50)) {
-    errors.push(`reservePercent must be within (0, 50); got ${reservePercent}.`);
+  if (!(reservePercent >= 0 && reservePercent < 50)) {
+    errors.push(`reservePercent must be within [0, 50); got ${reservePercent}.`);
   }
   const syncIntervalMinutes = num(r.syncIntervalMinutes, DEFAULTS.syncIntervalMinutes);
   if (!(syncIntervalMinutes >= 1 && syncIntervalMinutes <= 60)) {
@@ -415,8 +415,8 @@ export function parseConfig(raw: unknown): { config: ConnectorConfig; validation
   const perPoolIn = (r.perPoolReservePercent ?? {}) as Record<string, unknown>;
   if (isPlainObject(perPoolIn)) {
     for (const [poolId, value] of Object.entries(perPoolIn)) {
-      if (typeof value !== "number" || !(value > 0 && value < 50)) {
-        errors.push(`perPoolReservePercent[${poolId}] must be within (0, 50).`);
+      if (typeof value !== "number" || !(value >= 0 && value < 50)) {
+        errors.push(`perPoolReservePercent[${poolId}] must be within [0, 50).`);
         continue;
       }
       perPoolReservePercent[poolId] = value;
@@ -617,7 +617,8 @@ export function isKnownProviderWord(provider: string): boolean {
  * Effective reserve for a pool (percent remaining that still routes).
  *
  * Precedence: per-pool plugin override → pool `thresholdPercent` derived
- * (`100 - thresholdPercent`, the #17007 semantics) → company default.
+ * (`100 - thresholdPercent` for 50 < t <= 100) → company default.
+ * Zero reserve admits positive remaining quota, not actual exhaustion.
  * Never a hard `=== 90` gate: a pool without a usable threshold falls back
  * to the plugin default instead of refusing to route.
  */
@@ -629,7 +630,7 @@ export function effectiveReservePercent(
     return config.perPoolReservePercent[pool.id] as number;
   }
   const t = pool.thresholdPercent;
-  if (typeof t === "number" && Number.isFinite(t) && t > 50 && t < 100) {
+  if (typeof t === "number" && Number.isFinite(t) && t > 50 && t <= 100) {
     return 100 - t;
   }
   return config.reservePercent;
