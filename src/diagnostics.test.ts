@@ -11,7 +11,7 @@ import type { AccountUsageRow } from "./types.js";
 const NOW = "2026-11-08T02:00:00.000Z";
 const CANARY = "CREDENTIAL-CANARY-NOT-FOR-DIAGNOSTICS";
 const configRaw = {
-  cliproxyBaseUrl: "http://127.0.0.1:8317", managementSecretRef: { uid: CANARY }, audienceConfirmed: true,
+  cliproxyBaseUrl: "http://127.0.0.1:8317", managementKeyHeader: "X-Test-Key", managementSecretRef: { uid: CANARY }, audienceConfirmed: true,
   providers: [{ provider: "claude", connectionIds: ["conn-a", "conn-alias"], completeInventory: true }],
 };
 function row(): AccountUsageRow {

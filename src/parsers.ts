@@ -502,6 +502,13 @@ function makeLimit(init: {
   metrics?: string[] | null;
   viaProviderApi?: boolean | null;
   spendControlBlocked?: boolean;
+  scope?: string | null;
+  windowDurationSeconds?: number | null;
+  resetInterval?: string | null;
+  used?: number | null;
+  limit?: number | null;
+  remaining?: number | null;
+  unit?: string | null;
 }): UsageLimitRow {
   return {
     id: init.id,
@@ -516,6 +523,15 @@ function makeLimit(init: {
     models: init.models ?? null,
     metrics: init.metrics ?? null,
     viaProviderApi: init.viaProviderApi ?? null,
+    ...("scope" in init ? {
+      scope: init.scope ?? null,
+      windowDurationSeconds: init.windowDurationSeconds ?? null,
+      resetInterval: init.resetInterval ?? null,
+      used: init.used ?? null,
+      limit: init.limit ?? null,
+      remaining: init.remaining ?? null,
+      unit: init.unit ?? null,
+    } : {}),
     ...(init.spendControlBlocked ? { spendControlBlocked: true } : {}),
   };
 }
