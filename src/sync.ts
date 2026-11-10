@@ -1167,15 +1167,18 @@ async function fetchServedSets(
       continue;
     }
     const parsed = parseModelsPayload(payload);
+    for (const w of parsed.warnings) {
+      warnings.push(`${[...providers].sort().join(", ")} served set (${fileRef}): ${w}`);
+    }
+    // HTTP success alone does not prove membership: malformed shapes keep
+    // this file's quota evidence and the provider's owned_by fallback eligible.
+    if (!parsed.recognized) continue;
     ok += 1;
-    // A successful answer — even an empty set — is evidence: this file's live
+    // A recognized list — even an empty set — is evidence: this file's live
     // membership supersedes its historical model_quotas keys (see the call
     // site), so a stale quota key cannot fabricate an overlap.
     okFiles.add(name);
     for (const provider of providers) okProviders.add(provider);
-    for (const w of parsed.warnings) {
-      warnings.push(`${[...providers].sort().join(", ")} served set (${fileRef}): ${w}`);
-    }
     for (const m of parsed.models) {
       for (const provider of providers) {
         let set = byProvider.get(provider);
@@ -1197,7 +1200,7 @@ async function fetchServedSets(
       }
     }
   }
-  if (ok === 0 && notFound > 0 && warnings.length > 0) {
+  if (ok === 0 && notFound === providersByName.size && warnings.length > 0) {
     warnings.push(
       "the served-set endpoint returned 404 for every enabled auth file (older CLIProxy builds lack it); overlap detection falls back to the model_quotas + owned_by heuristic this run.",
     );
