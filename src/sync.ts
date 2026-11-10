@@ -1166,11 +1166,12 @@ async function fetchServedSets(
       );
       continue;
     }
-    const parsed = parseModelsPayload(payload);
+    const parsed = parseModelsPayload(payload, { emptyIsValid: true });
     ok += 1;
     // A successful answer — even an empty set — is evidence: this file's live
     // membership supersedes its historical model_quotas keys (see the call
-    // site), so a stale quota key cannot fabricate an overlap.
+    // site), so a stale quota key cannot fabricate an overlap. A found empty
+    // list is valid here and must not emit the catalog-wide empty warning.
     okFiles.add(name);
     for (const provider of providers) okProviders.add(provider);
     for (const w of parsed.warnings) {
