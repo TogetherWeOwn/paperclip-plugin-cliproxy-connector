@@ -140,6 +140,48 @@ describe("parseModelsPayload", () => {
     }
   });
 
+  it("preserves the default /v1/models empty-payload warning", () => {
+    for (const payload of [[], { data: [] }, { models: [] }, { items: [] }, { results: [] }]) {
+      expect(parseModelsPayload(payload)).toEqual({
+        models: [],
+        warnings: ["models payload holds no entries; no provider has proven models this run."],
+        recognized: true,
+      });
+    }
+  });
+
+  it("treats a found empty list as valid evidence for per-file served-set fetches", () => {
+    // Empty live membership means this credential serves nothing, not that
+    // the entire catalog has no proven models.
+    for (const payload of [[], { data: [] }, { models: [] }, { items: [] }, { results: [] }]) {
+      expect(parseModelsPayload(payload, { emptyIsValid: true })).toEqual({
+        models: [],
+        warnings: [],
+        recognized: true,
+      });
+    }
+  });
+
+  it("still warns on malformed shapes even for per-file served-set fetches", () => {
+    for (const payload of [{}, null, "oops", { error: "boom" }, { data: null }, { models: {} }]) {
+      const expected = {
+        models: [],
+        warnings: ["models payload holds no entries; no provider has proven models this run."],
+        recognized: false,
+      };
+      expect(parseModelsPayload(payload)).toEqual(expected);
+      expect(parseModelsPayload(payload, { emptyIsValid: true })).toEqual(expected);
+    }
+  });
+
+  it("still warns on unusable entries when empty lists are valid", () => {
+    expect(parseModelsPayload({ data: [{}] }, { emptyIsValid: true })).toEqual({
+      models: [],
+      warnings: ["skipping a /v1/models entry without a usable id."],
+      recognized: true,
+    });
+  });
+
   it("recognizes every supported list container independently of warnings", () => {
     for (const wrap of [
       (entries: unknown[]) => entries,

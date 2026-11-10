@@ -835,6 +835,64 @@ describe("served-model catalog (/v1/models + auth-files)", () => {
     assertNoKeyLeak(s);
   });
 
+  it("an empty served set supersedes owned_by and quota keys without an empty-payload warning", async () => {
+    const fetchEmptyServedSet = vi.fn(async (input: string | URL | Request): Promise<Response> => {
+      const url = new URL(String(input));
+      if (url.pathname === "/v0/management/auth-files") {
+        return jsonResponse(200, [{
+          id: "claude-1",
+          name: "claude-file",
+          provider: "claude",
+          model_quotas: {
+            "claude-opus-4-5": {
+              observed_at: NOW,
+              signals: { "anthropic-ratelimit-unified-5h-utilization": "0.2" },
+            },
+          },
+        }]);
+      }
+      if (url.pathname === "/v0/management/auth-files/models") {
+        return jsonResponse(200, { data: [] });
+      }
+      if (url.pathname === "/v1/models") {
+        return jsonResponse(200, { data: [{ id: "claude-opus-4-5", owned_by: "anthropic" }] });
+      }
+      return new Response("not found", { status: 404 });
+    });
+    const s = store();
+    const summary = await runSync(deps(s, fetchEmptyServedSet as unknown as typeof fetch), {
+      running: false,
+    });
+    expect(summary.skipped).toBe(false);
+    expect(summary.errors.some((e) => e.includes("holds no entries"))).toBe(false);
+    expect(summary.providerModels?.claude ?? []).toEqual([]);
+    expect(summary.modelOverlaps).toEqual([]);
+    expect(s.strike.failures).toHaveLength(0);
+    assertNoKeyLeak(s);
+  });
+
+  it("an empty /v1/models catalog still emits its original warning", async () => {
+    const fetchEmptyCatalog = vi.fn(async (input: string | URL | Request): Promise<Response> => {
+      const url = new URL(String(input));
+      if (url.pathname === "/v0/management/auth-files") {
+        return jsonResponse(200, [{ id: "claude-1", name: "claude-file", provider: "claude" }]);
+      }
+      if (url.pathname === "/v0/management/auth-files/models" || url.pathname === "/v1/models") {
+        return jsonResponse(200, { data: [] });
+      }
+      return new Response("not found", { status: 404 });
+    });
+    const s = store();
+    const summary = await runSync(deps(s, fetchEmptyCatalog as unknown as typeof fetch), {
+      running: false,
+    });
+    expect(summary.skipped).toBe(false);
+    expect(summary.errors.filter((e) => e.includes("holds no entries"))).toEqual([
+      "/v1/models: models payload holds no entries; no provider has proven models this run.",
+    ]);
+    assertNoKeyLeak(s);
+  });
+
   it.each([
     { label: "error object", payload: { error: "boom" }, expected: ["owned-model", "quota-model"], warns: true },
     { label: "missing list", payload: {}, expected: ["owned-model", "quota-model"], warns: true },
@@ -842,7 +900,7 @@ describe("served-model catalog (/v1/models + auth-files)", () => {
     { label: "non-array list", payload: { models: {} }, expected: ["owned-model", "quota-model"], warns: true },
     { label: "null payload", payload: null, expected: ["owned-model", "quota-model"], warns: true },
     ...[[], { data: [] }, { models: [] }, { items: [] }, { results: [] }].map((payload, i) => ({
-      label: `recognized empty list ${i}`, payload, expected: [], warns: true,
+      label: `recognized empty list ${i}`, payload, expected: [], warns: false,
     })),
     { label: "nonempty list", payload: { data: [{ id: "live-model" }] }, expected: ["live-model"], warns: false },
     { label: "mixed entries", payload: { data: [null, {}, { id: "live-model" }] }, expected: ["live-model"], warns: true },
@@ -922,7 +980,7 @@ describe("served-model catalog (/v1/models + auth-files)", () => {
     expect(summary.providerModels?.antigravity).toEqual(["live-model"]);
     expect(summary.providerModels?.meta).toEqual(["meta-model"]);
     expect(summary.modelOverlaps).toEqual([]);
-    expect(summary.errors.filter((e) => e.includes("served set (auth file"))).toHaveLength(3);
+    expect(summary.errors.filter((e) => e.includes("served set (auth file"))).toHaveLength(2);
     expect(summary.errors.some((e) => e.includes("404 for every enabled auth file"))).toBe(false);
     expect(s.strike.failures).toHaveLength(0);
     assertNoKeyLeak(s);

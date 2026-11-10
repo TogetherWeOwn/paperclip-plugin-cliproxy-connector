@@ -109,8 +109,15 @@ function asObj(v: unknown): Json | null {
  * (`{data: [...]}`), a `{models: [...]}` wrapper, or a bare array. Entries
  * accept `{id, owned_by|ownedBy|owner}` objects or plain id strings. Entries
  * without a usable id are skipped with a warning — never trusted.
+ *
+ * Per-file served-set fetches pass `{ emptyIsValid: true }`: a found empty
+ * list means this credential serves nothing. Unrecognised shapes still warn.
+ * This option changes diagnostics only, not evidence eligibility.
  */
-export function parseModelsPayload(payload: unknown): {
+export function parseModelsPayload(
+  payload: unknown,
+  opts?: { emptyIsValid?: boolean },
+): {
   models: ServedModel[];
   warnings: string[];
   /** A supported list container was found, even if empty or containing unusable entries. */
@@ -129,7 +136,9 @@ export function parseModelsPayload(payload: unknown): {
   const recognized = list !== undefined;
   const entries = list ?? [];
   if (entries.length === 0) {
-    warnings.push("models payload holds no entries; no provider has proven models this run.");
+    if (!(recognized && opts?.emptyIsValid)) {
+      warnings.push("models payload holds no entries; no provider has proven models this run.");
+    }
     return { models, warnings, recognized };
   }
   const seen = new Set<string>();
