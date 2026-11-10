@@ -117,7 +117,12 @@ function asObj(v: unknown): Json | null {
 export function parseModelsPayload(
   payload: unknown,
   opts?: { emptyIsValid?: boolean },
-): { models: ServedModel[]; warnings: string[] } {
+): {
+  models: ServedModel[];
+  warnings: string[];
+  /** A supported list container was found, even if empty or containing unusable entries. */
+  recognized: boolean;
+} {
   const warnings: string[] = [];
   const models: ServedModel[] = [];
   const root = asObj(payload);
@@ -128,12 +133,13 @@ export function parseModelsPayload(
           .map((k) => (root as Json)[k])
           .find((v) => Array.isArray(v)) as unknown[] | undefined)
       : undefined;
+  const recognized = list !== undefined;
   const entries = list ?? [];
   if (entries.length === 0) {
-    if (!(list !== undefined && opts?.emptyIsValid)) {
+    if (!(recognized && opts?.emptyIsValid)) {
       warnings.push("models payload holds no entries; no provider has proven models this run.");
     }
-    return { models, warnings };
+    return { models, warnings, recognized };
   }
   const seen = new Set<string>();
   for (const e of entries) {
@@ -154,7 +160,7 @@ export function parseModelsPayload(
       displayName: scrubDisplayName(displayRaw),
     });
   }
-  return { models, warnings };
+  return { models, warnings, recognized };
 }
 
 /** Namespace prefix of `ns/rest`, or null for bare ids. */

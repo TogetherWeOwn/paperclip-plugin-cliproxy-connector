@@ -145,6 +145,7 @@ describe("parseModelsPayload", () => {
       expect(parseModelsPayload(payload)).toEqual({
         models: [],
         warnings: ["models payload holds no entries; no provider has proven models this run."],
+        recognized: true,
       });
     }
   });
@@ -156,6 +157,7 @@ describe("parseModelsPayload", () => {
       expect(parseModelsPayload(payload, { emptyIsValid: true })).toEqual({
         models: [],
         warnings: [],
+        recognized: true,
       });
     }
   });
@@ -165,6 +167,7 @@ describe("parseModelsPayload", () => {
       const expected = {
         models: [],
         warnings: ["models payload holds no entries; no provider has proven models this run."],
+        recognized: false,
       };
       expect(parseModelsPayload(payload)).toEqual(expected);
       expect(parseModelsPayload(payload, { emptyIsValid: true })).toEqual(expected);
@@ -175,7 +178,52 @@ describe("parseModelsPayload", () => {
     expect(parseModelsPayload({ data: [{}] }, { emptyIsValid: true })).toEqual({
       models: [],
       warnings: ["skipping a /v1/models entry without a usable id."],
+      recognized: true,
     });
+  });
+
+  it("recognizes every supported list container independently of warnings", () => {
+    for (const wrap of [
+      (entries: unknown[]) => entries,
+      (entries: unknown[]) => ({ data: entries }),
+      (entries: unknown[]) => ({ models: entries }),
+      (entries: unknown[]) => ({ items: entries }),
+      (entries: unknown[]) => ({ results: entries }),
+    ]) {
+      const cases: Array<{ entries: unknown[]; ids: string[]; warns: boolean }> = [
+        { entries: [], ids: [], warns: true },
+        { entries: ["live-model"], ids: ["live-model"], warns: false },
+        { entries: [{ id: "live-model" }, null], ids: ["live-model"], warns: true },
+        { entries: [null, {}], ids: [], warns: true },
+      ];
+      for (const { entries, ids, warns } of cases) {
+        const parsed = parseModelsPayload(wrap(entries));
+        expect(parsed.recognized).toBe(true);
+        expect(parsed.models.map((m) => m.id)).toEqual(ids);
+        expect(parsed.warnings.length > 0).toBe(warns);
+      }
+    }
+  });
+
+  it("does not recognize missing or non-array list containers", () => {
+    for (const payload of [
+      undefined, null, "oops", 42, true, {}, { error: "boom" },
+      { data: null }, { models: {} }, { items: "oops" }, { results: 42 },
+    ]) {
+      const parsed = parseModelsPayload(payload);
+      expect(parsed.recognized).toBe(false);
+      expect(parsed.models).toEqual([]);
+      expect(parsed.warnings.length).toBeGreaterThan(0);
+    }
+    // Keep the parser's existing first-array precedence, including empty arrays.
+    expect(parseModelsPayload({ data: null, models: [] }).recognized).toBe(true);
+    expect(parseModelsPayload({ data: [], models: ["ignored"] }).models).toEqual([]);
+  });
+
+  it("warns on an empty payload instead of claiming models", () => {
+    const { models, warnings } = parseModelsPayload({ data: [] });
+    expect(models).toEqual([]);
+    expect(warnings.length).toBeGreaterThan(0);
   });
 });
 
