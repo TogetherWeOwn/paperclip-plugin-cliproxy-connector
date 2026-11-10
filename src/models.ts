@@ -110,20 +110,27 @@ function asObj(v: unknown): Json | null {
  * accept `{id, owned_by|ownedBy|owner}` objects or plain id strings. Entries
  * without a usable id are skipped with a warning — never trusted.
  */
-export function parseModelsPayload(payload: unknown): { models: ServedModel[]; warnings: string[] } {
+export function parseModelsPayload(payload: unknown): {
+  models: ServedModel[];
+  warnings: string[];
+  /** A supported list container was found, even if empty or containing unusable entries. */
+  recognized: boolean;
+} {
   const warnings: string[] = [];
   const models: ServedModel[] = [];
   const root = asObj(payload);
-  const entries: unknown[] = Array.isArray(payload)
+  const list: unknown[] | undefined = Array.isArray(payload)
     ? payload
     : root
       ? (["data", "models", "items", "results"]
           .map((k) => (root as Json)[k])
-          .find((v) => Array.isArray(v)) as unknown[]) ?? []
-      : [];
+          .find((v) => Array.isArray(v)) as unknown[] | undefined)
+      : undefined;
+  const recognized = list !== undefined;
+  const entries = list ?? [];
   if (entries.length === 0) {
     warnings.push("models payload holds no entries; no provider has proven models this run.");
-    return { models, warnings };
+    return { models, warnings, recognized };
   }
   const seen = new Set<string>();
   for (const e of entries) {
@@ -144,7 +151,7 @@ export function parseModelsPayload(payload: unknown): { models: ServedModel[]; w
       displayName: scrubDisplayName(displayRaw),
     });
   }
-  return { models, warnings };
+  return { models, warnings, recognized };
 }
 
 /** Namespace prefix of `ns/rest`, or null for bare ids. */

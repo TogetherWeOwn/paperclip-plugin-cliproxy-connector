@@ -835,6 +835,125 @@ describe("served-model catalog (/v1/models + auth-files)", () => {
     assertNoKeyLeak(s);
   });
 
+  it.each([
+    { label: "error object", payload: { error: "boom" }, expected: ["owned-model", "quota-model"], warns: true },
+    { label: "missing list", payload: {}, expected: ["owned-model", "quota-model"], warns: true },
+    { label: "null list", payload: { data: null }, expected: ["owned-model", "quota-model"], warns: true },
+    { label: "non-array list", payload: { models: {} }, expected: ["owned-model", "quota-model"], warns: true },
+    { label: "null payload", payload: null, expected: ["owned-model", "quota-model"], warns: true },
+    ...[[], { data: [] }, { models: [] }, { items: [] }, { results: [] }].map((payload, i) => ({
+      label: `recognized empty list ${i}`, payload, expected: [], warns: true,
+    })),
+    { label: "nonempty list", payload: { data: [{ id: "live-model" }] }, expected: ["live-model"], warns: false },
+    { label: "mixed entries", payload: { data: [null, {}, { id: "live-model" }] }, expected: ["live-model"], warns: true },
+    { label: "unusable entries", payload: { data: [null, {}] }, expected: [], warns: true },
+  ])("served-set eligibility uses list recognition: $label", async ({ payload, expected, warns }) => {
+    const fetchMembership = vi.fn(async (input: string | URL | Request): Promise<Response> => {
+      const url = new URL(String(input));
+      if (url.pathname === "/v0/management/auth-files") {
+        return jsonResponse(200, [{
+          id: "claude-1", name: "claude-file", provider: "claude",
+          model_quotas: {
+            "quota-model": {
+              observed_at: NOW,
+              signals: { "anthropic-ratelimit-unified-5h-utilization": "0.2" },
+            },
+          },
+        }]);
+      }
+      if (url.pathname === "/v0/management/auth-files/models") return jsonResponse(200, payload);
+      if (url.pathname === "/v1/models") {
+        return jsonResponse(200, { data: [
+          { id: "owned-model", owned_by: "anthropic" }, { id: "quota-model" }, { id: "live-model" },
+        ] });
+      }
+      return new Response("not found", { status: 404 });
+    });
+    const s = store();
+    const summary = await runSync(deps(s, fetchMembership as unknown as typeof fetch), { running: false });
+    expect(summary.skipped).toBe(false);
+    expect(summary.providerModels?.claude ?? []).toEqual(expected);
+    expect(summary.modelOverlaps).toEqual([]);
+    expect(summary.errors.some((e) => e.includes("served set (auth file"))).toBe(warns);
+    expect(s.strike.failures).toHaveLength(0);
+    assertNoKeyLeak(s);
+  });
+
+  it("mixed file outcomes retain only unrecognized files' quota fallback and providers' eligible owned_by", async () => {
+    const quota = (id: string) => ({
+      [id]: { observed_at: NOW, signals: { "anthropic-ratelimit-unified-5h-utilization": "0.2" } },
+    });
+    const fetchMixed = vi.fn(async (input: string | URL | Request): Promise<Response> => {
+      const url = new URL(String(input));
+      if (url.pathname === "/v0/management/auth-files") {
+        return jsonResponse(200, [
+          { id: "claude-1", name: "claude-empty", provider: "claude", model_quotas: quota("stale-model") },
+          { id: "claude-2", name: "claude-malformed", provider: "claude", model_quotas: quota("quota-model") },
+          { id: "codex-1", name: "codex-malformed", provider: "codex" },
+          { id: "ag-1", name: "ag-live", provider: "antigravity" },
+          { id: "meta-1", name: "meta-missing", provider: "meta" },
+        ]);
+      }
+      if (url.pathname === "/v0/management/auth-files/models") {
+        switch (url.searchParams.get("name")) {
+          case "claude-empty": return jsonResponse(200, { data: [] });
+          case "claude-malformed":
+          case "codex-malformed": return jsonResponse(200, { error: "boom" });
+          case "ag-live": return jsonResponse(200, { data: [{ id: "live-model" }] });
+          default: return new Response("not found", { status: 404 });
+        }
+      }
+      if (url.pathname === "/v1/models") {
+        return jsonResponse(200, { data: [
+          { id: "stale-model", owned_by: "anthropic" },
+          { id: "quota-model" }, { id: "live-model" },
+          { id: "owned-model", owned_by: "anthropic" },
+          { id: "codex-model", owned_by: "openai" },
+          { id: "meta-model", owned_by: "meta" },
+        ] });
+      }
+      return new Response("not found", { status: 404 });
+    });
+    const s = store();
+    const summary = await runSync(deps(s, fetchMixed as unknown as typeof fetch), { running: false });
+    expect(summary.skipped).toBe(false);
+    expect(summary.providerModels?.claude).toEqual(["quota-model"]);
+    expect(summary.providerModels?.codex).toEqual(["codex-model"]);
+    expect(summary.providerModels?.antigravity).toEqual(["live-model"]);
+    expect(summary.providerModels?.meta).toEqual(["meta-model"]);
+    expect(summary.modelOverlaps).toEqual([]);
+    expect(summary.errors.filter((e) => e.includes("served set (auth file"))).toHaveLength(3);
+    expect(summary.errors.some((e) => e.includes("404 for every enabled auth file"))).toBe(false);
+    expect(s.strike.failures).toHaveLength(0);
+    assertNoKeyLeak(s);
+  });
+
+  it("a malformed response mixed with a 404 does not report every file as missing", async () => {
+    const fetchMixed = vi.fn(async (input: string | URL | Request): Promise<Response> => {
+      const url = new URL(String(input));
+      if (url.pathname === "/v0/management/auth-files") {
+        return jsonResponse(200, [
+          { id: "claude-1", name: "claude-malformed", provider: "claude" },
+          { id: "meta-1", name: "meta-missing", provider: "meta" },
+        ]);
+      }
+      if (url.pathname === "/v0/management/auth-files/models" && url.searchParams.get("name") === "claude-malformed") {
+        return jsonResponse(200, { error: "boom" });
+      }
+      if (url.pathname === "/v1/models") {
+        return jsonResponse(200, { data: [{ id: "owned-model", owned_by: "anthropic" }] });
+      }
+      return new Response("not found", { status: 404 });
+    });
+    const s = store();
+    const summary = await runSync(deps(s, fetchMixed as unknown as typeof fetch), { running: false });
+    expect(summary.providerModels?.claude).toEqual(["owned-model"]);
+    expect(summary.errors.some((e) => e.includes("404 for every enabled auth file"))).toBe(false);
+    expect(summary.errors.some((e) => e.includes("holds no entries"))).toBe(true);
+    expect(summary.errors.some((e) => e.includes("returned 404"))).toBe(true);
+    assertNoKeyLeak(s);
+  });
+
   it("a disabled account's model_quotas cannot fabricate an overlap", async () => {
     // The old Claude credential is disabled but still carries a quota key for
     // the id antigravity live-serves. Disabling the credential must clear its
