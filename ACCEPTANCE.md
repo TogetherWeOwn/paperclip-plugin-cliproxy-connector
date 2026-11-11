@@ -7,7 +7,7 @@ Maintainer: connector maintainers. Tool: `quota-diagnostics` (read); companion A
 ## Release candidate identity (0.3.0)
 
 - Candidate: `main` at `212da246cfe884cfb9feda75995c1659877a24b5` (package / manifest version `0.3.0`). No tag or release asset is cut from this record alone.
-- Provenance: PR #24 merged as squash `1fd7aaa1848c47a56ea0d7154aab16c5f82a548f` (2026-11-08), followed by PR #26 (`70977553deb6bc6ad2cc77d9f37e3a3ea677c0ce`, served-set fallback preservation) and PR #25 (`212da246cfe884cfb9feda75995c1659877a24b5`, recognised-empty warning silencing), both merged 2026-11-10. The current `main` SHA is the PR #25 squash; no further code changes are in this candidate.
+- Provenance: PR #24 merged as squash `1fd7aaa1848c47a56ea0d7154aab16c5f82a548f` (2026-11-08), followed by PR #26 (`70977553deb6bc6ad2cc77d9f37e3a3ea677c0ce`, served-set fallback preservation) and PR #25 (`212da246cfe884cfb9feda75995c1659877a24b5`, recognised-empty warning silencing), both merged 2026-11-10. At review time `212da24` is the candidate; merging this record advances `main` beyond it, so the candidate identity above is the exact code head, not a claim about the future `main` head.
 - Previous released artifact: `v0.2.7` (no agent tools). This candidate is the first release carrying `quota-diagnostics`; the operator install must retain the `v0.2.7` artifact for rollback.
 
 ## Source and compatibility
