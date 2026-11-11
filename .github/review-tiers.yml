@@ -1,0 +1,53 @@
+# A PR takes the highest tier of its changed files; sensitive wins overlaps.
+# Unmatched and new paths default to sensitive. This map is always sensitive.
+# QA reviews every PR; sensitive, unclassified or escalated changes also get
+# Security before QA. The author attests risk_tier and QA verifies the diff.
+#
+# Content always escalates to sensitive regardless of path: new or changed
+# public endpoints or input parsing; auth, authz or sessions; crypto or keys;
+# secrets or credentials; permission checks; tenant isolation or personal
+# data; SQL, schema or migrations; dependencies or lockfiles (including dev
+# dependencies); CI or workflows; weakened assertions, deleted tests or
+# snapshots, or lowered test gates. Low test globs, if added, are additive-only.
+# Downgrading a sensitive-floor glob requires Security approval on that PR.
+#
+# LICENSE is the only low path: static license text, not executable or an
+# agent instruction. README and the other documents remain sensitive because
+# they contain operational, security or acceptance instructions. Ordinary is
+# empty: no runtime module has been audited as free of untrusted input,
+# sensitive output, permissions, persistence and trust-boundary effects.
+version: 1
+default_tier: sensitive
+
+tiers:
+  low:
+    - "LICENSE"
+  ordinary: []
+  sensitive:
+    # Review policy, CI, ownership and rulesets.
+    - ".github/**"
+    - "CODEOWNERS"
+    - "**/CODEOWNERS"
+    # Dependency, build, test-gate and installation configuration.
+    - "package.json"
+    - "package-lock.json"
+    - "**/package.json"
+    - "**/package-lock.json"
+    - ".npmrc"
+    - "tsconfig*.json"
+    - "vitest.config.ts"
+    - "Makefile"
+    - "Dockerfile*"
+    - "scripts/**"
+    # Agent instructions, skills and tool permissions.
+    - "AGENTS.md"
+    - "**/AGENTS.md"
+    - "CLAUDE.md"
+    - "**/CLAUDE.md"
+    - ".claude/**"
+    - "**/.claude/**"
+    - "skills/**"
+    - "**/SKILL.md"
+    # Plugin runtime, network, state, parsing, UI and their tests.
+    - "src/**"
+    - "ui/**"
