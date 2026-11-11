@@ -1,0 +1,132 @@
+name: qualify-stock
+
+on:
+  pull_request:
+    paths: [qualification/**, .github/workflows/qualify-stock.yml]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: qualify-stock-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  stock-host:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      WORKFLOW_PR_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+      CANDIDATE_SHA: 1fd7aaa1848c47a56ea0d7154aab16c5f82a548f
+      HOST_SOURCE_SHA: d69631b01b9c658f80bf8bed389863dce82643e1
+      STOCK_IMAGE: ghcr.io/paperclipai/paperclip@sha256:12ae7579165cbf11d8db71ef69cf01ff48660383e78541b6b2eba38939fa30c9
+      QUALIFICATION_CONTAINER: connector-qualification-${{ github.run_id }}-${{ github.run_attempt }}
+      BROWSER_CONTAINER: connector-browser-${{ github.run_id }}-${{ github.run_attempt }}
+      BROWSER_IMAGE: mcr.microsoft.com/playwright@sha256:42f02d323c310069b4d54c94bd91a608966a486c3492c48ae0b1cea747ec5ca2
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          path: workflow
+          persist-credentials: false
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: TogetherWeOwn/paperclip-plugin-cliproxy-connector
+          ref: 1fd7aaa1848c47a56ea0d7154aab16c5f82a548f
+          path: candidate
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24
+      - name: Verify lane invariants
+        run: node --test workflow/qualification/policy.test.mjs
+      - name: Build the exact candidate with install hooks disabled
+        working-directory: candidate
+        env:
+          npm_config_ignore_scripts: 'true'
+          npm_config_min_release_age: '3'
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$CANDIDATE_SHA"
+          test -z "$(git status --porcelain)"
+          npm install --global npm@11.19.0 --ignore-scripts --min-release-age=3
+          test "$(npm --version)" = 11.19.0
+          test "$(npm config get ignore-scripts)" = true
+          test "$(npm config get min-release-age)" = 3
+          npm ci
+          npm run build
+          mkdir -p "$RUNNER_TEMP/connector-evidence"
+          npm pack --ignore-scripts --json --pack-destination "$RUNNER_TEMP/connector-evidence" > "$RUNNER_TEMP/connector-evidence/pack.json"
+          test "$(node -p "require('./node_modules/@paperclipai/plugin-sdk/package.json').version")" = 2026.1023.0
+          test -z "$(git status --porcelain)"
+      - name: Install locked browser driver without hooks
+        working-directory: workflow/qualification/browser
+        run: |
+          set -euo pipefail
+          test "$(npm --version)" = 11.19.0
+          test "$(npm config get ignore-scripts)" = true
+          test "$(npm config get min-release-age)" = 3
+          npm install --package-lock-only
+          git diff --exit-code -- package-lock.json
+          npm ci
+          test -z "$(git status --porcelain)"
+      - name: Prepare immutable stock image and evidence directory
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/connector-evidence"
+          docker pull "$STOCK_IMAGE"
+          docker image inspect "$STOCK_IMAGE" > "$RUNNER_TEMP/connector-evidence/image.json"
+          docker pull "$BROWSER_IMAGE"
+          docker image inspect "$BROWSER_IMAGE" > "$RUNNER_TEMP/connector-evidence/browser-image.json"
+          node workflow/qualification/identity.mjs candidate "$RUNNER_TEMP/connector-evidence"
+      - name: Start job-scoped stock host with no network or persistent storage
+        run: |
+          set -euo pipefail
+          docker run --detach --name "$QUALIFICATION_CONTAINER" \
+            --network none --pids-limit 2048 --memory 5g --cpus 2 \
+            --mount "type=bind,source=$GITHUB_WORKSPACE/candidate,target=/qualification/candidate,readonly" \
+            --mount "type=bind,source=$GITHUB_WORKSPACE/workflow/qualification,target=/qualification/driver,readonly" \
+            --mount "type=bind,source=$RUNNER_TEMP/connector-evidence,target=/qualification/evidence" \
+            --env PAPERCLIP_DEPLOYMENT_MODE=local_trusted \
+            --env PAPERCLIP_DEPLOYMENT_EXPOSURE=private \
+            --env HOST=127.0.0.1 --env SERVE_UI=true \
+            --env HEARTBEAT_SCHEDULER_ENABLED=false \
+            "$STOCK_IMAGE"
+          docker inspect "$QUALIFICATION_CONTAINER" > "$RUNNER_TEMP/connector-evidence/container.json"
+      - name: Start bounded browser in the stock host network-none namespace
+        run: |
+          set -euo pipefail
+          chmod 0777 "$RUNNER_TEMP/connector-evidence"
+          docker run --detach --name "$BROWSER_CONTAINER" \
+            --network "container:$QUALIFICATION_CONTAINER" \
+            --pids-limit 512 --memory 2g --cpus 1 --shm-size 256m \
+            --user 1000:1000 --cap-drop ALL --security-opt no-new-privileges \
+            --mount "type=bind,source=$GITHUB_WORKSPACE/workflow/qualification/browser,target=/qualification/browser,readonly" \
+            --mount "type=bind,source=$RUNNER_TEMP/connector-evidence,target=/qualification/evidence" \
+            --env HOME=/tmp --env PLAYWRIGHT_BROWSERS_PATH=/ms-playwright \
+            "$BROWSER_IMAGE" node /qualification/browser/observe.mjs
+          docker inspect "$BROWSER_CONTAINER" > "$RUNNER_TEMP/connector-evidence/browser-container.json"
+      - name: Probe installed candidate through stock host APIs and actual browser
+        run: docker exec "$QUALIFICATION_CONTAINER" node /qualification/driver/preflight.mjs
+      - name: Capture and dispose job-local resources
+        if: always()
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/connector-evidence"
+          for container in "$BROWSER_CONTAINER" "$QUALIFICATION_CONTAINER"; do
+            if docker container inspect "$container" >/dev/null 2>&1; then
+              docker logs "$container" > "$RUNNER_TEMP/connector-evidence/$container.log" 2>&1
+              docker rm --force --volumes "$container"
+            fi
+            if docker container inspect "$container" >/dev/null 2>&1; then
+              exit 1
+            fi
+          done
+          printf '{"explicitContainerRemoval":true,"browserContainerRemoval":true,"nativeBackstop":"GitHub-hosted job VM disposal","externalStorage":false,"recurringIdleRuntime":false}\n' > "$RUNNER_TEMP/connector-evidence/cleanup.json"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always()
+        with:
+          name: connector-stock-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/connector-evidence
+          if-no-files-found: error
+          retention-days: 7
